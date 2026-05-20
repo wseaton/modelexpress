@@ -290,7 +290,7 @@ struct WorkerRecordJson {
     /// P2P: Worker gRPC endpoint for tensor manifest
     #[serde(default)]
     pub worker_grpc_endpoint: String,
-    /// External-identity labels used by planner informers.
+    /// External-identity labels published by the worker.
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub labels: std::collections::HashMap<String, String>,
     /// Lightweight owned-tensor catalog used by the planner.

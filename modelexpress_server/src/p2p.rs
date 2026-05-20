@@ -8,7 +8,6 @@
 //! garbage-collects stale workers; `source_identity` derives deterministic source IDs.
 
 pub mod backend;
-pub mod informer;
 pub mod k8s_types;
 pub mod planner;
 pub mod reaper;

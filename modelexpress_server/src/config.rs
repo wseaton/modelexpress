@@ -11,7 +11,6 @@ use std::path::PathBuf;
 use tracing::Level;
 
 use crate::cache::CacheEvictionConfig;
-use crate::p2p::informer::{InformerConfig, MockOverlayConfig};
 
 /// Command line arguments for the server
 #[derive(Parser, Debug)]
@@ -53,8 +52,7 @@ pub struct ServerArgs {
 /// Complete server configuration.
 ///
 /// Top-level fields default individually so an operator config can
-/// override only what they need (e.g. just `informers:`) without
-/// re-stating every section.
+/// override only what they need without re-stating every section.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ServerConfig {
     /// Server settings
@@ -66,16 +64,6 @@ pub struct ServerConfig {
     /// Logging configuration
     #[serde(default)]
     pub logging: LoggingConfig,
-    /// External-data informers contributing to peer ranking in the P2P
-    /// transfer planner. Empty by default — the planner uses load+id
-    /// ordering only.
-    #[serde(default)]
-    pub informers: Vec<InformerConfig>,
-    /// Optional mock overlay for end-to-end scorer testing. When set,
-    /// any informer's contribution can be forced from a file. Leave
-    /// unset in production.
-    #[serde(default)]
-    pub informer_mock: Option<MockOverlayConfig>,
 }
 
 /// Server-specific settings

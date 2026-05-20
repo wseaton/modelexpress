@@ -9,10 +9,8 @@
 use crate::p2p::backend::{
     SourceInstanceInfo, TensorCatalogEntryRecord, TensorCatalogRecord, WorkerRecord,
 };
-use crate::p2p::informer::InformerRegistry;
 use crate::p2p::planner::{
-    CatalogEntry, PeerCandidate, ScoringContext, compute_transfer_plan,
-    synthetic_catalog_from_worker,
+    CatalogEntry, PeerCandidate, compute_transfer_plan, synthetic_catalog_from_worker,
 };
 use crate::p2p::source_identity::{compute_mx_source_id, validate_identity};
 use crate::p2p::state::P2pStateManager;
@@ -30,27 +28,11 @@ use tracing::{debug, error, info};
 /// P2P Service implementation
 pub struct P2pServiceImpl {
     state: Arc<P2pStateManager>,
-    /// External-data informers used to rank peers during transfer planning.
-    /// Empty registry = no informer signal applied; planner uses
-    /// load+worker_id ordering only.
-    informers: Arc<InformerRegistry>,
 }
 
 impl P2pServiceImpl {
-    /// Create a new P2P service with no informers (planner uses
-    /// load+worker_id ordering only).
     pub fn new(state: Arc<P2pStateManager>) -> Self {
-        Self {
-            state,
-            informers: InformerRegistry::empty(),
-        }
-    }
-
-    /// Create a new P2P service backed by an informer registry. The
-    /// caller is responsible for having already called
-    /// [`InformerRegistry::start`] before the first plan request.
-    pub fn with_informers(state: Arc<P2pStateManager>, informers: Arc<InformerRegistry>) -> Self {
-        Self { state, informers }
+        Self { state }
     }
 }
 
@@ -424,39 +406,10 @@ impl P2pService for P2pServiceImpl {
             }
         }
 
-        // The requester's own worker record, looked up once and reused for
-        // both the implied need-set (empty `requested_tensor_names`) and the
-        // caller-relative scoring labels below. The receiver advertises this
-        // via PublishMetadata(INITIALIZING) + AdvertiseTensorCatalog before
-        // planning; absent that, it's None and we fall back to the union.
-        //
-        // Only fetched when something actually needs it: an empty request
-        // (implied need-set) or active informers (caller labels). The
-        // explicit-names path with no informers skips the round-trip.
-        let needs_requester_record =
-            req.requested_tensor_names.is_empty() || !self.informers.describe().is_empty();
-        let requester_record = if needs_requester_record {
-            self.state
-                .get_metadata(&source_id, &req.requester_worker_id)
-                .await
-                .ok()
-                .flatten()
-        } else {
-            None
-        };
-        let requester_worker = requester_record.as_ref().and_then(|rec| {
-            rec.workers
-                .iter()
-                .find(|w| w.worker_rank == req.requester_worker_rank)
-                .or_else(|| rec.workers.first())
-        });
-
-        // Resolve the requested tensor set. Per the proto contract:
+        // Resolve the requested tensor set:
         //   - explicit `requested_tensor_names` wins
-        //   - empty list uses the requester's own advertised catalog as the
-        //     implied need-set
-        //   - union of all peer catalogs is the last resort when the
-        //     requester advertised nothing (noted in diagnostics)
+        //   - empty list uses the union of all peer catalogs (the cold-start
+        //     full-load case: the receiver needs the whole model)
         let mut note_parts: Vec<String> = Vec::new();
         let requested: Vec<CatalogEntry> = if !req.requested_tensor_names.is_empty() {
             // Build entries from the union catalog so we have byte_len
@@ -482,7 +435,6 @@ impl P2pService for P2pServiceImpl {
                             name: name.clone(),
                             byte_len: 0,
                             dtype: String::new(),
-                            shape: None,
                         }
                     }
                 })
@@ -495,77 +447,24 @@ impl P2pService for P2pServiceImpl {
             }
             requested
         } else {
-            let requester_catalog = requester_worker
-                .map(catalog_entries_for_worker)
-                .filter(|c| !c.is_empty());
-            match requester_catalog {
-                Some(catalog) => {
-                    note_parts.push(format!(
-                        "using requester's advertised catalog ({} tensor(s))",
-                        catalog.len()
-                    ));
-                    catalog
-                }
-                None => {
-                    note_parts.push(
-                        "requester has no advertised catalog; \
-                         using union of peer catalogs (last resort)"
-                            .into(),
-                    );
-                    let mut seen: std::collections::HashSet<String> =
-                        std::collections::HashSet::new();
-                    let mut union = Vec::new();
-                    for peer in &peer_candidates {
-                        for e in &peer.catalog {
-                            if seen.insert(e.name.clone()) {
-                                union.push(e.clone());
-                            }
-                        }
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut union = Vec::new();
+            for peer in &peer_candidates {
+                for e in &peer.catalog {
+                    if seen.insert(e.name.clone()) {
+                        union.push(e.clone());
                     }
-                    union
                 }
             }
+            union
         };
 
-        // Build a scoring context when the registry has informers wired
-        // up. An empty registry behaves like no scoring (planner uses
-        // load+id ordering only), and we skip the caller-label lookup
-        // entirely in that case.
-        //
-        // The caller's own labels (published earlier via PublishMetadata
-        // under the same source_id) let label-only informers do
-        // caller-relative comparisons. Absent or unpublished => empty map.
-        let caller_labels: std::collections::HashMap<String, String> =
-            if self.informers.describe().is_empty() {
-                std::collections::HashMap::new()
-            } else {
-                requester_worker
-                    .map(|worker| worker.labels.clone())
-                    .unwrap_or_default()
-            };
-
-        let scoring = if self.informers.describe().is_empty() {
-            None
-        } else {
-            Some(ScoringContext {
-                caller_worker_id: &req.requester_worker_id,
-                caller_labels: &caller_labels,
-                registry: &self.informers,
-            })
-        };
-
-        let plan = compute_transfer_plan(&requested, &peer_candidates, req.max_peers, scoring);
+        let plan = compute_transfer_plan(&requested, &peer_candidates, req.max_peers);
 
         if !plan.dtype_conflicts.is_empty() {
             note_parts.push(format!(
                 "dtype conflicts dropped {} tensor(s)",
                 plan.dtype_conflicts.len()
-            ));
-        }
-        if !plan.shape_conflicts.is_empty() {
-            note_parts.push(format!(
-                "shape conflicts dropped {} tensor(s)",
-                plan.shape_conflicts.len()
             ));
         }
         if !plan.uncovered.is_empty() {
@@ -812,12 +711,6 @@ fn catalog_entries_for_worker(worker: &WorkerRecord) -> Vec<CatalogEntry> {
                     name: entry.name.clone(),
                     byte_len: entry.byte_len,
                     dtype: entry.dtype.clone(),
-                    // Empty shape on the wire/record means "unspecified".
-                    shape: if entry.shape.is_empty() {
-                        None
-                    } else {
-                        Some(entry.shape.clone())
-                    },
                 })
                 .collect()
         })
@@ -1613,9 +1506,7 @@ mod tests {
             }
         });
 
-        // Two peer lookups plus the requester's own catalog lookup (empty
-        // requested_tensor_names triggers the implied need-set path).
-        mock.expect_get_metadata().times(3).returning({
+        mock.expect_get_metadata().times(2).returning({
             move |sid, wid| {
                 Ok(Some(ModelMetadataRecord {
                     source_id: sid.to_string(),
@@ -1739,10 +1630,8 @@ mod tests {
                 }])
             }
         });
-        // One peer lookup plus the requester's own catalog lookup (empty
-        // requested_tensor_names triggers the implied need-set path).
         mock.expect_get_metadata()
-            .times(2)
+            .once()
             .returning(move |sid, wid| Ok(Some(make_model_record(sid, wid, worker.clone()))));
 
         let svc = make_service(mock);
@@ -1764,78 +1653,6 @@ mod tests {
             vec!["catalog-only".to_string()]
         );
         assert!(resp.uncovered_tensor_names.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_compute_transfer_plan_scopes_to_requester_catalog() {
-        // Peer owns {a, b}; the requester advertised a catalog of only {a}.
-        // With empty requested_tensor_names the plan must scope to the
-        // requester's need-set: "a" assigned, "b" never considered (not in
-        // the plan, not in uncovered).
-        let source_id = compute_mx_source_id(&test_identity());
-
-        let mut requester = make_worker_record(0, &[]);
-        requester.tensor_catalog = Some(TensorCatalogRecord {
-            generation: 1,
-            entries: vec![TensorCatalogEntryRecord {
-                name: "a".to_string(),
-                byte_len: 100,
-                dtype: "bfloat16".to_string(),
-                shape: vec![],
-            }],
-        });
-
-        let mut mock = MockMetadataBackend::new();
-        mock.expect_list_workers().once().returning({
-            let source_id = source_id.clone();
-            move |_, _| {
-                Ok(vec![SourceInstanceInfo {
-                    source_id: source_id.clone(),
-                    worker_id: "peer-1".to_string(),
-                    model_name: "my-model".to_string(),
-                    worker_rank: 0,
-                    status: SourceStatus::Ready as i32,
-                    updated_at: 0,
-                }])
-            }
-        });
-        // The requester lookup returns its advertised {a} catalog; every
-        // other lookup returns the peer that owns {a, b}.
-        mock.expect_get_metadata()
-            .withf(|_, wid| wid == "requester")
-            .once()
-            .returning(move |sid, wid| Ok(Some(make_model_record(sid, wid, requester.clone()))));
-        mock.expect_get_metadata()
-            .withf(|_, wid| wid != "requester")
-            .once()
-            .returning(|sid, wid| {
-                Ok(Some(ModelMetadataRecord {
-                    source_id: sid.to_string(),
-                    worker_id: wid.to_string(),
-                    model_name: "my-model".to_string(),
-                    workers: vec![make_worker_record(0, &[("a", 100), ("b", 80)])],
-                    published_at: 0,
-                }))
-            });
-
-        let svc = make_service(mock);
-        let resp = svc
-            .compute_transfer_plan(Request::new(ComputeTransferPlanRequest {
-                identity: Some(test_identity()),
-                requester_worker_rank: 0,
-                requester_worker_id: "requester".to_string(),
-                requested_tensor_names: Vec::new(),
-                max_peers: None,
-            }))
-            .await
-            .expect("rpc")
-            .into_inner();
-
-        assert_eq!(resp.peers.len(), 1);
-        assert_eq!(resp.peers[0].assigned_tensor_names, vec!["a".to_string()]);
-        assert!(resp.uncovered_tensor_names.is_empty());
-        let diag = resp.diagnostics.expect("diagnostics");
-        assert!(diag.note.contains("requester's advertised catalog"));
     }
 
     #[tokio::test]
@@ -1867,8 +1684,7 @@ mod tests {
             }
         });
 
-        // One eligible peer lookup plus the requester's own catalog lookup.
-        mock.expect_get_metadata().times(2).returning(|sid, wid| {
+        mock.expect_get_metadata().once().returning(|sid, wid| {
             Ok(Some(ModelMetadataRecord {
                 source_id: sid.to_string(),
                 worker_id: wid.to_string(),

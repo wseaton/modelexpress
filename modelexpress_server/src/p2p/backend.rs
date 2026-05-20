@@ -117,9 +117,8 @@ pub struct WorkerRecord {
     pub agent_name: String,
     /// P2P: Worker gRPC endpoint for tensor manifest (host:port)
     pub worker_grpc_endpoint: String,
-    /// External-identity labels (e.g. `pod`, `namespace`, `node`).
-    /// Used by external-data informers to join MX peers against
-    /// signals tagged by deployer-meaningful keys.
+    /// External-identity labels (e.g. `pod`, `namespace`, `node`)
+    /// published by the worker for deployer-meaningful identification.
     pub labels: std::collections::HashMap<String, String>,
     /// Lightweight owned-tensor catalog used by transfer planning.
     /// `None` means the worker has not advertised a catalog yet and

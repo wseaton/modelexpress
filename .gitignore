@@ -31,8 +31,13 @@
 .env
 .env.local
 *.local.toml
+justfile.local
 .cargo/
 .claude/skills/
+
+# Local agent scaffolding and personal e2e test artifacts (not upstream)
+AGENTS.md
+ci/k8s/multi-peer/
 
 # Backup files
 *~

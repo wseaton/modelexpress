@@ -19,59 +19,11 @@
 //! Dtype conflict policy: if multiple peers advertise the same tensor name
 //! with different dtypes, that tensor is treated as uncovered (we don't
 //! silently pick one). The caller surfaces this in `PlanDiagnostics.note`.
-//!
-//! Shape conflict policy: same idea for shapes. Non-empty shapes that
-//! disagree (peer-vs-peer, or peer-vs-requester) mean someone's layout
-//! drifted; the tensor is dropped to uncovered rather than transferred as
-//! mismatched bytes. An unspecified shape (`None`) skips this check.
 
-use std::cmp::{Ordering, Reverse};
+use std::cmp::Reverse;
 use std::collections::HashMap;
 
 use crate::p2p::backend::WorkerRecord;
-use crate::p2p::informer::{InformerRegistry, ScoreCtx};
-
-/// Per-tensor candidate ordering used by the greedy pick.
-///
-/// We don't derive `Ord` because `score` is an `f64` (no total order on
-/// NaN); the explicit `cmp` formalizes the lex ordering and makes it
-/// inspectable. Lower load wins, ties broken by higher informer score,
-/// then by `worker_id` ascending for deterministic plans.
-#[derive(Debug, Clone, Copy)]
-pub struct PeerRank<'a> {
-    /// Bytes already assigned to this peer in the current plan.
-    pub load_bytes: u64,
-    /// Composite informer score for this peer from the caller's POV.
-    /// `0.0` is the no-signal neutral baseline. Higher = better.
-    pub score: f64,
-    /// Stable tiebreak. Borrowed from the candidate list.
-    pub worker_id: &'a str,
-}
-
-impl PeerRank<'_> {
-    /// Total ordering for greedy selection: lower load first, then
-    /// higher score, then lower worker_id. Treats NaN as Equal so a
-    /// misconfigured informer can never panic the planner.
-    ///
-    /// Inherent method (not `impl Ord`) because `score: f64` has no
-    /// total order — implementing `Ord` would require wrapping in
-    /// `OrderedFloat` or hashing NaN out, and the planner only ever
-    /// uses `cmp` directly. Allow the clippy lint since the method
-    /// name is intentional: callers explicitly do `peer.cmp(&other)`.
-    #[allow(clippy::should_implement_trait)]
-    pub fn cmp(&self, other: &Self) -> Ordering {
-        self.load_bytes
-            .cmp(&other.load_bytes)
-            .then_with(|| {
-                // Higher score is better, so reverse the partial_cmp.
-                other
-                    .score
-                    .partial_cmp(&self.score)
-                    .unwrap_or(Ordering::Equal)
-            })
-            .then_with(|| self.worker_id.cmp(other.worker_id))
-    }
-}
 
 /// One tensor's planning-relevant metadata. Mirrors the proto
 /// `TensorCatalogEntry` but lives in the server's domain layer.
@@ -80,8 +32,6 @@ pub struct CatalogEntry {
     pub name: String,
     pub byte_len: u64,
     pub dtype: String,
-    /// Tensor shape. `None` means "unspecified" and skips shape validation.
-    pub shape: Option<Vec<i64>>,
 }
 
 /// Bundled peer data the RPC handler assembles before calling the planner.
@@ -115,30 +65,7 @@ pub struct TransferPlan {
     /// Tensors that were dropped because peers disagreed on dtype.
     /// Included in `uncovered` too; this list is for diagnostics.
     pub dtype_conflicts: Vec<String>,
-    /// Tensors that were dropped because peers (or the requester) disagreed
-    /// on shape. Included in `uncovered` too; this list is for diagnostics.
-    pub shape_conflicts: Vec<String>,
 }
-
-/// Optional context for caller-relative scoring. `None` means the
-/// planner skips informer scoring entirely and uses the load+worker_id
-/// ordering only — preserving the pre-informer behavior.
-#[derive(Debug, Clone, Copy)]
-pub struct ScoringContext<'a> {
-    /// Worker ID of the requesting peer. Informers use this for
-    /// caller-relative signals (e.g., topology distance).
-    pub caller_worker_id: &'a str,
-    /// Labels the caller published. Informers use these for
-    /// caller-relative label comparisons (same rack, same tenant).
-    pub caller_labels: &'a HashMap<String, String>,
-    /// Source of composite scores.
-    pub registry: &'a InformerRegistry,
-}
-
-/// One peer that owns a given tensor name, with the dtype and (optional)
-/// shape it advertised. Used to build the per-name owner index and run
-/// dtype/shape conflict checks before assignment.
-type TensorOwner<'a> = (usize, &'a str, Option<&'a [i64]>);
 
 /// Compute a transfer plan.
 ///
@@ -150,15 +77,13 @@ type TensorOwner<'a> = (usize, &'a str, Option<&'a [i64]>);
 /// - `max_peers`: optional cap on how many peers appear in the response.
 ///   Peers are kept in input order before capping (caller decides
 ///   ordering — typically by recency or load).
-/// - `scoring`: optional informer-backed scorer. When present, peers
-///   that any informer hard-excludes (returns `None`) are filtered out
-///   before assignment, and the per-tensor pick uses the composite
-///   score as a tiebreaker behind load.
+///
+/// Each needed tensor is assigned to its least-loaded owning peer, ties
+/// broken by `worker_id` for deterministic plans across retries.
 pub fn compute_transfer_plan(
     requested: &[CatalogEntry],
     peers: &[PeerCandidate],
     max_peers: Option<u32>,
-    scoring: Option<ScoringContext<'_>>,
 ) -> TransferPlan {
     if peers.is_empty() || requested.is_empty() {
         return TransferPlan::default();
@@ -169,40 +94,16 @@ pub fn compute_transfer_plan(
         _ => peers,
     };
 
-    // Resolve per-peer composite scores once up front. Hard-excluded
-    // peers (any informer returns None) are filtered out of candidacy
-    // entirely. Soft scores default to 0.0 when no scoring context.
     let n = active_peers.len();
-    let scores: Vec<Option<f64>> = active_peers
-        .iter()
-        .map(|p| match scoring {
-            Some(sctx) => {
-                let ctx = ScoreCtx {
-                    caller_worker_id: sctx.caller_worker_id,
-                    peer_worker_id: &p.worker_id,
-                    caller_labels: sctx.caller_labels,
-                    peer_labels: &p.worker.labels,
-                };
-                sctx.registry.composite_score(&ctx)
-            }
-            None => Some(0.0),
-        })
-        .collect();
 
-    // Build name -> [owner] inverted index across active peers, skipping
-    // peers that are hard-excluded for this caller. Each owner carries its
-    // peer index, advertised dtype, and (optional) shape for conflict checks.
-    let mut owners: HashMap<&str, Vec<TensorOwner<'_>>> = HashMap::new();
+    // Build name -> [(peer_idx, dtype)] inverted index across active peers.
+    let mut owners: HashMap<&str, Vec<(usize, &str)>> = HashMap::new();
     for (idx, peer) in active_peers.iter().enumerate() {
-        if scores[idx].is_none() {
-            continue;
-        }
         for entry in &peer.catalog {
-            owners.entry(entry.name.as_str()).or_default().push((
-                idx,
-                entry.dtype.as_str(),
-                entry.shape.as_deref(),
-            ));
+            owners
+                .entry(entry.name.as_str())
+                .or_default()
+                .push((idx, entry.dtype.as_str()));
         }
     }
 
@@ -220,7 +121,6 @@ pub fn compute_transfer_plan(
     let mut assignments: Vec<Vec<String>> = vec![Vec::new(); n];
     let mut uncovered: Vec<String> = Vec::new();
     let mut dtype_conflicts: Vec<String> = Vec::new();
-    let mut shape_conflicts: Vec<String> = Vec::new();
 
     for need in order {
         let Some(candidates) = owners.get(need.name.as_str()) else {
@@ -231,7 +131,7 @@ pub fn compute_transfer_plan(
         // Reject if peers disagree on dtype for this name. We don't try
         // to be clever — silently picking a peer with a different dtype
         // than the receiver expects produces corrupted weights.
-        let dtypes: Vec<&str> = candidates.iter().map(|(_, d, _)| *d).collect();
+        let dtypes: Vec<&str> = candidates.iter().map(|(_, d)| *d).collect();
         let first_dtype = dtypes[0];
         let dtype_ok = dtypes.iter().all(|d| *d == first_dtype) && first_dtype == need.dtype;
         if !dtype_ok {
@@ -240,43 +140,15 @@ pub fn compute_transfer_plan(
             continue;
         }
 
-        // Reject if any specified shapes disagree (peer-vs-peer or
-        // peer-vs-requester). Unspecified shapes (`None`) are skipped, so a
-        // peer that never advertised a shape doesn't block the transfer.
-        let mut ref_shape: Option<&[i64]> = need.shape.as_deref();
-        let shape_ok = candidates.iter().all(|(_, _, s)| match (ref_shape, s) {
-            (_, None) => true,
-            (None, Some(peer_shape)) => {
-                ref_shape = Some(peer_shape);
-                true
-            }
-            (Some(want), Some(peer_shape)) => want == *peer_shape,
-        });
-        if !shape_ok {
-            shape_conflicts.push(need.name.clone());
-            uncovered.push(need.name.clone());
-            continue;
-        }
-
-        // Pick the candidate peer minimizing PeerRank: load first,
-        // composite score second (higher better), worker_id third.
+        // Pick the owning peer with the smallest running load, tie-broken
+        // by worker_id for deterministic plans across retries.
         let pick = candidates
             .iter()
-            .min_by(|(a, _, _), (b, _, _)| {
-                let ra = PeerRank {
-                    load_bytes: load[*a],
-                    // Unwrap: any hard-excluded peer was filtered above.
-                    score: scores[*a].unwrap_or(0.0),
-                    worker_id: active_peers[*a].worker_id.as_str(),
-                };
-                let rb = PeerRank {
-                    load_bytes: load[*b],
-                    score: scores[*b].unwrap_or(0.0),
-                    worker_id: active_peers[*b].worker_id.as_str(),
-                };
-                ra.cmp(&rb)
+            .min_by(|(a, _), (b, _)| {
+                (load[*a], active_peers[*a].worker_id.as_str())
+                    .cmp(&(load[*b], active_peers[*b].worker_id.as_str()))
             })
-            .map(|(idx, _, _)| *idx);
+            .map(|(idx, _)| *idx);
 
         let Some(idx) = pick else {
             uncovered.push(need.name.clone());
@@ -302,7 +174,6 @@ pub fn compute_transfer_plan(
         assignments: plan_assignments,
         uncovered,
         dtype_conflicts,
-        shape_conflicts,
     }
 }
 
@@ -318,9 +189,6 @@ pub fn synthetic_catalog_from_worker(worker: &WorkerRecord) -> Vec<CatalogEntry>
             name: t.name.clone(),
             byte_len: t.size,
             dtype: t.dtype.clone(),
-            // PublishMetadata descriptors carry no shape; synthetic
-            // entries are shape-unspecified and skip shape validation.
-            shape: None,
         })
         .collect()
 }
@@ -336,7 +204,6 @@ mod tests {
             name: name.to_string(),
             byte_len,
             dtype: "bfloat16".to_string(),
-            shape: None,
         }
     }
 
@@ -345,27 +212,7 @@ mod tests {
             name: name.to_string(),
             byte_len,
             dtype: dtype.to_string(),
-            shape: None,
         }
-    }
-
-    fn entry_with_shape(name: &str, byte_len: u64, shape: &[i64]) -> CatalogEntry {
-        CatalogEntry {
-            name: name.to_string(),
-            byte_len,
-            dtype: "bfloat16".to_string(),
-            shape: Some(shape.to_vec()),
-        }
-    }
-
-    /// Build a peer whose catalog carries explicit per-tensor shapes.
-    fn make_peer_shapes(name: &str, catalog: &[(&str, u64, &[i64])]) -> PeerCandidate {
-        let mut p = make_peer(name, &[]);
-        p.catalog = catalog
-            .iter()
-            .map(|(n, s, shape)| entry_with_shape(n, *s, shape))
-            .collect();
-        p
     }
 
     fn make_peer(name: &str, catalog: &[(&str, u64)]) -> PeerCandidate {
@@ -426,7 +273,7 @@ mod tests {
 
     #[test]
     fn empty_peers_returns_empty_plan() {
-        let plan = compute_transfer_plan(&requested(&[("a", 100)]), &[], None, None);
+        let plan = compute_transfer_plan(&requested(&[("a", 100)]), &[], None);
         assert!(plan.assignments.is_empty());
         assert!(plan.uncovered.is_empty());
     }
@@ -434,7 +281,7 @@ mod tests {
     #[test]
     fn empty_request_returns_empty_plan() {
         let peers = vec![make_peer("p0", &[("a", 100)])];
-        let plan = compute_transfer_plan(&[], &peers, None, None);
+        let plan = compute_transfer_plan(&[], &peers, None);
         assert!(plan.assignments.is_empty());
         assert!(plan.uncovered.is_empty());
     }
@@ -443,7 +290,7 @@ mod tests {
     fn single_peer_gets_all_tensors() {
         let tensors = &[("a", 100), ("b", 80)];
         let peers = vec![make_peer("p0", tensors)];
-        let plan = compute_transfer_plan(&requested(tensors), &peers, None, None);
+        let plan = compute_transfer_plan(&requested(tensors), &peers, None);
         assert_eq!(plan.assignments.len(), 1);
         assert_eq!(plan.assignments[0].assigned_tensor_names.len(), 2);
         assert_eq!(assigned_bytes(&plan.assignments[0], tensors), 180);
@@ -460,7 +307,7 @@ mod tests {
             ("layer.3", 40),
         ];
         let peers = vec![make_peer("p0", tensors), make_peer("p1", tensors)];
-        let plan = compute_transfer_plan(&requested(tensors), &peers, None, None);
+        let plan = compute_transfer_plan(&requested(tensors), &peers, None);
         assert_eq!(plan.assignments.len(), 2);
         let b0 = assigned_bytes(&plan.assignments[0], tensors);
         let b1 = assigned_bytes(&plan.assignments[1], tensors);
@@ -500,7 +347,7 @@ mod tests {
             ("layer.0.mlp.experts.3.w", 500),
         ]);
 
-        let plan = compute_transfer_plan(&need, &[p0, p1], None, None);
+        let plan = compute_transfer_plan(&need, &[p0, p1], None);
         assert_eq!(plan.assignments.len(), 2);
         assert!(plan.uncovered.is_empty(), "MoE plan should cover all needs");
 
@@ -542,7 +389,7 @@ mod tests {
             make_peer("p1", tensors),
             make_peer("p2", tensors),
         ];
-        let plan = compute_transfer_plan(&requested(tensors), &peers, None, None);
+        let plan = compute_transfer_plan(&requested(tensors), &peers, None);
         assert_eq!(plan.assignments.len(), 3);
         let totals: Vec<u64> = plan
             .assignments
@@ -562,8 +409,7 @@ mod tests {
         // pin "a" to p0 and "b" to p1 — no uncovered, no disagreement.
         let p0 = make_peer("p0", &[("a", 100)]);
         let p1 = make_peer("p1", &[("b", 100)]);
-        let plan =
-            compute_transfer_plan(&requested(&[("a", 100), ("b", 100)]), &[p0, p1], None, None);
+        let plan = compute_transfer_plan(&requested(&[("a", 100), ("b", 100)]), &[p0, p1], None);
         assert!(plan.uncovered.is_empty());
         let a_owner: Vec<&str> = plan
             .assignments
@@ -585,7 +431,7 @@ mod tests {
     fn uncovered_tensors_are_reported() {
         let p0 = make_peer("p0", &[("a", 100), ("b", 80)]);
         let need = requested(&[("a", 100), ("b", 80), ("missing", 50)]);
-        let plan = compute_transfer_plan(&need, &[p0], None, None);
+        let plan = compute_transfer_plan(&need, &[p0], None);
         assert_eq!(plan.uncovered, vec!["missing".to_string()]);
         let assigned: Vec<&str> = plan.assignments[0]
             .assigned_tensor_names
@@ -608,7 +454,6 @@ mod tests {
             &requested(&[("a", 100), ("b", 80), ("c", 60), ("d", 40)]),
             &[p0, p1],
             None,
-            None,
         );
         assert!(plan.uncovered.is_empty());
         let mut all: Vec<&str> = plan
@@ -626,7 +471,7 @@ mod tests {
         // planner refuses to pick — adds "a" to uncovered + dtype_conflicts.
         let p0 = make_peer_dtypes("p0", &[("a", 100, "bfloat16")]);
         let p1 = make_peer_dtypes("p1", &[("a", 100, "float8_e4m3fn")]);
-        let plan = compute_transfer_plan(&requested(&[("a", 100)]), &[p0, p1], None, None);
+        let plan = compute_transfer_plan(&requested(&[("a", 100)]), &[p0, p1], None);
         assert_eq!(plan.uncovered, vec!["a".to_string()]);
         assert_eq!(plan.dtype_conflicts, vec!["a".to_string()]);
         for asn in &plan.assignments {
@@ -639,59 +484,9 @@ mod tests {
         // Receiver wants bf16, peer offers fp8: do not silently corrupt.
         let p0 = make_peer_dtypes("p0", &[("a", 100, "float8_e4m3fn")]);
         let need = vec![entry_with_dtype("a", 100, "bfloat16")];
-        let plan = compute_transfer_plan(&need, &[p0], None, None);
+        let plan = compute_transfer_plan(&need, &[p0], None);
         assert_eq!(plan.uncovered, vec!["a".to_string()]);
         assert_eq!(plan.dtype_conflicts, vec!["a".to_string()]);
-    }
-
-    #[test]
-    fn shape_conflict_between_peers_drops_tensor() {
-        // p0 and p1 both advertise "a" but with divergent shapes (e.g. an
-        // elastic-EP shuffle gone wrong). Refuse rather than transfer
-        // mismatched bytes.
-        let p0 = make_peer_shapes("p0", &[("a", 100, &[2, 50])]);
-        let p1 = make_peer_shapes("p1", &[("a", 100, &[5, 20])]);
-        let plan = compute_transfer_plan(&requested(&[("a", 100)]), &[p0, p1], None, None);
-        assert_eq!(plan.uncovered, vec!["a".to_string()]);
-        assert_eq!(plan.shape_conflicts, vec!["a".to_string()]);
-        for asn in &plan.assignments {
-            assert!(asn.assigned_tensor_names.is_empty());
-        }
-    }
-
-    #[test]
-    fn requested_shape_mismatch_drops_tensor() {
-        // Receiver expects [2, 50], peer offers [4, 25]: same byte_len,
-        // wrong layout. Drop it.
-        let p0 = make_peer_shapes("p0", &[("a", 100, &[4, 25])]);
-        let need = vec![entry_with_shape("a", 100, &[2, 50])];
-        let plan = compute_transfer_plan(&need, &[p0], None, None);
-        assert_eq!(plan.uncovered, vec!["a".to_string()]);
-        assert_eq!(plan.shape_conflicts, vec!["a".to_string()]);
-    }
-
-    #[test]
-    fn unspecified_shape_skips_validation() {
-        // Peer advertises a shape, requester leaves it unspecified (None):
-        // the transfer proceeds. Mixed specified/unspecified is fine.
-        let p0 = make_peer_shapes("p0", &[("a", 100, &[2, 50])]);
-        let need = vec![entry("a", 100)]; // entry() leaves shape None
-        let plan = compute_transfer_plan(&need, &[p0], None, None);
-        assert!(plan.shape_conflicts.is_empty());
-        assert_eq!(
-            plan.assignments[0].assigned_tensor_names,
-            vec!["a".to_string()]
-        );
-    }
-
-    #[test]
-    fn matching_shapes_across_peers_transfer() {
-        let p0 = make_peer_shapes("p0", &[("a", 100, &[2, 50])]);
-        let p1 = make_peer_shapes("p1", &[("a", 100, &[2, 50])]);
-        let need = vec![entry_with_shape("a", 100, &[2, 50])];
-        let plan = compute_transfer_plan(&need, &[p0, p1], None, None);
-        assert!(plan.shape_conflicts.is_empty());
-        assert!(plan.uncovered.is_empty());
     }
 
     #[test]
@@ -702,7 +497,7 @@ mod tests {
             make_peer("p1", tensors),
             make_peer("p2", tensors),
         ];
-        let plan = compute_transfer_plan(&requested(tensors), &peers, Some(2), None);
+        let plan = compute_transfer_plan(&requested(tensors), &peers, Some(2));
         assert_eq!(plan.assignments.len(), 2);
         let all: Vec<&str> = plan
             .assignments
@@ -721,7 +516,7 @@ mod tests {
             make_peer("p1", tensors),
             make_peer("p2", tensors),
         ];
-        let plan = compute_transfer_plan(&requested(tensors), &peers, None, None);
+        let plan = compute_transfer_plan(&requested(tensors), &peers, None);
         let mut all: Vec<&str> = plan
             .assignments
             .iter()
@@ -738,8 +533,8 @@ mod tests {
         // between assignments and waste already-warm RDMA connections.
         let tensors = &[("a", 100), ("b", 80), ("c", 60), ("d", 40)];
         let peers = vec![make_peer("p0", tensors), make_peer("p1", tensors)];
-        let p1 = compute_transfer_plan(&requested(tensors), &peers, None, None);
-        let p2 = compute_transfer_plan(&requested(tensors), &peers, None, None);
+        let p1 = compute_transfer_plan(&requested(tensors), &peers, None);
+        let p2 = compute_transfer_plan(&requested(tensors), &peers, None);
         let collect = |t: &TransferPlan| -> Vec<Vec<String>> {
             t.assignments
                 .iter()
@@ -747,168 +542,5 @@ mod tests {
                 .collect()
         };
         assert_eq!(collect(&p1), collect(&p2));
-    }
-
-    // ----------------------------------------------------------------------
-    // Scoring integration
-    // ----------------------------------------------------------------------
-
-    use crate::p2p::informer::test_informers::StaticScoreInformer;
-    use crate::p2p::informer::{Informer, InformerRegistry};
-    use std::sync::Arc;
-
-    #[test]
-    fn higher_score_wins_when_load_is_tied() {
-        // Both peers own the same single tensor — without scoring, the
-        // worker_id tiebreak picks "p0". With scoring that ranks p1
-        // higher, p1 should win instead.
-        let tensors = &[("a", 100)];
-        let peers = vec![make_peer("p0", tensors), make_peer("p1", tensors)];
-        let scorer = StaticScoreInformer::new("test");
-        scorer.set("p0", Some(1.0));
-        scorer.set("p1", Some(10.0));
-        let reg = InformerRegistry::new(vec![(Arc::clone(&scorer) as Arc<dyn Informer>, 1.0)]);
-        let ctx = super::ScoringContext {
-            caller_worker_id: "target",
-            caller_labels: &std::collections::HashMap::new(),
-            registry: &reg,
-        };
-
-        let plan = compute_transfer_plan(&requested(tensors), &peers, None, Some(ctx));
-        let winner: Vec<&str> = plan
-            .assignments
-            .iter()
-            .filter(|a| !a.assigned_tensor_names.is_empty())
-            .map(|a| a.worker_id.as_str())
-            .collect();
-        assert_eq!(winner, vec!["p1"], "higher-scored peer should win the tie");
-    }
-
-    #[test]
-    fn hard_excluded_peer_loses_candidacy_entirely() {
-        // p0 is hard-excluded (informer returns None). p0 was the only
-        // owner of "a" — so "a" becomes uncovered. p1 still serves "b".
-        let p0 = make_peer("p0", &[("a", 100)]);
-        let p1 = make_peer("p1", &[("b", 80)]);
-        let scorer = StaticScoreInformer::new("maint");
-        scorer.set("p0", None); // peer in maintenance
-        scorer.set("p1", Some(0.0));
-        let reg = InformerRegistry::new(vec![(Arc::clone(&scorer) as Arc<dyn Informer>, 1.0)]);
-        let ctx = super::ScoringContext {
-            caller_worker_id: "target",
-            caller_labels: &std::collections::HashMap::new(),
-            registry: &reg,
-        };
-
-        let plan = compute_transfer_plan(
-            &requested(&[("a", 100), ("b", 80)]),
-            &[p0, p1],
-            None,
-            Some(ctx),
-        );
-
-        // p0's only tensor is uncovered.
-        assert_eq!(plan.uncovered, vec!["a".to_string()]);
-        // p1 is still assigned "b".
-        let assigned: Vec<(String, Vec<String>)> = plan
-            .assignments
-            .iter()
-            .map(|a| (a.worker_id.clone(), a.assigned_tensor_names.clone()))
-            .collect();
-        assert!(
-            assigned.contains(&("p1".to_string(), vec!["b".to_string()])),
-            "p1 should still serve b: got {assigned:?}"
-        );
-        // p0 is still listed in the plan but with empty assignments.
-        let p0_entry = assigned
-            .iter()
-            .find(|(w, _)| w == "p0")
-            .expect("p0 should still appear in the plan");
-        assert!(p0_entry.1.is_empty());
-    }
-
-    #[test]
-    fn scoring_does_not_override_load_balance() {
-        // Two peers, both own all 4 tensors. p0 has a much higher score,
-        // but the planner must still load-balance bytes — score is a
-        // tertiary tiebreak only.
-        let tensors = &[("a", 100), ("b", 80), ("c", 60), ("d", 40)];
-        let peers = vec![make_peer("p0", tensors), make_peer("p1", tensors)];
-        let scorer = StaticScoreInformer::new("test");
-        scorer.set("p0", Some(1000.0));
-        scorer.set("p1", Some(0.0));
-        let reg = InformerRegistry::new(vec![(Arc::clone(&scorer) as Arc<dyn Informer>, 1.0)]);
-        let ctx = super::ScoringContext {
-            caller_worker_id: "target",
-            caller_labels: &std::collections::HashMap::new(),
-            registry: &reg,
-        };
-
-        let plan = compute_transfer_plan(&requested(tensors), &peers, None, Some(ctx));
-        let p0_bytes = assigned_bytes(&plan.assignments[0], tensors);
-        let p1_bytes = assigned_bytes(&plan.assignments[1], tensors);
-        assert_eq!(p0_bytes + p1_bytes, 280);
-        // p0 wins ties (higher score), but the inner loop still balances
-        // overall bytes. With heaviest-first, p0 takes 100, p1 takes 80,
-        // p0 would tie at 100/80 → p0's load is higher, so p1 gets 60
-        // (its load is 80 < p0's 100), then p0 takes 40 to land 140/140.
-        assert_eq!(p0_bytes, 140);
-        assert_eq!(p1_bytes, 140);
-    }
-
-    #[test]
-    fn peer_rank_cmp_lex_order_is_load_score_id() {
-        let lo_load = super::PeerRank {
-            load_bytes: 100,
-            score: 0.0,
-            worker_id: "z",
-        };
-        let hi_load = super::PeerRank {
-            load_bytes: 200,
-            score: 100.0,
-            worker_id: "a",
-        };
-        // Lower load wins despite worse score and later id.
-        assert_eq!(lo_load.cmp(&hi_load), std::cmp::Ordering::Less);
-
-        // Equal load: higher score wins.
-        let same_load_a = super::PeerRank {
-            load_bytes: 100,
-            score: 5.0,
-            worker_id: "z",
-        };
-        let same_load_b = super::PeerRank {
-            load_bytes: 100,
-            score: 1.0,
-            worker_id: "a",
-        };
-        assert_eq!(same_load_a.cmp(&same_load_b), std::cmp::Ordering::Less);
-
-        // Equal load and score: lower worker_id wins.
-        let id_a = super::PeerRank {
-            load_bytes: 100,
-            score: 5.0,
-            worker_id: "a",
-        };
-        let id_z = super::PeerRank {
-            load_bytes: 100,
-            score: 5.0,
-            worker_id: "z",
-        };
-        assert_eq!(id_a.cmp(&id_z), std::cmp::Ordering::Less);
-
-        // NaN score is treated as Equal, never panics.
-        let nan_score = super::PeerRank {
-            load_bytes: 100,
-            score: f64::NAN,
-            worker_id: "a",
-        };
-        let ok_score = super::PeerRank {
-            load_bytes: 100,
-            score: 1.0,
-            worker_id: "z",
-        };
-        // load equal, score comparison falls back to Equal, then "a" < "z"
-        assert_eq!(nan_score.cmp(&ok_score), std::cmp::Ordering::Less);
     }
 }

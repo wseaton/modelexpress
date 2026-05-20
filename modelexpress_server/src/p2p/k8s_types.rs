@@ -106,9 +106,8 @@ pub struct WorkerStatus {
     #[serde(rename = "workerGrpcEndpoint", default)]
     pub worker_grpc_endpoint: String,
 
-    /// External-identity labels (e.g. `pod`, `namespace`, `node`).
-    /// Used by external-data informers in the planner to join MX
-    /// peers against signals tagged by deployer-meaningful keys.
+    /// External-identity labels (e.g. `pod`, `namespace`, `node`)
+    /// published by the worker for deployer-meaningful identification.
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub labels: std::collections::HashMap<String, String>,
 }
