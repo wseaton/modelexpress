@@ -15,7 +15,8 @@ use tracing::{debug, info};
 
 // Re-export types for backwards compatibility
 pub use crate::p2p::backend::{
-    BackendMetadataRecord, ModelMetadataRecord, TensorRecord, WorkerRecord,
+    BackendMetadataRecord, ModelMetadataRecord, TensorCatalogEntryRecord, TensorCatalogRecord,
+    TensorRecord, WorkerRecord,
 };
 
 /// State manager that handles P2P metadata operations.
@@ -184,6 +185,20 @@ impl P2pStateManager {
             source_id, worker_id, worker_rank, status as i32
         );
         Ok(())
+    }
+
+    /// Replace a worker's lightweight tensor catalog.
+    pub async fn put_tensor_catalog(
+        &self,
+        source_id: &str,
+        worker_id: &str,
+        worker_rank: u32,
+        catalog: TensorCatalogRecord,
+    ) -> MetadataResult<()> {
+        self.get_backend()
+            .await?
+            .put_tensor_catalog(source_id, worker_id, worker_rank, catalog)
+            .await
     }
 }
 
@@ -356,6 +371,8 @@ mod tests {
                     metadata_endpoint: String::new(),
                     agent_name: String::new(),
                     worker_grpc_endpoint: String::new(),
+                    labels: std::collections::HashMap::new(),
+                    tensor_catalog: None,
                 },
                 WorkerRecord {
                     worker_rank: 1,
@@ -372,6 +389,8 @@ mod tests {
                     metadata_endpoint: String::new(),
                     agent_name: String::new(),
                     worker_grpc_endpoint: String::new(),
+                    labels: std::collections::HashMap::new(),
+                    tensor_catalog: None,
                 },
             ],
             published_at: 1234567890,

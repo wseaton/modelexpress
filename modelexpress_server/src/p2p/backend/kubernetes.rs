@@ -5,7 +5,10 @@
 //!
 //! Uses ModelMetadata CRD and ConfigMaps for tensor descriptors.
 
-use super::{MetadataBackend, MetadataResult, ModelMetadataRecord, TensorRecord, WorkerRecord};
+use super::{
+    MetadataBackend, MetadataResult, ModelMetadataRecord, TensorCatalogEntryRecord,
+    TensorCatalogRecord, TensorRecord, WorkerRecord,
+};
 use crate::p2p::k8s_types::{ModelMetadata, ModelMetadataSpec, TensorDescriptorJson, WorkerStatus};
 use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
@@ -18,6 +21,26 @@ use modelexpress_common::grpc::p2p::{SourceIdentity, SourceStatus, WorkerMetadat
 use serde_json::json;
 use std::collections::BTreeMap;
 use tracing::{debug, info, warn};
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct TensorCatalogEntryJson {
+    pub name: String,
+    pub byte_len: String,
+    pub dtype: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shape: Vec<i64>,
+}
+
+impl From<&TensorCatalogEntryRecord> for TensorCatalogEntryJson {
+    fn from(record: &TensorCatalogEntryRecord) -> Self {
+        Self {
+            name: record.name.clone(),
+            byte_len: record.byte_len.to_string(),
+            dtype: record.dtype.clone(),
+            shape: record.shape.clone(),
+        }
+    }
+}
 
 /// Kubernetes backend for metadata storage
 pub struct KubernetesBackend {
@@ -165,6 +188,128 @@ impl KubernetesBackend {
 
         Ok(tensors)
     }
+
+    /// Create or update a ConfigMap with lightweight tensor catalog entries.
+    async fn upsert_tensor_catalog_configmap(
+        &self,
+        source_id: &str,
+        worker_id: &str,
+        worker_rank: u32,
+        catalog: &TensorCatalogRecord,
+        owner_name: Option<&str>,
+        owner_uid: Option<&str>,
+    ) -> MetadataResult<String> {
+        let cr_name = format!("mx-source-{}-{}", source_id, worker_id);
+        let cm_name = format!("{}-catalog-worker-{}", cr_name, worker_rank);
+
+        let catalog_json: Vec<TensorCatalogEntryJson> = catalog
+            .entries
+            .iter()
+            .map(TensorCatalogEntryJson::from)
+            .collect();
+        let catalog_data = serde_json::to_string_pretty(&catalog_json)?;
+
+        let mut data = BTreeMap::new();
+        data.insert("catalog.json".to_string(), catalog_data);
+
+        let mut labels = BTreeMap::new();
+        labels.insert(
+            "modelexpress.nvidia.com/mx-source-id".to_string(),
+            source_id.to_string(),
+        );
+        labels.insert(
+            "modelexpress.nvidia.com/worker".to_string(),
+            worker_rank.to_string(),
+        );
+        labels.insert(
+            "modelexpress.nvidia.com/catalog".to_string(),
+            "true".to_string(),
+        );
+
+        let owner_references = match (owner_name, owner_uid) {
+            (Some(name), Some(uid)) => Some(vec![
+                k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference {
+                    api_version: "modelexpress.nvidia.com/v1alpha1".to_string(),
+                    kind: "ModelMetadata".to_string(),
+                    name: name.to_string(),
+                    uid: uid.to_string(),
+                    controller: Some(false),
+                    block_owner_deletion: Some(true),
+                },
+            ]),
+            _ => None,
+        };
+
+        let cm = ConfigMap {
+            metadata: kube::api::ObjectMeta {
+                name: Some(cm_name.clone()),
+                namespace: Some(self.namespace.clone()),
+                labels: Some(labels),
+                owner_references,
+                ..Default::default()
+            },
+            data: Some(data),
+            ..Default::default()
+        };
+
+        let api = self.configmap_api();
+        match api.create(&PostParams::default(), &cm).await {
+            Ok(_) => debug!(
+                "Created tensor catalog ConfigMap {} for worker {}",
+                cm_name, worker_rank
+            ),
+            Err(kube::Error::Api(err)) if err.code == 409 => {
+                api.patch(&cm_name, &PatchParams::default(), &Patch::Merge(&cm))
+                    .await?;
+                debug!(
+                    "Updated tensor catalog ConfigMap {} for worker {}",
+                    cm_name, worker_rank
+                );
+            }
+            Err(e) => return Err(e.into()),
+        }
+
+        Ok(cm_name)
+    }
+
+    /// Read lightweight tensor catalog entries from a ConfigMap.
+    async fn read_tensor_catalog_configmap(
+        &self,
+        cm_name: &str,
+        generation: u64,
+    ) -> MetadataResult<TensorCatalogRecord> {
+        let api = self.configmap_api();
+        let cm = api.get(cm_name).await?;
+
+        let catalog_json = cm
+            .data
+            .and_then(|d| d.get("catalog.json").cloned())
+            .ok_or("ConfigMap missing catalog.json")?;
+
+        let entries_json: Vec<TensorCatalogEntryJson> = serde_json::from_str(&catalog_json)?;
+        let entries = entries_json
+            .into_iter()
+            .map(|entry| {
+                let byte_len = entry.byte_len.parse::<u64>().map_err(|e| {
+                    format!(
+                        "Invalid catalog byte_len '{}' for '{}': {}",
+                        entry.byte_len, entry.name, e
+                    )
+                })?;
+                Ok(TensorCatalogEntryRecord {
+                    name: entry.name,
+                    byte_len,
+                    dtype: entry.dtype,
+                    shape: entry.shape,
+                })
+            })
+            .collect::<MetadataResult<Vec<_>>>()?;
+
+        Ok(TensorCatalogRecord {
+            generation,
+            entries,
+        })
+    }
 }
 
 #[async_trait]
@@ -270,11 +415,15 @@ impl MetadataBackend for KubernetesBackend {
             transfer_engine_session_id,
             tensor_count: worker_record.tensors.len() as i32,
             tensor_config_map: Some(cm_name),
+            tensor_catalog_config_map: None,
+            tensor_catalog_generation: 0,
+            tensor_catalog_count: 0,
             status: WorkerStatus::status_name_from_proto(worker_record.status),
             updated_at: Some(now.clone()),
             metadata_endpoint: worker_record.metadata_endpoint.clone(),
             agent_name: worker_record.agent_name.clone(),
             worker_grpc_endpoint: worker_record.worker_grpc_endpoint.clone(),
+            labels: worker_record.labels.clone(),
         };
 
         let max_retries: u32 = 5;
@@ -403,6 +552,24 @@ impl MetadataBackend for KubernetesBackend {
                 Vec::new()
             };
 
+            let tensor_catalog = if let Some(cm_name) = &worker_status.tensor_catalog_config_map {
+                match self
+                    .read_tensor_catalog_configmap(cm_name, worker_status.tensor_catalog_generation)
+                    .await
+                {
+                    Ok(catalog) => Some(catalog),
+                    Err(e) => {
+                        warn!(
+                            "Failed to read tensor catalog ConfigMap '{}': {}",
+                            cm_name, e
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
             let status = WorkerStatus::status_proto_from_name(&worker_status.status);
             let updated_at = worker_status
                 .updated_at
@@ -420,6 +587,8 @@ impl MetadataBackend for KubernetesBackend {
                 metadata_endpoint: worker_status.metadata_endpoint.clone(),
                 agent_name: worker_status.agent_name.clone(),
                 worker_grpc_endpoint: worker_status.worker_grpc_endpoint.clone(),
+                labels: worker_status.labels.clone(),
+                tensor_catalog,
             });
         }
 
@@ -700,6 +869,160 @@ impl MetadataBackend for KubernetesBackend {
 
         Err(format!(
             "Failed to update status for source '{}' worker '{}' rank {} after {} retries",
+            source_id, worker_id, worker_rank, max_retries
+        )
+        .into())
+    }
+
+    async fn put_tensor_catalog(
+        &self,
+        source_id: &str,
+        worker_id: &str,
+        worker_rank: u32,
+        catalog: TensorCatalogRecord,
+    ) -> MetadataResult<()> {
+        let api = self.model_metadata_api();
+        let cr_name = format!("mx-source-{}-{}", source_id, worker_id);
+
+        let cr = api.get(&cr_name).await?;
+        let owner_uid = cr.metadata.uid.as_deref();
+        let owner_name = cr.metadata.name.as_deref();
+        let current_worker = cr
+            .status
+            .as_ref()
+            .and_then(|status| status.worker.as_ref())
+            .ok_or_else(|| {
+                format!(
+                    "put_tensor_catalog: no worker in source '{}' worker '{}'",
+                    source_id, worker_id
+                )
+            })?;
+
+        if current_worker.worker_rank as u32 != worker_rank {
+            return Err(format!(
+                "put_tensor_catalog: worker rank mismatch for source '{}' worker '{}': request={}, stored={}",
+                source_id, worker_id, worker_rank, current_worker.worker_rank
+            )
+            .into());
+        }
+
+        if current_worker.tensor_catalog_config_map.is_some()
+            && catalog.generation <= current_worker.tensor_catalog_generation
+        {
+            return Err(format!(
+                "stale tensor catalog generation {} for source '{}' worker '{}' rank {}; current generation is {}",
+                catalog.generation,
+                source_id,
+                worker_id,
+                worker_rank,
+                current_worker.tensor_catalog_generation
+            )
+            .into());
+        }
+
+        let cm_name = self
+            .upsert_tensor_catalog_configmap(
+                source_id,
+                worker_id,
+                worker_rank,
+                &catalog,
+                owner_name,
+                owner_uid,
+            )
+            .await?;
+
+        let entry_count = match i32::try_from(catalog.entries.len()) {
+            Ok(count) => count,
+            Err(_) => i32::MAX,
+        };
+        let max_retries: u32 = 5;
+        for attempt in 0..max_retries {
+            let current = api.get(&cr_name).await?;
+            let mut crd_status = current.status.ok_or_else(|| {
+                format!(
+                    "put_tensor_catalog: no status in source '{}' worker '{}'",
+                    source_id, worker_id
+                )
+            })?;
+
+            let mut worker = crd_status.worker.take().ok_or_else(|| {
+                format!(
+                    "put_tensor_catalog: no worker in source '{}' worker '{}'",
+                    source_id, worker_id
+                )
+            })?;
+
+            if worker.worker_rank as u32 != worker_rank {
+                return Err(format!(
+                    "put_tensor_catalog: worker rank mismatch for source '{}' worker '{}': request={}, stored={}",
+                    source_id, worker_id, worker_rank, worker.worker_rank
+                )
+                .into());
+            }
+
+            if worker.tensor_catalog_config_map.is_some()
+                && catalog.generation <= worker.tensor_catalog_generation
+            {
+                return Err(format!(
+                    "stale tensor catalog generation {} for source '{}' worker '{}' rank {}; current generation is {}",
+                    catalog.generation,
+                    source_id,
+                    worker_id,
+                    worker_rank,
+                    worker.tensor_catalog_generation
+                )
+                .into());
+            }
+
+            worker.tensor_catalog_config_map = Some(cm_name.clone());
+            worker.tensor_catalog_generation = catalog.generation;
+            worker.tensor_catalog_count = entry_count;
+
+            let generation = current.metadata.generation.unwrap_or(0);
+            let resource_version = current.metadata.resource_version.unwrap_or_default();
+            let status_patch = serde_json::json!({
+                "metadata": { "resourceVersion": resource_version },
+                "status": {
+                    "worker": worker,
+                    "conditions": crd_status.conditions,
+                    "observedGeneration": generation
+                }
+            });
+
+            match api
+                .patch_status(
+                    &cr_name,
+                    &PatchParams::default(),
+                    &Patch::Merge(&status_patch),
+                )
+                .await
+            {
+                Ok(_) => {
+                    debug!(
+                        "Updated tensor catalog for source '{}' worker '{}' rank {} ({} entries, generation={})",
+                        source_id, worker_id, worker_rank, entry_count, catalog.generation
+                    );
+                    return Ok(());
+                }
+                Err(kube::Error::Api(err)) if err.code == 409 => {
+                    debug!(
+                        "Conflict updating tensor catalog for source '{}' worker '{}', retrying ({}/{})",
+                        source_id,
+                        worker_id,
+                        attempt.saturating_add(1),
+                        max_retries
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        100_u64.saturating_mul(u64::from(attempt).saturating_add(1)),
+                    ))
+                    .await;
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+
+        Err(format!(
+            "Failed to update tensor catalog for source '{}' worker '{}' rank {} after {} retries",
             source_id, worker_id, worker_rank, max_retries
         )
         .into())

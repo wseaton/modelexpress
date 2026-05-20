@@ -1,0 +1,26 @@
+---
+# PodMonitor for vLLM workers in the multi-peer P2P test.
+# Picked up by the cluster Prometheus (kube-prometheus-stack) which
+# has empty podMonitorNamespaceSelector + podMonitorSelector — it
+# scrapes any PodMonitor.
+#
+# After applying, give Prometheus ~1 minute to discover and start
+# scraping. Verify via:
+#   kubectl port-forward -n monitoring svc/prometheus-kube-prometheus-prometheus 9090:9090
+#   curl 'http://localhost:9090/api/v1/query?query=up{job="mx-test/mx-vllm-workers"}'
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: mx-vllm-workers
+  namespace: mx-test
+  labels:
+    app: mx-p2p-worker
+spec:
+  selector:
+    matchLabels:
+      app: mx-p2p-worker
+  podMetricsEndpoints:
+    - port: metrics
+      path: /metrics
+      interval: 15s
+      scrapeTimeout: 10s

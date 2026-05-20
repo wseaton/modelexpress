@@ -60,6 +60,16 @@ class P2pServiceStub(object):
                 request_serializer=p2p__pb2.UpdateStatusRequest.SerializeToString,
                 response_deserializer=p2p__pb2.UpdateStatusResponse.FromString,
                 _registered_method=True)
+        self.ComputeTransferPlan = channel.unary_unary(
+                '/model_express.p2p.P2pService/ComputeTransferPlan',
+                request_serializer=p2p__pb2.ComputeTransferPlanRequest.SerializeToString,
+                response_deserializer=p2p__pb2.ComputeTransferPlanResponse.FromString,
+                _registered_method=True)
+        self.AdvertiseTensorCatalog = channel.unary_unary(
+                '/model_express.p2p.P2pService/AdvertiseTensorCatalog',
+                request_serializer=p2p__pb2.AdvertiseTensorCatalogRequest.SerializeToString,
+                response_deserializer=p2p__pb2.AdvertiseTensorCatalogResponse.FromString,
+                _registered_method=True)
 
 
 class P2pServiceServicer(object):
@@ -99,6 +109,40 @@ class P2pServiceServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def ComputeTransferPlan(self, request, context):
+        """Compute a multi-peer transfer plan for parallel weight downloads.
+        The server selects eligible peers, spreads tensors across them, and
+        returns per-peer assignments with NIXL metadata inlined so the client
+        needs no follow-up RPCs.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def AdvertiseTensorCatalog(self, request, context):
+        """Advertise this worker's owned-tensor inventory for planning.
+
+        Lightweight catalog (name + dtype + byte_len + optional shape; no GPU
+        addresses) used by the planner to match peers that own a needed tensor.
+        Required for models where peers may own disjoint shards (MoE with
+        expert-parallel, asymmetric quantization variants, etc.), since the
+        server cannot derive ownership from SourceIdentity alone.
+
+        Sent once per peer after the model is loaded and before the peer is
+        considered eligible for transfer planning. Receivers also call this
+        before requesting a plan (with an empty entries list) so the planner
+        can diff what the receiver has against what peers own; receivers then
+        re-advertise the populated catalog after the transfer completes so
+        they can serve future requesters.
+
+        Re-sending replaces the previous catalog for (mx_source_id, worker_id)
+        iff the new generation is higher. The lease expires with the worker's
+        heartbeat (same lifecycle as PublishMetadata).
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_P2pServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -121,6 +165,16 @@ def add_P2pServiceServicer_to_server(servicer, server):
                     servicer.UpdateStatus,
                     request_deserializer=p2p__pb2.UpdateStatusRequest.FromString,
                     response_serializer=p2p__pb2.UpdateStatusResponse.SerializeToString,
+            ),
+            'ComputeTransferPlan': grpc.unary_unary_rpc_method_handler(
+                    servicer.ComputeTransferPlan,
+                    request_deserializer=p2p__pb2.ComputeTransferPlanRequest.FromString,
+                    response_serializer=p2p__pb2.ComputeTransferPlanResponse.SerializeToString,
+            ),
+            'AdvertiseTensorCatalog': grpc.unary_unary_rpc_method_handler(
+                    servicer.AdvertiseTensorCatalog,
+                    request_deserializer=p2p__pb2.AdvertiseTensorCatalogRequest.FromString,
+                    response_serializer=p2p__pb2.AdvertiseTensorCatalogResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -234,6 +288,60 @@ class P2pService(object):
             '/model_express.p2p.P2pService/UpdateStatus',
             p2p__pb2.UpdateStatusRequest.SerializeToString,
             p2p__pb2.UpdateStatusResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ComputeTransferPlan(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/model_express.p2p.P2pService/ComputeTransferPlan',
+            p2p__pb2.ComputeTransferPlanRequest.SerializeToString,
+            p2p__pb2.ComputeTransferPlanResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def AdvertiseTensorCatalog(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/model_express.p2p.P2pService/AdvertiseTensorCatalog',
+            p2p__pb2.AdvertiseTensorCatalogRequest.SerializeToString,
+            p2p__pb2.AdvertiseTensorCatalogResponse.FromString,
             options,
             channel_credentials,
             insecure,

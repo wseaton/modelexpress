@@ -23,6 +23,32 @@ service P2pService {
 
   // Update source status - called by source after NIXL registration and warmup
   rpc UpdateStatus(UpdateStatusRequest) returns (UpdateStatusResponse);
+
+  // Compute a multi-peer transfer plan for parallel weight downloads.
+  // The server selects eligible peers, spreads tensors across them, and
+  // returns per-peer assignments with NIXL metadata inlined so the client
+  // needs no follow-up RPCs.
+  rpc ComputeTransferPlan(ComputeTransferPlanRequest) returns (ComputeTransferPlanResponse);
+
+  // Advertise this worker's owned-tensor inventory for planning.
+  //
+  // Lightweight catalog (name + dtype + byte_len + optional shape; no GPU
+  // addresses) used by the planner to match peers that own a needed tensor.
+  // Required for models where peers may own disjoint shards (MoE with
+  // expert-parallel, asymmetric quantization variants, etc.), since the
+  // server cannot derive ownership from SourceIdentity alone.
+  //
+  // Sent once per peer after the model is loaded and before the peer is
+  // considered eligible for transfer planning. Receivers also call this
+  // before requesting a plan (with an empty entries list) so the planner
+  // can diff what the receiver has against what peers own; receivers then
+  // re-advertise the populated catalog after the transfer completes so
+  // they can serve future requesters.
+  //
+  // Re-sending replaces the previous catalog for (mx_source_id, worker_id)
+  // iff the new generation is higher. The lease expires with the worker's
+  // heartbeat (same lifecycle as PublishMetadata).
+  rpc AdvertiseTensorCatalog(AdvertiseTensorCatalogRequest) returns (AdvertiseTensorCatalogResponse);
 }
 
 // ============================================================================
@@ -154,6 +180,18 @@ message WorkerMetadata {
 
   // host:port for the worker's gRPC WorkerService (tensor manifest)
   string worker_grpc_endpoint = 8;
+
+  // Free-form key/value labels describing this worker's external
+  // identity. Used by the planner's external-data informers to join
+  // MX workers against signals tagged by deployer-meaningful keys
+  // (e.g. `pod`, `namespace`, `node`, `rack`, `region`).
+  //
+  // Conventionally lowercase keys. Keys are not interpreted by the
+  // server; informers declare which key they consume. Empty map is
+  // valid and means "no external identity advertised" — informers
+  // that require a label treat the peer as missing data (apply their
+  // unknown-policy).
+  map<string, string> labels = 9;
 }
 
 // ============================================================================
@@ -300,4 +338,144 @@ message UpdateStatusRequest {
 message UpdateStatusResponse {
   bool success = 1;
   string message = 2;
+}
+
+// ============================================================================
+// Transfer Planning
+// ============================================================================
+
+message ComputeTransferPlanRequest {
+  // Source identity for the model to transfer
+  SourceIdentity identity = 1;
+
+  // Rank of the requesting worker (only peers with matching rank are eligible)
+  uint32 requester_worker_rank = 2;
+
+  // Worker ID of the requester (excluded from peer candidates)
+  string requester_worker_id = 3;
+
+  // Maximum number of peers to include in the plan. Server may cap lower.
+  // If not set, the server uses all eligible peers.
+  optional uint32 max_peers = 4;
+
+  // Optional explicit list of tensor names the requester needs.
+  //
+  // If populated, the planner restricts assignments to this set.
+  // If empty, the planner uses the requester's own advertised catalog
+  // (from a prior AdvertiseTensorCatalog call with the matching
+  // worker_id) as the implied need-set. Falling back to the union of
+  // all peers' catalogs is a last resort and the planner returns it in
+  // PlanDiagnostics.note for visibility.
+  repeated string requested_tensor_names = 5;
+}
+
+// One peer's assignment in a transfer plan.
+// Contains everything the client needs to initiate an RDMA transfer
+// without any follow-up RPCs.
+message PeerAssignment {
+  // Source ID for this peer
+  string mx_source_id = 1;
+
+  // Unique worker instance identifier
+  string worker_id = 2;
+
+  // NIXL agent name for remote identification
+  string agent_name = 3;
+
+  // host:port where NIXL listen thread accepts metadata fetches
+  string metadata_endpoint = 4;
+
+  // Serialized NIXL agent metadata for RDMA connection setup
+  bytes nixl_metadata = 5;
+
+  // Full tensor descriptors for this peer (addresses, sizes, dtypes)
+  repeated TensorDescriptor tensors = 6;
+
+  // Subset of tensor names this peer should serve in the transfer.
+  // The union of assigned_tensor_names across all peers covers the
+  // full model; each tensor appears in exactly one peer's assignment.
+  repeated string assigned_tensor_names = 7;
+
+  // host:port for the worker's gRPC WorkerService (tensor manifest)
+  string worker_grpc_endpoint = 8;
+}
+
+// Diagnostic information about how the plan was computed.
+message PlanDiagnostics {
+  // Total candidate workers discovered for this source/rank
+  uint32 candidates_total = 1;
+
+  // Candidates that passed eligibility filters
+  uint32 candidates_eligible = 2;
+
+  // Human-readable summary of the planning decision
+  string note = 3;
+}
+
+message ComputeTransferPlanResponse {
+  // Per-peer transfer assignments. Empty if no eligible peers exist.
+  repeated PeerAssignment peers = 1;
+
+  // How the plan was computed (always populated)
+  PlanDiagnostics diagnostics = 2;
+
+  // Tensors the requester asked for that no eligible peer owned.
+  // The requester is expected to load these from disk (or skip them
+  // if they were already present locally).
+  repeated string uncovered_tensor_names = 3;
+}
+
+// ============================================================================
+// Tensor Catalog (planning inventory)
+// ============================================================================
+
+// One owned-tensor entry in a peer's catalog. Lighter than TensorDescriptor:
+// no GPU address (those flow through GetTensorManifest at transfer time).
+message TensorCatalogEntry {
+  // Fully-qualified tensor name. Required. For MoE this includes the
+  // expert index, e.g. "model.layers.42.mlp.experts.7.w1.weight".
+  string name = 1;
+
+  // Byte length of this tensor as owned by this peer.
+  uint64 byte_len = 2;
+
+  // Data type string. The planner verifies that peers serving the same
+  // name agree on dtype and rejects the request if they diverge.
+  string dtype = 3;
+
+  // Optional shape. Used for cross-peer validation (e.g., catching
+  // accidental shape divergence in elastic-EP shuffles); the planner
+  // does not require it. Empty means "unspecified".
+  repeated int64 shape = 4;
+}
+
+message AdvertiseTensorCatalogRequest {
+  // Source identity; the server derives mx_source_id and restricts
+  // catalog scope to peers with the same key.
+  SourceIdentity identity = 1;
+
+  // Worker that owns these tensors. Must match a prior PublishMetadata
+  // worker_id for the same identity, or the call is rejected.
+  string worker_id = 2;
+  uint32 worker_rank = 3;
+
+  // Full owned-tensor inventory at this generation. Each name must be
+  // unique within entries. An empty list is valid (the receiver-side
+  // pre-plan advertise pattern).
+  repeated TensorCatalogEntry entries = 4;
+
+  // Monotonic generation counter. The server keeps only the highest
+  // generation per (mx_source_id, worker_id) and rejects stale writes.
+  // Bump when expert routing or shard layout changes mid-run.
+  uint64 generation = 5;
+}
+
+message AdvertiseTensorCatalogResponse {
+  bool success = 1;
+  string message = 2;
+  // Echoed totals for client-side sanity check.
+  uint32 entries_accepted = 3;
+  uint64 total_bytes = 4;
+  // Generation the server now holds (>= the request's generation).
+  uint64 generation = 5;
 }

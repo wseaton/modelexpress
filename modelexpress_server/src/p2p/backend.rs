@@ -117,6 +117,14 @@ pub struct WorkerRecord {
     pub agent_name: String,
     /// P2P: Worker gRPC endpoint for tensor manifest (host:port)
     pub worker_grpc_endpoint: String,
+    /// External-identity labels (e.g. `pod`, `namespace`, `node`).
+    /// Used by external-data informers to join MX peers against
+    /// signals tagged by deployer-meaningful keys.
+    pub labels: std::collections::HashMap<String, String>,
+    /// Lightweight owned-tensor catalog used by transfer planning.
+    /// `None` means the worker has not advertised a catalog yet and
+    /// planners should fall back to the full tensor descriptors.
+    pub tensor_catalog: Option<TensorCatalogRecord>,
 }
 
 /// Tensor descriptor record
@@ -127,6 +135,30 @@ pub struct TensorRecord {
     pub size: u64,
     pub device_id: u32,
     pub dtype: String,
+}
+
+/// Lightweight owned-tensor catalog for one worker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TensorCatalogRecord {
+    pub generation: u64,
+    pub entries: Vec<TensorCatalogEntryRecord>,
+}
+
+impl TensorCatalogRecord {
+    pub fn total_bytes(&self) -> u64 {
+        self.entries
+            .iter()
+            .fold(0_u64, |acc, entry| acc.saturating_add(entry.byte_len))
+    }
+}
+
+/// One lightweight owned-tensor catalog entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TensorCatalogEntryRecord {
+    pub name: String,
+    pub byte_len: u64,
+    pub dtype: String,
+    pub shape: Vec<i64>,
 }
 
 // Conversions from gRPC types
@@ -149,6 +181,8 @@ impl From<WorkerMetadata> for WorkerRecord {
             metadata_endpoint: meta.metadata_endpoint,
             agent_name: meta.agent_name,
             worker_grpc_endpoint: meta.worker_grpc_endpoint,
+            labels: meta.labels,
+            tensor_catalog: None,
         }
     }
 }
@@ -189,6 +223,7 @@ impl From<WorkerRecord> for WorkerMetadata {
             metadata_endpoint: record.metadata_endpoint,
             agent_name: record.agent_name,
             worker_grpc_endpoint: record.worker_grpc_endpoint,
+            labels: record.labels,
         }
     }
 }
@@ -257,6 +292,18 @@ pub trait MetadataBackend: Send + Sync {
         worker_rank: u32,
         status: SourceStatus,
         updated_at: i64,
+    ) -> MetadataResult<()>;
+
+    /// Replace a worker's lightweight tensor catalog.
+    ///
+    /// Backends must reject stale generations (new generation must be
+    /// strictly greater than any stored generation for this worker).
+    async fn put_tensor_catalog(
+        &self,
+        source_id: &str,
+        worker_id: &str,
+        worker_rank: u32,
+        catalog: TensorCatalogRecord,
     ) -> MetadataResult<()>;
 }
 

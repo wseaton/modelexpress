@@ -8,6 +8,61 @@
 # Accessed by test pods via the stable in-cluster DNS name: mx-server:8000
 
 ---
+# Server config file — mounted at /etc/mx/config.yaml. Declares the
+# informer block that the planner uses to score peers; everything
+# else is left to defaults.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mx-server-config
+data:
+  config.yaml: |
+    server:
+      host: "0.0.0.0"
+      port: 8000
+    informers:
+      # Real signal — direct vLLM /metrics scrape (no Prometheus).
+      # Score = 1 - kv_cache_usage_perc: idle peers score 1.0, busy
+      # peers near 0.0. Soft tiebreak behind load in the planner.
+      - kind: vllm_metrics
+        name: vllm_kv_idle
+        weight: 1.0
+        metric_name: "vllm:kv_cache_usage_perc"
+        host_label: pod_ip
+        port: 8000
+        refresh_seconds: 15
+        transform: one_minus
+        unknown_policy:
+          kind: neutral
+          default: 0.5
+    # Mock overlay for end-to-end scorer testing. When present, forces
+    # any informer's contribution from /etc/mx-scores/overrides.json
+    # (the mx-server-scores ConfigMap below), re-read every 10s. Edit
+    # that ConfigMap to change scores live — no server restart. Keyed by
+    # the `role` label (stable JOB_NAME). Delete this block (and the
+    # ConfigMap) to run with real signals only.
+    informer_mock:
+      path: /etc/mx-scores/overrides.json
+      join_label: role
+      refresh_seconds: 10
+---
+# Live-editable mock overrides. Outer key = informer name (`*` = all
+# informers). Inner key = `role` label value (JOB_NAME). Value = forced
+# score, or null to hard-exclude. Picked up within the overlay's refresh
+# interval — no pod restart.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mx-server-scores
+data:
+  overrides.json: |
+    {
+      "*": {
+        "mx-source-0": 1.0,
+        "mx-source-1": 1.0
+      }
+    }
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -27,6 +82,13 @@ spec:
       serviceAccountName: modelexpress
       imagePullSecrets:
         - name: worker-registry
+      volumes:
+        - name: config
+          configMap:
+            name: mx-server-config
+        - name: scores
+          configMap:
+            name: mx-server-scores
       containers:
         - name: mx-server
           image: ${MX_SERVER_IMAGE}
@@ -34,7 +96,7 @@ spec:
           # tag pick up freshly pushed images instead of the node's cached copy.
           imagePullPolicy: Always
           command: ["/app/modelexpress-server"]
-          args: ["--port", "8000"]
+          args: ["--config", "/etc/mx/config.yaml"]
           env:
             - name: MX_METADATA_BACKEND
               value: "kubernetes"
@@ -44,6 +106,13 @@ spec:
                   fieldPath: metadata.namespace
           ports:
             - containerPort: 8000
+          volumeMounts:
+            - name: config
+              mountPath: /etc/mx
+              readOnly: true
+            - name: scores
+              mountPath: /etc/mx-scores
+              readOnly: true
           resources:
             requests:
               cpu: "500m"

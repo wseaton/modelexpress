@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use async_trait::async_trait;
 use clap::Parser;
 use modelexpress_common::grpc::{
     api::api_service_server::ApiServiceServer, health::health_service_server::HealthServiceServer,
@@ -9,7 +10,11 @@ use modelexpress_common::grpc::{
 use modelexpress_server::{
     cache::CacheEvictionService,
     config::{ServerArgs, ServerConfig},
-    p2p::{service::P2pServiceImpl, state::P2pStateManager},
+    p2p::{
+        informer::{DiscoveredPeer, InformerContext, InformerRegistry, PeerDiscovery},
+        service::P2pServiceImpl,
+        state::P2pStateManager,
+    },
     registry::state::RegistryManager,
     services::{
         ApiServiceImpl, HealthServiceImpl, ModelDownloadTracker, ModelServiceImpl,
@@ -20,6 +25,48 @@ use std::sync::Arc;
 use tonic::transport::Server;
 use tracing::{error, info};
 use tracing_subscriber::{EnvFilter, FmtSubscriber};
+
+/// PeerDiscovery backed by the live P2P state manager. Each call lists
+/// Ready workers and reads their per-worker labels for informers to
+/// join against (e.g. by `pod_ip` for direct vLLM /metrics scrapes).
+struct P2pStatePeerDiscovery {
+    state: Arc<P2pStateManager>,
+}
+
+#[async_trait]
+impl PeerDiscovery for P2pStatePeerDiscovery {
+    async fn discover(&self) -> anyhow::Result<Vec<DiscoveredPeer>> {
+        let workers = self
+            .state
+            .list_workers(
+                None,
+                Some(modelexpress_common::grpc::p2p::SourceStatus::Ready),
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("list_workers: {e}"))?;
+        let mut out = Vec::with_capacity(workers.len());
+        for w in workers {
+            // Pull the full record to get the labels (list_workers returns
+            // only summary info). Skip peers whose metadata we can't read.
+            let record = match self.state.get_metadata(&w.source_id, &w.worker_id).await {
+                Ok(Some(r)) => r,
+                _ => continue,
+            };
+            // A record holds one WorkerRecord per rank. We take rank 0 as a
+            // representative for the group's labels. This is correct only when
+            // a worker's ranks share scrape-relevant labels (e.g. one pod_ip),
+            // which holds for the common single-pod-per-node vLLM deployment but
+            // is not guaranteed; multi-pod ranks would need per-rank peers.
+            if let Some(worker) = record.workers.into_iter().next() {
+                out.push(DiscoveredPeer {
+                    worker_id: w.worker_id,
+                    labels: worker.labels,
+                });
+            }
+        }
+        Ok(out)
+    }
+}
 
 /// Maximum gRPC message size (100MB) for large models like DeepSeek-V3.
 /// Each worker can have thousands of tensor descriptors with NIXL metadata.
@@ -144,7 +191,50 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     }
 
-    let p2p_service = P2pServiceImpl::new(p2p_state.clone());
+    // Build informer registry from config. Empty config = empty
+    // registry = planner uses load+id ordering only.
+    let informer_ctx = InformerContext {
+        peer_discovery: Arc::new(P2pStatePeerDiscovery {
+            state: p2p_state.clone(),
+        }) as Arc<dyn PeerDiscovery>,
+    };
+    let mut built_informers = Vec::with_capacity(config.informers.len());
+    for cfg in &config.informers {
+        match cfg.build(&informer_ctx) {
+            Ok(inf) => {
+                info!(
+                    "Informer '{}' configured (kind={}, weight={})",
+                    cfg.name(),
+                    cfg.kind(),
+                    cfg.weight(),
+                );
+                built_informers.push((inf, cfg.weight()));
+            }
+            Err(e) => {
+                error!("Failed to build informer '{}': {:#}", cfg.name(), e);
+                return Err(format!("informer config error: {e:#}").into());
+            }
+        }
+    }
+    let informer_registry = match &config.informer_mock {
+        Some(mock_cfg) => {
+            let overlay = mock_cfg.build();
+            info!(
+                "Informer mock overlay ENABLED (path={}, join_label={}) — scoring is being faked",
+                mock_cfg.path, mock_cfg.join_label,
+            );
+            InformerRegistry::with_overlay(built_informers, overlay)
+        }
+        None => InformerRegistry::new(built_informers),
+    };
+    let (informer_shutdown_tx, informer_shutdown_rx) = tokio::sync::watch::channel(false);
+    informer_registry.start(informer_shutdown_rx);
+    let informer_join_handle = {
+        let reg = Arc::clone(&informer_registry);
+        tokio::spawn(async move { reg.join().await })
+    };
+
+    let p2p_service = P2pServiceImpl::with_informers(p2p_state.clone(), informer_registry);
 
     // Start reaper for stale source detection
     let (reaper_shutdown_tx, reaper_shutdown_rx) = tokio::sync::oneshot::channel();
@@ -169,6 +259,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Signal reaper to shutdown
         if reaper_shutdown_tx.send(()).is_err() {
             error!("Failed to send shutdown signal to reaper");
+        }
+
+        // Signal informer refresh tasks to shutdown
+        if informer_shutdown_tx.send(true).is_err() {
+            error!("Failed to send shutdown signal to informer registry");
         }
     };
 
@@ -195,6 +290,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
     if let Err(e) = reaper_handle.await {
         error!("Reaper join error: {e}");
+    }
+    if let Err(e) = informer_join_handle.await {
+        error!("Informer registry join error: {e}");
     }
 
     server_result?;

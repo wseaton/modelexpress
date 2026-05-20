@@ -8,7 +8,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use tracing::{Level, info};
+use tracing::{Level, info, warn};
 
 /// Parse a duration string into a `chrono::Duration`.
 /// Supports formats like "2h", "30m", "45s", "1d", etc.
@@ -313,9 +313,13 @@ where
     // Try to load configuration strictly first
     match load_config_with_env_strict(config_file, env_prefix) {
         Ok(config) => Ok(config),
-        Err(_) => {
-            // If strict loading fails, fall back to defaults
-            // This provides a safe fallback for partial configurations or errors
+        Err(e) => {
+            // Fall back to defaults for partial configs or a missing file.
+            // Log the swallowed error at WARN so a malformed config (typo,
+            // wrong type, missing required section) doesn't silently boot
+            // with defaults and leave the operator wondering why their
+            // settings were ignored.
+            warn!("Configuration loading failed, falling back to defaults: {e}");
             Ok(defaults)
         }
     }

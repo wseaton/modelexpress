@@ -74,6 +74,18 @@ pub struct WorkerStatus {
     #[serde(rename = "tensorConfigMap", default)]
     pub tensor_config_map: Option<String>,
 
+    /// Name of ConfigMap containing the lightweight tensor catalog.
+    #[serde(rename = "tensorCatalogConfigMap", default)]
+    pub tensor_catalog_config_map: Option<String>,
+
+    /// Monotonic generation for the lightweight tensor catalog.
+    #[serde(rename = "tensorCatalogGeneration", default)]
+    pub tensor_catalog_generation: u64,
+
+    /// Number of entries in the lightweight tensor catalog.
+    #[serde(rename = "tensorCatalogCount", default)]
+    pub tensor_catalog_count: i32,
+
     /// Worker lifecycle status (Initializing, Ready, Stale)
     #[serde(default)]
     pub status: String,
@@ -93,6 +105,12 @@ pub struct WorkerStatus {
     /// P2P: Worker gRPC endpoint for tensor manifest (host:port)
     #[serde(rename = "workerGrpcEndpoint", default)]
     pub worker_grpc_endpoint: String,
+
+    /// External-identity labels (e.g. `pod`, `namespace`, `node`).
+    /// Used by external-data informers in the planner to join MX
+    /// peers against signals tagged by deployer-meaningful keys.
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub labels: std::collections::HashMap<String, String>,
 }
 
 impl WorkerStatus {

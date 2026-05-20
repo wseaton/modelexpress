@@ -88,6 +88,152 @@ class RdmaStrategy(LoadStrategy):
         failures are raised immediately instead of trying another source.
         """
         result = _as_load_result(result)
+
+        if os.environ.get("MX_USE_TRANSFER_PLAN", "").strip() == "1":
+            return self._load_via_transfer_plan(result, ctx)
+
+        return self._load_via_discovery(result, ctx)
+
+    def _load_via_transfer_plan(
+        self, result: LoadResult, ctx: LoadContext,
+    ) -> LoadResult:
+        """Server-side planning: single RPC, parallel RDMA from all peers."""
+        max_peers_str = os.environ.get("MX_MAX_PEERS", "")
+        max_peers = int(max_peers_str) if max_peers_str.strip() else None
+
+        try:
+            plan = ctx.mx_client.compute_transfer_plan(
+                identity=ctx.identity,
+                requester_worker_rank=ctx.worker_rank,
+                requester_worker_id=ctx.worker_id,
+                max_peers=max_peers,
+            )
+        except Exception as e:
+            logger.warning(
+                f"[Worker {ctx.global_rank}] ComputeTransferPlan failed: {e}"
+            )
+            raise StrategyFailed(
+                f"ComputeTransferPlan failed: {e}", mutated=False,
+            ) from e
+
+        if not plan.peers:
+            diag = plan.diagnostics
+            note = diag.note if diag else "unknown"
+            logger.info(
+                f"[Worker {ctx.global_rank}] Transfer plan returned no peers: {note}"
+            )
+            raise StrategyFailed("No peers in transfer plan", mutated=False)
+
+        diag = plan.diagnostics
+        logger.info(
+            f"[Worker {ctx.global_rank}] Transfer plan: {len(plan.peers)} peer(s), "
+            f"{diag.candidates_eligible}/{diag.candidates_total} eligible"
+            + (f" ({diag.note})" if diag and diag.note else "")
+        )
+
+        try:
+            result = ctx.adapter.prepare_rdma_target(result)
+            result = ctx.adapter.before_rdma_receive(result)
+            self._receive_from_plan(result, ctx, plan)
+            return ctx.adapter.after_rdma_receive(result)
+        except StrategyFailed:
+            raise
+        except Exception as e:
+            raise StrategyFailed(str(e), mutated=True) from e
+
+    def _receive_from_plan(
+        self,
+        result: LoadResult,
+        ctx: LoadContext,
+        plan: "p2p_pb2.ComputeTransferPlanResponse",
+    ) -> None:
+        """Fetch NIXL metadata from all peers, then issue parallel RDMA reads."""
+        from ..metadata.worker_server import fetch_tensor_manifest
+
+        receive_start = time.perf_counter()
+        register_tensors(result, ctx)
+
+        peers_for_transfer: list[tuple[str, list[TensorDescriptor], set[str]]] = []
+
+        for peer in plan.peers:
+            assigned_names = set(peer.assigned_tensor_names)
+            if not assigned_names:
+                continue
+
+            if peer.worker_grpc_endpoint:
+                tensor_protos, _ = fetch_tensor_manifest(
+                    endpoint=peer.worker_grpc_endpoint,
+                    mx_source_id=peer.mx_source_id,
+                )
+                source_tensors = [
+                    TensorDescriptor(
+                        name=t.name, addr=t.addr, size=t.size,
+                        device_id=t.device_id, dtype=t.dtype,
+                    )
+                    for t in tensor_protos
+                ]
+
+                ep = peer.metadata_endpoint
+                host, port_str = ep.rsplit(":", 1)
+                ctx.nixl_manager.fetch_remote_and_wait(
+                    remote_agent_name=peer.agent_name,
+                    ip=host,
+                    port=int(port_str),
+                )
+            else:
+                source_tensors = [
+                    TensorDescriptor(
+                        name=t.name, addr=t.addr, size=t.size,
+                        device_id=t.device_id, dtype=t.dtype,
+                    )
+                    for t in peer.tensors
+                ]
+                ctx.nixl_manager._agent.add_remote_agent(peer.nixl_metadata)
+
+            logger.info(
+                f"[Worker {ctx.global_rank}] Peer {peer.agent_name}: "
+                f"{len(assigned_names)} assigned tensors of "
+                f"{len(source_tensors)} total"
+            )
+            peers_for_transfer.append(
+                (peer.agent_name, source_tensors, assigned_names)
+            )
+
+        if not peers_for_transfer:
+            raise SourceTransferError("No peers had assigned tensors")
+
+        try:
+            bytes_transferred, tensor_count, duration = (
+                ctx.nixl_manager.receive_from_peers(
+                    peers=peers_for_transfer,
+                    timeout_seconds=300.0,
+                )
+            )
+        except Exception as e:
+            raise SourceTransferError(f"Multi-peer RDMA receive failed: {e}") from e
+
+        bandwidth_gbps = (
+            (bytes_transferred * 8) / (duration * 1e9) if duration > 0 else 0
+        )
+        logger.info(
+            f"[Worker {ctx.global_rank}] [TIMING] RDMA transfer complete: "
+            f"{len(peers_for_transfer)} peers, {tensor_count} tensors, "
+            f"{bytes_transferred / 1e9:.2f} GB, {duration:.3f}s, "
+            f"{bandwidth_gbps:.1f} Gbps"
+        )
+
+        torch.cuda.synchronize()
+
+        total_time = time.perf_counter() - receive_start
+        logger.info(
+            f"[Worker {ctx.global_rank}] [TIMING] Total receive time: "
+            f"{total_time:.2f}s"
+        )
+
+    def _load_via_discovery(
+        self, result: LoadResult, ctx: LoadContext,
+    ) -> LoadResult:
+        """Legacy client-side discovery: ListSources + GetMetadata loop."""
         candidates = self._find_source_instances(ctx)
         if not candidates:
             logger.info(f"[Worker {ctx.global_rank}] No RDMA source available, skipping")

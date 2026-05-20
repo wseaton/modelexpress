@@ -14,7 +14,7 @@ RUN apt-get update && \
 
 COPY . .
 
-RUN cargo build --release --bin modelexpress-server
+RUN CARGO_BUILD_JOBS=4 cargo build --release --bin modelexpress-server
 
 FROM ubuntu:24.04 AS runtime
 

@@ -150,6 +150,35 @@ def test_update_status_is_noop_returning_true():
     assert client.update_status("sid", "wid", 0, p2p_pb2.SOURCE_STATUS_READY) is True
 
 
+def test_advertise_tensor_catalog_is_noop_summary():
+    client = MxK8sServiceClient(worker_rank=0)
+    resp = client.advertise_tensor_catalog(
+        identity=_base_identity(),
+        worker_id="worker-id",
+        worker_rank=0,
+        entries=[
+            p2p_pb2.TensorCatalogEntry(
+                name="w0",
+                byte_len=10,
+                dtype="bfloat16",
+                shape=[5, 1],
+            ),
+            p2p_pb2.TensorCatalogEntry(
+                name="w1",
+                byte_len=20,
+                dtype="bfloat16",
+                shape=[10, 1],
+            ),
+        ],
+        generation=3,
+    )
+
+    assert resp.success
+    assert resp.entries_accepted == 2
+    assert resp.total_bytes == 30
+    assert resp.generation == 3
+
+
 def test_resolve_endpoint_substitutes_rank():
     client = MxK8sServiceClient(
         worker_rank=7,

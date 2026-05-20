@@ -892,6 +892,14 @@ class TestPublishMetadataAndReady:
 
         mx_client = MagicMock()
         mx_client.publish_metadata.return_value = "abc123def456abcd"
+        mx_client.advertise_tensor_catalog.return_value = (
+            p2p_pb2.AdvertiseTensorCatalogResponse(
+                success=True,
+                entries_accepted=3,
+                total_bytes=1536,
+                generation=1,
+            )
+        )
 
         nixl_manager = MagicMock()
         nixl_manager.nixl_metadata = b"nixl-data"
@@ -903,6 +911,7 @@ class TestPublishMetadataAndReady:
             t.numel.return_value = 256
             t.element_size.return_value = 2
             t.dtype = torch.bfloat16
+            t.shape = (256,)
             tensors[f"layer.{i}.weight"] = t
 
         identity = _make_identity("my-model")
@@ -915,6 +924,21 @@ class TestPublishMetadataAndReady:
         assert call_args.args[0] is identity
         assert call_args.args[2] == "inst-uuid"
 
+        mx_client.advertise_tensor_catalog.assert_called_once()
+        catalog_call = mx_client.advertise_tensor_catalog.call_args.kwargs
+        assert catalog_call["identity"] is identity
+        assert catalog_call["worker_id"] == "inst-uuid"
+        assert catalog_call["worker_rank"] == 2
+        assert catalog_call["generation"] == 1
+        assert [entry.name for entry in catalog_call["entries"]] == [
+            "layer.0.weight",
+            "layer.1.weight",
+            "layer.2.weight",
+        ]
+        assert catalog_call["entries"][0].byte_len == 512
+        assert catalog_call["entries"][0].dtype == "torch.bfloat16"
+        assert list(catalog_call["entries"][0].shape) == [256]
+
         hb_cls.assert_called_once_with(
             mx_client=mx_client,
             mx_source_id="abc123def456abcd",
@@ -922,6 +946,33 @@ class TestPublishMetadataAndReady:
             worker_rank=2,
             nixl_manager=nixl_manager,
         )
+        mock_hb.start.assert_called_once()
+
+    def test_advertise_failure_does_not_block_heartbeat(self, caplog):
+        from modelexpress.metadata.publish import publish_metadata_and_ready
+
+        mx_client = MagicMock()
+        mx_client.publish_metadata.return_value = "abc123def456abcd"
+        mx_client.advertise_tensor_catalog.side_effect = RuntimeError("catalog down")
+
+        nixl_manager = MagicMock()
+        nixl_manager.nixl_metadata = b"nixl-data"
+
+        identity = _make_identity("my-model")
+        mock_hb = MagicMock()
+        with caplog.at_level(logging.WARNING, logger="modelexpress.metadata.publish"), \
+             patch("modelexpress.metadata.publish.HeartbeatThread", return_value=mock_hb):
+            publish_metadata_and_ready(
+                mx_client,
+                nixl_manager,
+                {},
+                worker_rank=2,
+                device_id=0,
+                identity=identity,
+                worker_id="inst-uuid",
+            )
+
+        assert any("AdvertiseTensorCatalog failed" in rec.message for rec in caplog.records)
         mock_hb.start.assert_called_once()
 
     def test_retries_publish_before_starting_heartbeat(self):

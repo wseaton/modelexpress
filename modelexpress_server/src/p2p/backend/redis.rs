@@ -14,7 +14,10 @@
 //! Global listing uses SCAN with pattern `mx:source:????????????????` (16-char source IDs)
 //! to enumerate source index keys without a separate secondary index.
 
-use super::{MetadataBackend, MetadataResult, ModelMetadataRecord, TensorRecord, WorkerRecord};
+use super::{
+    MetadataBackend, MetadataResult, ModelMetadataRecord, TensorCatalogEntryRecord,
+    TensorCatalogRecord, TensorRecord, WorkerRecord,
+};
 use async_trait::async_trait;
 use modelexpress_common::grpc::p2p::WorkerMetadata;
 use modelexpress_common::grpc::p2p::{SourceIdentity, SourceStatus};
@@ -111,6 +114,79 @@ struct TensorRecordJson {
     pub size: u64,
     pub device_id: u32,
     pub dtype: String,
+}
+
+/// Serializable version of TensorCatalogEntryRecord for Redis storage.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TensorCatalogEntryJson {
+    pub name: String,
+    #[serde(
+        serialize_with = "serialize_u64_as_string",
+        deserialize_with = "deserialize_u64_from_any"
+    )]
+    pub byte_len: u64,
+    pub dtype: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shape: Vec<i64>,
+}
+
+impl From<TensorCatalogEntryRecord> for TensorCatalogEntryJson {
+    fn from(record: TensorCatalogEntryRecord) -> Self {
+        Self {
+            name: record.name,
+            byte_len: record.byte_len,
+            dtype: record.dtype,
+            shape: record.shape,
+        }
+    }
+}
+
+impl From<TensorCatalogEntryJson> for TensorCatalogEntryRecord {
+    fn from(json: TensorCatalogEntryJson) -> Self {
+        Self {
+            name: json.name,
+            byte_len: json.byte_len,
+            dtype: json.dtype,
+            shape: json.shape,
+        }
+    }
+}
+
+/// Serializable version of TensorCatalogRecord for Redis storage.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TensorCatalogJson {
+    #[serde(
+        serialize_with = "serialize_u64_as_string",
+        deserialize_with = "deserialize_u64_from_any"
+    )]
+    pub generation: u64,
+    pub entries: Vec<TensorCatalogEntryJson>,
+}
+
+impl From<TensorCatalogRecord> for TensorCatalogJson {
+    fn from(record: TensorCatalogRecord) -> Self {
+        Self {
+            generation: record.generation,
+            entries: record
+                .entries
+                .into_iter()
+                .map(TensorCatalogEntryJson::from)
+                .collect(),
+        }
+    }
+}
+
+impl From<TensorCatalogJson> for TensorCatalogRecord {
+    fn from(json: TensorCatalogJson) -> Self {
+        Self {
+            generation: json.generation,
+            entries: json
+                .entries
+                .into_iter()
+                .map(TensorCatalogEntryRecord::from)
+                .collect(),
+        }
+    }
 }
 
 fn serialize_u64_as_string<S>(value: &u64, serializer: S) -> Result<S::Ok, S::Error>
@@ -214,6 +290,12 @@ struct WorkerRecordJson {
     /// P2P: Worker gRPC endpoint for tensor manifest
     #[serde(default)]
     pub worker_grpc_endpoint: String,
+    /// External-identity labels used by planner informers.
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub labels: std::collections::HashMap<String, String>,
+    /// Lightweight owned-tensor catalog used by the planner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tensor_catalog: Option<TensorCatalogJson>,
 }
 
 impl WorkerRecordJson {
@@ -239,6 +321,8 @@ impl WorkerRecordJson {
             metadata_endpoint: record.metadata_endpoint,
             agent_name: record.agent_name,
             worker_grpc_endpoint: record.worker_grpc_endpoint,
+            labels: record.labels,
+            tensor_catalog: record.tensor_catalog.map(TensorCatalogJson::from),
         }
     }
 }
@@ -258,6 +342,8 @@ impl From<WorkerRecordJson> for WorkerRecord {
             metadata_endpoint: json.metadata_endpoint,
             agent_name: json.agent_name,
             worker_grpc_endpoint: json.worker_grpc_endpoint,
+            labels: json.labels,
+            tensor_catalog: json.tensor_catalog.map(TensorCatalogRecord::from),
         }
     }
 }
@@ -577,6 +663,49 @@ impl MetadataBackend for RedisBackend {
         );
         Ok(())
     }
+
+    async fn put_tensor_catalog(
+        &self,
+        source_id: &str,
+        worker_id: &str,
+        worker_rank: u32,
+        catalog: TensorCatalogRecord,
+    ) -> MetadataResult<()> {
+        let mut conn = self.get_conn().await?;
+        let key = format!("{}{}:{}", keys::SOURCE_PREFIX, source_id, worker_id);
+        let field = worker_rank.to_string();
+
+        let value: Option<String> = conn.hget(&key, &field).await?;
+        let json_str = value.ok_or_else(|| {
+            format!(
+                "put_tensor_catalog: rank {} not found in source '{}' worker '{}'",
+                worker_rank, source_id, worker_id
+            )
+        })?;
+
+        let mut record: WorkerRecordJson = serde_json::from_str(&json_str)?;
+        if let Some(existing) = &record.tensor_catalog
+            && catalog.generation <= existing.generation
+        {
+            return Err(format!(
+                "stale tensor catalog generation {} for source '{}' worker '{}' rank {}; current generation is {}",
+                catalog.generation, source_id, worker_id, worker_rank, existing.generation
+            )
+            .into());
+        }
+
+        let entry_count = catalog.entries.len();
+        record.tensor_catalog = Some(TensorCatalogJson::from(catalog));
+
+        let updated = serde_json::to_string(&record)?;
+        conn.hset::<_, _, _, ()>(&key, &field, &updated).await?;
+
+        debug!(
+            "Updated tensor catalog for source '{}' worker '{}' rank {} ({} entries)",
+            source_id, worker_id, worker_rank, entry_count
+        );
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -654,6 +783,8 @@ mod tests {
             metadata_endpoint: String::new(),
             agent_name: String::new(),
             worker_grpc_endpoint: String::new(),
+            labels: std::collections::HashMap::new(),
+            tensor_catalog: None,
         };
 
         let json_record = WorkerRecordJson::from_worker_record(record.clone());
@@ -666,6 +797,45 @@ mod tests {
         assert_eq!(back.status, record.status);
         assert_eq!(back.updated_at, record.updated_at);
         assert_eq!(back.tensors.len(), 1);
+    }
+
+    #[test]
+    fn test_worker_record_json_roundtrip_with_tensor_catalog() {
+        let record = WorkerRecord {
+            worker_rank: 2,
+            backend_metadata: super::super::BackendMetadataRecord::Nixl(vec![1, 2, 3]),
+            tensors: vec![],
+            status: 2,
+            updated_at: 1_700_000_000_000,
+            metadata_endpoint: String::new(),
+            agent_name: String::new(),
+            worker_grpc_endpoint: String::new(),
+            labels: std::collections::HashMap::new(),
+            tensor_catalog: Some(TensorCatalogRecord {
+                generation: 7,
+                entries: vec![TensorCatalogEntryRecord {
+                    name: "model.layers.0.weight".to_string(),
+                    byte_len: 1_099_511_627_776,
+                    dtype: "bfloat16".to_string(),
+                    shape: vec![4096, 4096],
+                }],
+            }),
+        };
+
+        let json_record = WorkerRecordJson::from_worker_record(record.clone());
+        let json = serde_json::to_string(&json_record).expect("serialize");
+        assert!(json.contains(r#""generation":"7""#));
+        assert!(json.contains(r#""byte_len":"1099511627776""#));
+
+        let parsed: WorkerRecordJson = serde_json::from_str(&json).expect("deserialize");
+        let back = WorkerRecord::from(parsed);
+        let catalog = back.tensor_catalog.expect("catalog");
+
+        assert_eq!(catalog.generation, 7);
+        assert_eq!(catalog.entries.len(), 1);
+        assert_eq!(catalog.entries[0].name, "model.layers.0.weight");
+        assert_eq!(catalog.entries[0].byte_len, 1_099_511_627_776);
+        assert_eq!(catalog.entries[0].shape, vec![4096, 4096]);
     }
 
     #[test]

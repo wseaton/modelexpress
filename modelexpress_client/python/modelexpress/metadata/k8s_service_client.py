@@ -288,6 +288,36 @@ class MxK8sServiceClient(MxClientBase):
         logger.error("%s: %s", message, last_error)
         raise RuntimeError(f"{message}: {last_error}") from last_error
 
+    def compute_transfer_plan(
+        self,
+        identity: "p2p_pb2.SourceIdentity",
+        requester_worker_rank: int,
+        requester_worker_id: str,
+        max_peers: int | None = None,
+    ) -> "p2p_pb2.ComputeTransferPlanResponse":
+        raise NotImplementedError(
+            "compute_transfer_plan requires a central coordinator; "
+            "K8s-Service-routed backends use direct peer discovery"
+        )
+
+    def advertise_tensor_catalog(
+        self,
+        identity: "p2p_pb2.SourceIdentity",
+        worker_id: str,
+        worker_rank: int,
+        entries: list["p2p_pb2.TensorCatalogEntry"],
+        generation: int,
+    ) -> "p2p_pb2.AdvertiseTensorCatalogResponse":
+        """No-op: this backend has no central planner catalog store."""
+        del identity, worker_id, worker_rank
+        return p2p_pb2.AdvertiseTensorCatalogResponse(
+            success=True,
+            message="k8s-service backend has no central catalog store",
+            entries_accepted=len(entries),
+            total_bytes=sum(entry.byte_len for entry in entries),
+            generation=generation,
+        )
+
     def update_status(
         self,
         mx_source_id: str,

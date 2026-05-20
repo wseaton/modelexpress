@@ -76,6 +76,27 @@ class MxClientBase(ABC):
         """Update a source worker's lifecycle status."""
 
     @abstractmethod
+    def advertise_tensor_catalog(
+        self,
+        identity: "p2p_pb2.SourceIdentity",
+        worker_id: str,
+        worker_rank: int,
+        entries: list["p2p_pb2.TensorCatalogEntry"],
+        generation: int,
+    ) -> "p2p_pb2.AdvertiseTensorCatalogResponse":
+        """Persist this worker's lightweight owned-tensor catalog."""
+
+    @abstractmethod
+    def compute_transfer_plan(
+        self,
+        identity: "p2p_pb2.SourceIdentity",
+        requester_worker_rank: int,
+        requester_worker_id: str,
+        max_peers: int | None = None,
+    ) -> "p2p_pb2.ComputeTransferPlanResponse":
+        """Compute a multi-peer transfer plan with server-side bin-packing."""
+
+    @abstractmethod
     def close(self) -> None:
         """Release any resources held by the client."""
 
@@ -112,10 +133,8 @@ class MxClient(MxClientBase):
     """
     Lightweight gRPC client for ModelExpress server communication.
 
-    Provides typed methods for every P2P RPC (``PublishMetadata``,
-    ``ListSources``, ``GetMetadata``, ``UpdateStatus``) so that callers
-    (loaders, coordinators) never need to create gRPC channels or
-    stubs directly.
+    Provides typed methods for every P2P RPC so that callers (loaders,
+    coordinators) never need to create gRPC channels or stubs directly.
 
     The connection is created lazily on first use.
 
@@ -223,3 +242,41 @@ class MxClient(MxClientBase):
         if not response.success:
             logger.error("UpdateStatus failed: %s", response.message)
         return response.success
+
+    def advertise_tensor_catalog(
+        self,
+        identity: "p2p_pb2.SourceIdentity",
+        worker_id: str,
+        worker_rank: int,
+        entries: list["p2p_pb2.TensorCatalogEntry"],
+        generation: int,
+    ) -> "p2p_pb2.AdvertiseTensorCatalogResponse":
+        """Persist this worker's lightweight catalog for transfer planning."""
+        request = p2p_pb2.AdvertiseTensorCatalogRequest(
+            identity=identity,
+            worker_id=worker_id,
+            worker_rank=worker_rank,
+            entries=entries,
+            generation=generation,
+        )
+        response = self.stub.AdvertiseTensorCatalog(request, timeout=30)
+        if not response.success:
+            raise RuntimeError(f"AdvertiseTensorCatalog failed: {response.message}")
+        return response
+
+    def compute_transfer_plan(
+        self,
+        identity: "p2p_pb2.SourceIdentity",
+        requester_worker_rank: int,
+        requester_worker_id: str,
+        max_peers: int | None = None,
+    ) -> "p2p_pb2.ComputeTransferPlanResponse":
+        """Compute a multi-peer transfer plan with server-side bin-packing."""
+        request = p2p_pb2.ComputeTransferPlanRequest(
+            identity=identity,
+            requester_worker_rank=requester_worker_rank,
+            requester_worker_id=requester_worker_id,
+        )
+        if max_peers is not None:
+            request.max_peers = max_peers
+        return self.stub.ComputeTransferPlan(request, timeout=30)

@@ -246,3 +246,35 @@ class TestReceiveFromSourceManifestValidation:
             remote_agent_name="dummy",
         )
         assert result == (0, 0, 0.0)
+
+    def test_multi_peer_missing_local_tensor_raises(self, monkeypatch):
+        mgr = self._make_manager(monkeypatch, {"x": torch.zeros(1, dtype=torch.float32)})
+        source_tensor = TensorDescriptor(
+            name="w", addr=0x1000, size=4, device_id=0, dtype="torch.float32",
+        )
+        with pytest.raises(ManifestMismatchError, match="missing locally"):
+            mgr.receive_from_peers(
+                peers=[("peer-a", [source_tensor], {"w"})],
+            )
+
+    def test_multi_peer_missing_assigned_source_tensor_raises(self, monkeypatch):
+        local = torch.zeros(1, dtype=torch.float32)
+        mgr = self._make_manager(monkeypatch, {"w": local})
+        source_tensor = TensorDescriptor(
+            name="w", addr=0x1000, size=4, device_id=0, dtype=str(local.dtype),
+        )
+        with pytest.raises(ManifestMismatchError, match="missing assigned tensor"):
+            mgr.receive_from_peers(
+                peers=[("peer-a", [source_tensor], {"w", "missing"})],
+            )
+
+    def test_multi_peer_dtype_mismatch_raises(self, monkeypatch):
+        local = torch.zeros(10, dtype=torch.float32)
+        mgr = self._make_manager(monkeypatch, {"w": local})
+        source_tensor = TensorDescriptor(
+            name="w", addr=0x1000, size=40, device_id=0, dtype="torch.bfloat16",
+        )
+        with pytest.raises(ManifestMismatchError, match="dtype mismatch"):
+            mgr.receive_from_peers(
+                peers=[("peer-a", [source_tensor], {"w"})],
+            )

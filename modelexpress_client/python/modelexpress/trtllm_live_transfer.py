@@ -26,6 +26,7 @@ from typing import Any, Optional
 import torch
 
 from .client import MxClient
+from .metadata.publish import advertise_tensor_catalog, build_tensor_catalog_entries
 from . import p2p_pb2
 
 logger = logging.getLogger("modelexpress.trtllm_live_transfer")
@@ -143,6 +144,16 @@ def publish_model_params(torch_model: Any) -> None:
             "ModelExpress worker rank %d (GPU %d) published %.2f GB (mx_source_id=%s)",
             mpi_rank, device_id, total_bytes / 1e9, mx_source_id,
         )
+
+        # Advertise the owned-tensor catalog so the server-side planner can
+        # spread assignments and validate dtype/shape across peers.
+        advertise_tensor_catalog(
+            mx_client=mx_client,
+            identity=identity,
+            worker_id=worker_id,
+            worker_rank=mpi_rank,
+            entries=build_tensor_catalog_entries(param_tensors),
+        )
     finally:
         mx_client.close()
 
@@ -250,10 +261,19 @@ def publish_from_worker(worker: Any) -> None:
     identity = _build_trtllm_identity(model_name=model_name)
     worker_id = uuid.uuid4().hex[:8]
     mx_client = MxClient(server_url=mx_server)
-    mx_source_id = mx_client.publish_metadata(
-        identity=identity, worker=my_worker, worker_id=worker_id,
-    )
-    mx_client.close()
+    try:
+        mx_source_id = mx_client.publish_metadata(
+            identity=identity, worker=my_worker, worker_id=worker_id,
+        )
+        advertise_tensor_catalog(
+            mx_client=mx_client,
+            identity=identity,
+            worker_id=worker_id,
+            worker_rank=mpi_rank,
+            entries=build_tensor_catalog_entries(param_tensors),
+        )
+    finally:
+        mx_client.close()
 
     logger.info(
         "ModelExpress worker rank %d (GPU %d) published %.2f GB (mx_source_id=%s)",

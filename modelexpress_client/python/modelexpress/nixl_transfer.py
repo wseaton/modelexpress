@@ -582,6 +582,150 @@ class NixlTransferManager:
 
         return total_bytes, matched_tensors, duration
 
+    def receive_from_peers(
+        self,
+        peers: list[tuple[str, list[TensorDescriptor], set[str]]],
+        timeout_seconds: float = 300.0,
+    ) -> tuple[int, int, float]:
+        """Receive tensors from multiple peers in parallel.
+
+        Issues RDMA READs to all peers before waiting on any, so transfers
+        from separate NICs overlap. Same fire-then-collect pattern as
+        layercast's _nixl_load_multi_peer.
+
+        Args:
+            peers: List of (remote_agent_name, source_tensors, assigned_names).
+                Each peer's source_tensors is its full manifest; assigned_names
+                is the subset this peer should serve.
+            timeout_seconds: Maximum wall-clock time for all transfers.
+
+        Returns:
+            Tuple of (total_bytes, total_tensors, duration).
+        """
+        if self._agent is None:
+            raise RuntimeError("NIXL agent not initialized")
+
+        start_time = time.perf_counter()
+        torch.cuda.set_device(self._device_id)
+
+        total_bytes = 0
+        total_tensors = 0
+        in_flight: list[tuple[str, int, object]] = []
+
+        for remote_agent_name, source_tensors, assigned_names in peers:
+            remote_descs: list[tuple[int, int, int]] = []
+            local_descs: list[tuple[int, int, int]] = []
+            peer_bytes = 0
+            missing_from_source = set(assigned_names)
+
+            for src_tensor in source_tensors:
+                if src_tensor.name not in assigned_names:
+                    continue
+                missing_from_source.discard(src_tensor.name)
+                local_tensor = self._tensors.get(src_tensor.name)
+                if local_tensor is None:
+                    raise ManifestMismatchError(
+                        f"Assigned tensor '{src_tensor.name}' is missing locally"
+                    )
+                local_size = local_tensor.numel() * local_tensor.element_size()
+                if local_size != src_tensor.size:
+                    raise ManifestMismatchError(
+                        f"Tensor '{src_tensor.name}' size mismatch: "
+                        f"source={src_tensor.size} bytes, local={local_size} bytes"
+                    )
+                local_dtype = str(local_tensor.dtype)
+                if local_dtype != src_tensor.dtype:
+                    raise ManifestMismatchError(
+                        f"Tensor '{src_tensor.name}' dtype mismatch: "
+                        f"source={src_tensor.dtype!r}, local={local_dtype!r}"
+                    )
+                remote_descs.append(
+                    (src_tensor.addr, src_tensor.size, src_tensor.device_id)
+                )
+                local_descs.append(
+                    (local_tensor.data_ptr(), local_size, self._device_id)
+                )
+                peer_bytes += src_tensor.size
+
+            if missing_from_source:
+                missing = ", ".join(sorted(missing_from_source))
+                raise ManifestMismatchError(
+                    f"Peer '{remote_agent_name}' missing assigned tensor(s): {missing}"
+                )
+
+            if not remote_descs:
+                continue
+
+            src_prepped = self._agent.prep_xfer_dlist(
+                agent_name=remote_agent_name,
+                xfer_list=remote_descs,
+                mem_type="cuda",
+                backends=self._backends,
+            )
+            dst_prepped = self._agent.prep_xfer_dlist(
+                agent_name="",
+                xfer_list=local_descs,
+                mem_type="cuda",
+                backends=self._backends,
+            )
+            indices = list(range(len(remote_descs)))
+            handle = self._agent.make_prepped_xfer(
+                operation="READ",
+                local_xfer_side=dst_prepped,
+                local_indices=indices,
+                remote_xfer_side=src_prepped,
+                remote_indices=indices,
+                backends=self._backends,
+            )
+            self._agent.transfer(handle)
+
+            in_flight.append((remote_agent_name, len(remote_descs), handle))
+            total_bytes += peer_bytes
+            total_tensors += len(remote_descs)
+
+            logger.info(
+                f"Issued transfer to {remote_agent_name}: "
+                f"{len(remote_descs)} tensors, {peer_bytes / 1e9:.2f} GB"
+            )
+
+        for remote_agent_name, tensor_count, handle in in_flight:
+            deadline = start_time + timeout_seconds
+            while True:
+                remaining = deadline - time.perf_counter()
+                if remaining <= 0:
+                    self._agent.release_xfer_handle(handle)
+                    raise TimeoutError(
+                        f"Transfer from {remote_agent_name} timed out"
+                    )
+                status = self._agent.check_xfer_state(handle)
+                if status in ("DONE", "SUCCESS"):
+                    self._agent.release_xfer_handle(handle)
+                    logger.info(
+                        f"Transfer from {remote_agent_name} complete "
+                        f"({tensor_count} tensors)"
+                    )
+                    break
+                if status in ("ERR", "ERROR", "FAIL"):
+                    self._agent.release_xfer_handle(handle)
+                    raise RuntimeError(
+                        f"Transfer from {remote_agent_name} failed: {status}"
+                    )
+                time.sleep(0.001)
+
+        torch.cuda.synchronize(self._device_id)
+
+        duration = time.perf_counter() - start_time
+        bandwidth_gbps = (
+            (total_bytes * 8) / (duration * 1e9) if duration > 0 else 0.0
+        )
+        logger.info(
+            f"Multi-peer transfer complete: {len(in_flight)} peers, "
+            f"{total_tensors} tensors, {total_bytes / 1e9:.2f} GB in "
+            f"{duration:.2f}s ({bandwidth_gbps:.1f} Gbps)"
+        )
+
+        return total_bytes, total_tensors, duration
+
     def is_healthy(self) -> bool:
         """Check if the NIXL agent is initialized and has registered metadata."""
         return self._agent is not None and len(self._metadata) > 0
