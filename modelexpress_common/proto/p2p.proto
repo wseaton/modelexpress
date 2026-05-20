@@ -32,23 +32,22 @@ service P2pService {
 
   // Advertise this worker's owned-tensor inventory for planning.
   //
-  // Lightweight catalog (name + dtype + byte_len + optional shape; no GPU
+  // Lightweight entries (name + dtype + byte_len + optional shape; no GPU
   // addresses) used by the planner to match peers that own a needed tensor.
-  // Required for models where peers may own disjoint shards (MoE with
-  // expert-parallel, asymmetric quantization variants, etc.), since the
-  // server cannot derive ownership from SourceIdentity alone.
+  // Required: the server cannot derive ownership from SourceIdentity alone
+  // (peers may own disjoint shards — MoE with expert-parallel, asymmetric
+  // quantization variants, etc.), so a peer that has not advertised an
+  // inventory is not eligible to serve any tensor in a plan.
   //
   // Sent once per peer after the model is loaded and before the peer is
-  // considered eligible for transfer planning. Receivers also call this
-  // before requesting a plan (with an empty entries list) so the planner
-  // can diff what the receiver has against what peers own; receivers then
-  // re-advertise the populated catalog after the transfer completes so
+  // considered eligible for transfer planning. Sources advertise after
+  // load; receivers re-advertise after their own transfer completes so
   // they can serve future requesters.
   //
-  // Re-sending replaces the previous catalog for (mx_source_id, worker_id)
+  // Re-sending replaces the previous inventory for (mx_source_id, worker_id)
   // iff the new generation is higher. The lease expires with the worker's
   // heartbeat (same lifecycle as PublishMetadata).
-  rpc AdvertiseTensorCatalog(AdvertiseTensorCatalogRequest) returns (AdvertiseTensorCatalogResponse);
+  rpc AdvertiseInventory(AdvertiseInventoryRequest) returns (AdvertiseInventoryResponse);
 }
 
 // ============================================================================
@@ -361,11 +360,9 @@ message ComputeTransferPlanRequest {
   // Optional explicit list of tensor names the requester needs.
   //
   // If populated, the planner restricts assignments to this set.
-  // If empty, the planner uses the requester's own advertised catalog
-  // (from a prior AdvertiseTensorCatalog call with the matching
-  // worker_id) as the implied need-set. Falling back to the union of
-  // all peers' catalogs is a last resort and the planner returns it in
-  // PlanDiagnostics.note for visibility.
+  // If empty, the planner uses the union of all peers' advertised
+  // inventories as the need-set (the cold-start full-load case: the
+  // requester needs the whole model).
   repeated string requested_tensor_names = 5;
 }
 
@@ -426,12 +423,12 @@ message ComputeTransferPlanResponse {
 }
 
 // ============================================================================
-// Tensor Catalog (planning inventory)
+// Inventory (planning ownership)
 // ============================================================================
 
-// One owned-tensor entry in a peer's catalog. Lighter than TensorDescriptor:
+// One owned-tensor entry in a peer's inventory. Lighter than TensorDescriptor:
 // no GPU address (those flow through GetTensorManifest at transfer time).
-message TensorCatalogEntry {
+message InventoryEntry {
   // Fully-qualified tensor name. Required. For MoE this includes the
   // expert index, e.g. "model.layers.42.mlp.experts.7.w1.weight".
   string name = 1;
@@ -449,9 +446,9 @@ message TensorCatalogEntry {
   repeated int64 shape = 4;
 }
 
-message AdvertiseTensorCatalogRequest {
+message AdvertiseInventoryRequest {
   // Source identity; the server derives mx_source_id and restricts
-  // catalog scope to peers with the same key.
+  // inventory scope to peers with the same key.
   SourceIdentity identity = 1;
 
   // Worker that owns these tensors. Must match a prior PublishMetadata
@@ -462,7 +459,7 @@ message AdvertiseTensorCatalogRequest {
   // Full owned-tensor inventory at this generation. Each name must be
   // unique within entries. An empty list is valid (the receiver-side
   // pre-plan advertise pattern).
-  repeated TensorCatalogEntry entries = 4;
+  repeated InventoryEntry entries = 4;
 
   // Monotonic generation counter. The server keeps only the highest
   // generation per (mx_source_id, worker_id) and rejects stale writes.
@@ -470,7 +467,7 @@ message AdvertiseTensorCatalogRequest {
   uint64 generation = 5;
 }
 
-message AdvertiseTensorCatalogResponse {
+message AdvertiseInventoryResponse {
   bool success = 1;
   string message = 2;
   // Echoed totals for client-side sanity check.

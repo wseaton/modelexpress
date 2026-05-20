@@ -15,8 +15,8 @@
 //! to enumerate source index keys without a separate secondary index.
 
 use super::{
-    MetadataBackend, MetadataResult, ModelMetadataRecord, TensorCatalogEntryRecord,
-    TensorCatalogRecord, TensorRecord, WorkerRecord,
+    InventoryEntryRecord, InventoryRecord, MetadataBackend, MetadataResult, ModelMetadataRecord,
+    TensorRecord, WorkerRecord,
 };
 use async_trait::async_trait;
 use modelexpress_common::grpc::p2p::WorkerMetadata;
@@ -116,9 +116,9 @@ struct TensorRecordJson {
     pub dtype: String,
 }
 
-/// Serializable version of TensorCatalogEntryRecord for Redis storage.
+/// Serializable version of InventoryEntryRecord for Redis storage.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct TensorCatalogEntryJson {
+struct InventoryEntryJson {
     pub name: String,
     #[serde(
         serialize_with = "serialize_u64_as_string",
@@ -130,8 +130,8 @@ struct TensorCatalogEntryJson {
     pub shape: Vec<i64>,
 }
 
-impl From<TensorCatalogEntryRecord> for TensorCatalogEntryJson {
-    fn from(record: TensorCatalogEntryRecord) -> Self {
+impl From<InventoryEntryRecord> for InventoryEntryJson {
+    fn from(record: InventoryEntryRecord) -> Self {
         Self {
             name: record.name,
             byte_len: record.byte_len,
@@ -141,8 +141,8 @@ impl From<TensorCatalogEntryRecord> for TensorCatalogEntryJson {
     }
 }
 
-impl From<TensorCatalogEntryJson> for TensorCatalogEntryRecord {
-    fn from(json: TensorCatalogEntryJson) -> Self {
+impl From<InventoryEntryJson> for InventoryEntryRecord {
+    fn from(json: InventoryEntryJson) -> Self {
         Self {
             name: json.name,
             byte_len: json.byte_len,
@@ -152,38 +152,38 @@ impl From<TensorCatalogEntryJson> for TensorCatalogEntryRecord {
     }
 }
 
-/// Serializable version of TensorCatalogRecord for Redis storage.
+/// Serializable version of InventoryRecord for Redis storage.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct TensorCatalogJson {
+struct InventoryJson {
     #[serde(
         serialize_with = "serialize_u64_as_string",
         deserialize_with = "deserialize_u64_from_any"
     )]
     pub generation: u64,
-    pub entries: Vec<TensorCatalogEntryJson>,
+    pub entries: Vec<InventoryEntryJson>,
 }
 
-impl From<TensorCatalogRecord> for TensorCatalogJson {
-    fn from(record: TensorCatalogRecord) -> Self {
+impl From<InventoryRecord> for InventoryJson {
+    fn from(record: InventoryRecord) -> Self {
         Self {
             generation: record.generation,
             entries: record
                 .entries
                 .into_iter()
-                .map(TensorCatalogEntryJson::from)
+                .map(InventoryEntryJson::from)
                 .collect(),
         }
     }
 }
 
-impl From<TensorCatalogJson> for TensorCatalogRecord {
-    fn from(json: TensorCatalogJson) -> Self {
+impl From<InventoryJson> for InventoryRecord {
+    fn from(json: InventoryJson) -> Self {
         Self {
             generation: json.generation,
             entries: json
                 .entries
                 .into_iter()
-                .map(TensorCatalogEntryRecord::from)
+                .map(InventoryEntryRecord::from)
                 .collect(),
         }
     }
@@ -293,9 +293,9 @@ struct WorkerRecordJson {
     /// External-identity labels published by the worker.
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub labels: std::collections::HashMap<String, String>,
-    /// Lightweight owned-tensor catalog used by the planner.
+    /// Lightweight owned-tensor inventory used by the planner.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tensor_catalog: Option<TensorCatalogJson>,
+    pub inventory: Option<InventoryJson>,
 }
 
 impl WorkerRecordJson {
@@ -322,7 +322,7 @@ impl WorkerRecordJson {
             agent_name: record.agent_name,
             worker_grpc_endpoint: record.worker_grpc_endpoint,
             labels: record.labels,
-            tensor_catalog: record.tensor_catalog.map(TensorCatalogJson::from),
+            inventory: record.inventory.map(InventoryJson::from),
         }
     }
 }
@@ -343,7 +343,7 @@ impl From<WorkerRecordJson> for WorkerRecord {
             agent_name: json.agent_name,
             worker_grpc_endpoint: json.worker_grpc_endpoint,
             labels: json.labels,
-            tensor_catalog: json.tensor_catalog.map(TensorCatalogRecord::from),
+            inventory: json.inventory.map(InventoryRecord::from),
         }
     }
 }
@@ -664,12 +664,12 @@ impl MetadataBackend for RedisBackend {
         Ok(())
     }
 
-    async fn put_tensor_catalog(
+    async fn put_inventory(
         &self,
         source_id: &str,
         worker_id: &str,
         worker_rank: u32,
-        catalog: TensorCatalogRecord,
+        inventory: InventoryRecord,
     ) -> MetadataResult<()> {
         let mut conn = self.get_conn().await?;
         let key = format!("{}{}:{}", keys::SOURCE_PREFIX, source_id, worker_id);
@@ -678,30 +678,30 @@ impl MetadataBackend for RedisBackend {
         let value: Option<String> = conn.hget(&key, &field).await?;
         let json_str = value.ok_or_else(|| {
             format!(
-                "put_tensor_catalog: rank {} not found in source '{}' worker '{}'",
+                "put_inventory: rank {} not found in source '{}' worker '{}'",
                 worker_rank, source_id, worker_id
             )
         })?;
 
         let mut record: WorkerRecordJson = serde_json::from_str(&json_str)?;
-        if let Some(existing) = &record.tensor_catalog
-            && catalog.generation <= existing.generation
+        if let Some(existing) = &record.inventory
+            && inventory.generation <= existing.generation
         {
             return Err(format!(
-                "stale tensor catalog generation {} for source '{}' worker '{}' rank {}; current generation is {}",
-                catalog.generation, source_id, worker_id, worker_rank, existing.generation
+                "stale tensor inventory generation {} for source '{}' worker '{}' rank {}; current generation is {}",
+                inventory.generation, source_id, worker_id, worker_rank, existing.generation
             )
             .into());
         }
 
-        let entry_count = catalog.entries.len();
-        record.tensor_catalog = Some(TensorCatalogJson::from(catalog));
+        let entry_count = inventory.entries.len();
+        record.inventory = Some(InventoryJson::from(inventory));
 
         let updated = serde_json::to_string(&record)?;
         conn.hset::<_, _, _, ()>(&key, &field, &updated).await?;
 
         debug!(
-            "Updated tensor catalog for source '{}' worker '{}' rank {} ({} entries)",
+            "Updated tensor inventory for source '{}' worker '{}' rank {} ({} entries)",
             source_id, worker_id, worker_rank, entry_count
         );
         Ok(())
@@ -784,7 +784,7 @@ mod tests {
             agent_name: String::new(),
             worker_grpc_endpoint: String::new(),
             labels: std::collections::HashMap::new(),
-            tensor_catalog: None,
+            inventory: None,
         };
 
         let json_record = WorkerRecordJson::from_worker_record(record.clone());
@@ -800,7 +800,7 @@ mod tests {
     }
 
     #[test]
-    fn test_worker_record_json_roundtrip_with_tensor_catalog() {
+    fn test_worker_record_json_roundtrip_with_inventory() {
         let record = WorkerRecord {
             worker_rank: 2,
             backend_metadata: super::super::BackendMetadataRecord::Nixl(vec![1, 2, 3]),
@@ -811,9 +811,9 @@ mod tests {
             agent_name: String::new(),
             worker_grpc_endpoint: String::new(),
             labels: std::collections::HashMap::new(),
-            tensor_catalog: Some(TensorCatalogRecord {
+            inventory: Some(InventoryRecord {
                 generation: 7,
-                entries: vec![TensorCatalogEntryRecord {
+                entries: vec![InventoryEntryRecord {
                     name: "model.layers.0.weight".to_string(),
                     byte_len: 1_099_511_627_776,
                     dtype: "bfloat16".to_string(),
@@ -829,13 +829,13 @@ mod tests {
 
         let parsed: WorkerRecordJson = serde_json::from_str(&json).expect("deserialize");
         let back = WorkerRecord::from(parsed);
-        let catalog = back.tensor_catalog.expect("catalog");
+        let inventory = back.inventory.expect("inventory");
 
-        assert_eq!(catalog.generation, 7);
-        assert_eq!(catalog.entries.len(), 1);
-        assert_eq!(catalog.entries[0].name, "model.layers.0.weight");
-        assert_eq!(catalog.entries[0].byte_len, 1_099_511_627_776);
-        assert_eq!(catalog.entries[0].shape, vec![4096, 4096]);
+        assert_eq!(inventory.generation, 7);
+        assert_eq!(inventory.entries.len(), 1);
+        assert_eq!(inventory.entries[0].name, "model.layers.0.weight");
+        assert_eq!(inventory.entries[0].byte_len, 1_099_511_627_776);
+        assert_eq!(inventory.entries[0].shape, vec![4096, 4096]);
     }
 
     #[test]

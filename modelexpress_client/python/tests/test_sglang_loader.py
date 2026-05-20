@@ -470,10 +470,10 @@ def test_transfer_engine_publish_starts_non_nixl_heartbeat():
         published["status"] = kwargs
         return True
 
-    def advertise_tensor_catalog(**kwargs):
-        published["catalog"] = kwargs
+    def advertise_inventory(**kwargs):
+        published["inventory"] = kwargs
         entries = kwargs["entries"]
-        return p2p_pb2.AdvertiseTensorCatalogResponse(
+        return p2p_pb2.AdvertiseInventoryResponse(
             success=True,
             entries_accepted=len(entries),
             total_bytes=sum(entry.byte_len for entry in entries),
@@ -482,7 +482,7 @@ def test_transfer_engine_publish_starts_non_nixl_heartbeat():
 
     ctx.mx_client.publish_metadata = publish_metadata
     ctx.mx_client.update_status = update_status
-    ctx.mx_client.advertise_tensor_catalog = advertise_tensor_catalog
+    ctx.mx_client.advertise_inventory = advertise_inventory
 
     class FakeHeartbeat:
         def __init__(self, **kwargs):
@@ -504,9 +504,9 @@ def test_transfer_engine_publish_starts_non_nixl_heartbeat():
     assert published_ok
     assert published["worker"].transfer_engine_session_id == "te-session"
     assert published["worker"].tensors[0].dtype == ctx.identity.dtype
-    assert published["catalog"]["entries"][0].name == "weight"
-    assert published["catalog"]["entries"][0].byte_len == 8
-    assert published["catalog"]["entries"][0].dtype == ctx.identity.dtype
+    assert published["inventory"]["entries"][0].name == "weight"
+    assert published["inventory"]["entries"][0].byte_len == 8
+    assert published["inventory"]["entries"][0].dtype == ctx.identity.dtype
     assert published["status"]["status"] == p2p_pb2.SOURCE_STATUS_READY
     assert published["heartbeat"]["nixl_manager"] is None
     assert published["heartbeat_started"]

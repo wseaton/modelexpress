@@ -9,7 +9,7 @@
 //! ascending, for deterministic plans across retries).
 //!
 //! Unlike the previous version, the planner takes the **union** of peer
-//! catalogs rather than the intersection. This is the only correct choice
+//! inventories rather than the intersection. This is the only correct choice
 //! for MoE models with expert-parallel sharding, where different peers own
 //! disjoint subsets of expert weights.
 //!
@@ -26,9 +26,9 @@ use std::collections::HashMap;
 use crate::p2p::backend::WorkerRecord;
 
 /// One tensor's planning-relevant metadata. Mirrors the proto
-/// `TensorCatalogEntry` but lives in the server's domain layer.
+/// `InventoryEntry` but lives in the server's domain layer.
 #[derive(Debug, Clone)]
-pub struct CatalogEntry {
+pub struct InventoryItem {
     pub name: String,
     pub byte_len: u64,
     pub dtype: String,
@@ -41,10 +41,9 @@ pub struct PeerCandidate {
     pub worker_id: String,
     /// Used to materialize the response (NIXL metadata, endpoints, addrs).
     pub worker: WorkerRecord,
-    /// What this peer owns. Empty means "advertised nothing"; such peers
-    /// are eligible only as a destination for symmetric advertise but
-    /// can't be assigned tensors to serve.
-    pub catalog: Vec<CatalogEntry>,
+    /// What this peer owns (its advertised inventory). Empty means the peer
+    /// advertised nothing and so can't be assigned any tensor to serve.
+    pub inventory: Vec<InventoryItem>,
 }
 
 /// One peer's assignment in the computed transfer plan.
@@ -81,7 +80,7 @@ pub struct TransferPlan {
 /// Each needed tensor is assigned to its least-loaded owning peer, ties
 /// broken by `worker_id` for deterministic plans across retries.
 pub fn compute_transfer_plan(
-    requested: &[CatalogEntry],
+    requested: &[InventoryItem],
     peers: &[PeerCandidate],
     max_peers: Option<u32>,
 ) -> TransferPlan {
@@ -99,7 +98,7 @@ pub fn compute_transfer_plan(
     // Build name -> [(peer_idx, dtype)] inverted index across active peers.
     let mut owners: HashMap<&str, Vec<(usize, &str)>> = HashMap::new();
     for (idx, peer) in active_peers.iter().enumerate() {
-        for entry in &peer.catalog {
+        for entry in &peer.inventory {
             owners
                 .entry(entry.name.as_str())
                 .or_default()
@@ -110,7 +109,7 @@ pub fn compute_transfer_plan(
     // Sort requested tensors by descending byte_len, tie-break by name
     // ascending, so the heaviest tensors get placed first (better balance)
     // and the plan is deterministic across calls.
-    let mut order: Vec<&CatalogEntry> = requested.iter().collect();
+    let mut order: Vec<&InventoryItem> = requested.iter().collect();
     order.sort_by(|a, b| {
         Reverse(a.byte_len)
             .cmp(&Reverse(b.byte_len))
@@ -177,46 +176,30 @@ pub fn compute_transfer_plan(
     }
 }
 
-/// Build a synthetic catalog from a worker's `tensors` (the addresses
-/// from PublishMetadata). Used as a backward-compat shim for peers that
-/// don't call AdvertiseTensorCatalog: planning sees their tensor set
-/// the same way the old intersection-based planner did.
-pub fn synthetic_catalog_from_worker(worker: &WorkerRecord) -> Vec<CatalogEntry> {
-    worker
-        .tensors
-        .iter()
-        .map(|t| CatalogEntry {
-            name: t.name.clone(),
-            byte_len: t.size,
-            dtype: t.dtype.clone(),
-        })
-        .collect()
-}
-
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
-    use super::{CatalogEntry, PeerCandidate, TransferPlan, compute_transfer_plan};
+    use super::{InventoryItem, PeerCandidate, TransferPlan, compute_transfer_plan};
     use crate::p2p::backend::{BackendMetadataRecord, TensorRecord, WorkerRecord};
 
-    fn entry(name: &str, byte_len: u64) -> CatalogEntry {
-        CatalogEntry {
+    fn entry(name: &str, byte_len: u64) -> InventoryItem {
+        InventoryItem {
             name: name.to_string(),
             byte_len,
             dtype: "bfloat16".to_string(),
         }
     }
 
-    fn entry_with_dtype(name: &str, byte_len: u64, dtype: &str) -> CatalogEntry {
-        CatalogEntry {
+    fn entry_with_dtype(name: &str, byte_len: u64, dtype: &str) -> InventoryItem {
+        InventoryItem {
             name: name.to_string(),
             byte_len,
             dtype: dtype.to_string(),
         }
     }
 
-    fn make_peer(name: &str, catalog: &[(&str, u64)]) -> PeerCandidate {
-        let cat: Vec<CatalogEntry> = catalog.iter().map(|(n, s)| entry(n, *s)).collect();
+    fn make_peer(name: &str, inventory: &[(&str, u64)]) -> PeerCandidate {
+        let cat: Vec<InventoryItem> = inventory.iter().map(|(n, s)| entry(n, *s)).collect();
         PeerCandidate {
             source_id: "test-source".to_string(),
             worker_id: name.to_string(),
@@ -239,15 +222,15 @@ mod tests {
                 agent_name: format!("{name}-agent"),
                 worker_grpc_endpoint: String::new(),
                 labels: std::collections::HashMap::new(),
-                tensor_catalog: None,
+                inventory: None,
             },
-            catalog: cat,
+            inventory: cat,
         }
     }
 
-    fn make_peer_dtypes(name: &str, catalog: &[(&str, u64, &str)]) -> PeerCandidate {
+    fn make_peer_dtypes(name: &str, inventory: &[(&str, u64, &str)]) -> PeerCandidate {
         let mut p = make_peer(name, &[]);
-        p.catalog = catalog
+        p.inventory = inventory
             .iter()
             .map(|(n, s, d)| entry_with_dtype(n, *s, d))
             .collect();
@@ -267,7 +250,7 @@ mod tests {
             .sum()
     }
 
-    fn requested(sizes: &[(&str, u64)]) -> Vec<CatalogEntry> {
+    fn requested(sizes: &[(&str, u64)]) -> Vec<InventoryItem> {
         sizes.iter().map(|(n, s)| entry(n, *s)).collect()
     }
 

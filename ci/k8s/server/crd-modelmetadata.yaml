@@ -56,22 +56,25 @@ spec:
                     transferEngineSessionId:
                       type: string
                       description: Mooncake TransferEngine session ID (ip:port)
-                    tensorCount:
-                      type: integer
-                      description: Number of tensors registered by this worker
-                    tensorConfigMap:
-                      type: string
-                      description: Name of ConfigMap containing tensor descriptors
-                    tensorCatalogConfigMap:
-                      type: string
-                      description: Name of ConfigMap containing lightweight tensor catalog entries
-                    tensorCatalogGeneration:
-                      type: integer
-                      format: int64
-                      description: Monotonic generation of the lightweight tensor catalog
-                    tensorCatalogCount:
-                      type: integer
-                      description: Number of entries in the lightweight tensor catalog
+                    tensors:
+                      type: object
+                      description: Full tensor descriptors (with GPU addresses)
+                      properties:
+                        count:
+                          type: integer
+                        configMap:
+                          type: string
+                    inventory:
+                      type: object
+                      description: Lightweight owned-tensor inventory (no addresses) used for planning
+                      properties:
+                        configMap:
+                          type: string
+                        generation:
+                          type: integer
+                          format: int64
+                        count:
+                          type: integer
                     metadataEndpoint:
                       type: string
                       description: P2P NIXL listen thread endpoint (host:port)

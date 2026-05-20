@@ -7,15 +7,13 @@
 //! Clients send the full SourceIdentity; the server computes and returns the hash.
 
 use crate::p2p::backend::{
-    SourceInstanceInfo, TensorCatalogEntryRecord, TensorCatalogRecord, WorkerRecord,
+    InventoryEntryRecord, InventoryRecord, SourceInstanceInfo, WorkerRecord,
 };
-use crate::p2p::planner::{
-    CatalogEntry, PeerCandidate, compute_transfer_plan, synthetic_catalog_from_worker,
-};
+use crate::p2p::planner::{InventoryItem, PeerCandidate, compute_transfer_plan};
 use crate::p2p::source_identity::{compute_mx_source_id, validate_identity};
 use crate::p2p::state::P2pStateManager;
 use modelexpress_common::grpc::p2p::{
-    AdvertiseTensorCatalogRequest, AdvertiseTensorCatalogResponse, ComputeTransferPlanRequest,
+    AdvertiseInventoryRequest, AdvertiseInventoryResponse, ComputeTransferPlanRequest,
     ComputeTransferPlanResponse, GetMetadataRequest, GetMetadataResponse, ListSourcesRequest,
     ListSourcesResponse, PeerAssignment, PlanDiagnostics, PublishMetadataRequest,
     PublishMetadataResponse, SourceInstanceRef, SourceStatus, UpdateStatusRequest,
@@ -378,16 +376,14 @@ impl P2pService for P2pServiceImpl {
             {
                 Ok(Some(record)) => {
                     if let Some(worker) = record.workers.into_iter().next() {
-                        // Backward-compat: peers that didn't call
-                        // AdvertiseTensorCatalog (or whose catalog hasn't
-                        // landed in the backend yet) get a synthetic
-                        // catalog from their PublishMetadata tensors.
-                        let catalog = catalog_entries_for_worker(&worker);
+                        // A peer can only be assigned tensors it advertised.
+                        // No inventory => empty => not a serving candidate.
+                        let inventory = inventory_items_for_worker(&worker);
                         peer_candidates.push(PeerCandidate {
                             source_id: info.source_id.clone(),
                             worker_id: info.worker_id.clone(),
                             worker,
-                            catalog,
+                            inventory,
                         });
                     }
                 }
@@ -408,30 +404,30 @@ impl P2pService for P2pServiceImpl {
 
         // Resolve the requested tensor set:
         //   - explicit `requested_tensor_names` wins
-        //   - empty list uses the union of all peer catalogs (the cold-start
+        //   - empty list uses the union of all peer inventories (the cold-start
         //     full-load case: the receiver needs the whole model)
         let mut note_parts: Vec<String> = Vec::new();
-        let requested: Vec<CatalogEntry> = if !req.requested_tensor_names.is_empty() {
-            // Build entries from the union catalog so we have byte_len
+        let requested: Vec<InventoryItem> = if !req.requested_tensor_names.is_empty() {
+            // Build entries from the union inventory so we have byte_len
             // and dtype for sorting and dtype-conflict detection. If a
             // requested name appears in multiple peers, we use the first
             // peer's entry; mismatches are caught inside the planner.
-            let mut by_name: std::collections::HashMap<&str, &CatalogEntry> =
+            let mut by_name: std::collections::HashMap<&str, &InventoryItem> =
                 std::collections::HashMap::new();
             for peer in &peer_candidates {
-                for e in &peer.catalog {
+                for e in &peer.inventory {
                     by_name.entry(e.name.as_str()).or_insert(e);
                 }
             }
-            let mut missing_from_catalog = 0usize;
+            let mut missing_from_inventory = 0usize;
             let requested = req
                 .requested_tensor_names
                 .iter()
                 .map(|name| match by_name.get(name.as_str()) {
                     Some(e) => (*e).clone(),
                     None => {
-                        missing_from_catalog = missing_from_catalog.saturating_add(1);
-                        CatalogEntry {
+                        missing_from_inventory = missing_from_inventory.saturating_add(1);
+                        InventoryItem {
                             name: name.clone(),
                             byte_len: 0,
                             dtype: String::new(),
@@ -439,10 +435,10 @@ impl P2pService for P2pServiceImpl {
                     }
                 })
                 .collect();
-            if missing_from_catalog > 0 {
+            if missing_from_inventory > 0 {
                 note_parts.push(format!(
-                    "{} requested tensor(s) absent from all peer catalogs",
-                    missing_from_catalog
+                    "{} requested tensor(s) absent from all peer inventories",
+                    missing_from_inventory
                 ));
             }
             requested
@@ -450,7 +446,7 @@ impl P2pService for P2pServiceImpl {
             let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
             let mut union = Vec::new();
             for peer in &peer_candidates {
-                for e in &peer.catalog {
+                for e in &peer.inventory {
                     if seen.insert(e.name.clone()) {
                         union.push(e.clone());
                     }
@@ -518,16 +514,16 @@ impl P2pService for P2pServiceImpl {
         }))
     }
 
-    async fn advertise_tensor_catalog(
+    async fn advertise_inventory(
         &self,
-        request: Request<AdvertiseTensorCatalogRequest>,
-    ) -> Result<Response<AdvertiseTensorCatalogResponse>, Status> {
+        request: Request<AdvertiseInventoryRequest>,
+    ) -> Result<Response<AdvertiseInventoryResponse>, Status> {
         let req = request.into_inner();
 
         let identity = match req.identity {
             Some(id) => id,
             None => {
-                return Ok(Response::new(AdvertiseTensorCatalogResponse {
+                return Ok(Response::new(AdvertiseInventoryResponse {
                     success: false,
                     message: "identity is required".to_string(),
                     entries_accepted: 0,
@@ -538,7 +534,7 @@ impl P2pService for P2pServiceImpl {
         };
 
         if let Err(e) = validate_identity(&identity) {
-            return Ok(Response::new(AdvertiseTensorCatalogResponse {
+            return Ok(Response::new(AdvertiseInventoryResponse {
                 success: false,
                 message: e,
                 entries_accepted: 0,
@@ -548,7 +544,7 @@ impl P2pService for P2pServiceImpl {
         }
 
         if req.worker_id.is_empty() {
-            return Ok(Response::new(AdvertiseTensorCatalogResponse {
+            return Ok(Response::new(AdvertiseInventoryResponse {
                 success: false,
                 message: "worker_id is required".to_string(),
                 entries_accepted: 0,
@@ -561,7 +557,7 @@ impl P2pService for P2pServiceImpl {
         let existing = match self.state.get_metadata(&source_id, &req.worker_id).await {
             Ok(Some(record)) => record,
             Ok(None) => {
-                return Ok(Response::new(AdvertiseTensorCatalogResponse {
+                return Ok(Response::new(AdvertiseInventoryResponse {
                     success: false,
                     message: format!(
                         "worker '{}' has not published metadata for source_id={}",
@@ -574,10 +570,10 @@ impl P2pService for P2pServiceImpl {
             }
             Err(e) => {
                 error!(
-                    "AdvertiseTensorCatalog: failed to read metadata for worker_id={}: {}",
+                    "AdvertiseInventory: failed to read metadata for worker_id={}: {}",
                     req.worker_id, e
                 );
-                return Ok(Response::new(AdvertiseTensorCatalogResponse {
+                return Ok(Response::new(AdvertiseInventoryResponse {
                     success: false,
                     message: format!("backend error: {e}"),
                     entries_accepted: 0,
@@ -592,7 +588,7 @@ impl P2pService for P2pServiceImpl {
             .iter()
             .find(|worker| worker.worker_rank == req.worker_rank)
         else {
-            return Ok(Response::new(AdvertiseTensorCatalogResponse {
+            return Ok(Response::new(AdvertiseInventoryResponse {
                 success: false,
                 message: format!(
                     "worker '{}' rank {} was not found for source_id={}",
@@ -604,18 +600,18 @@ impl P2pService for P2pServiceImpl {
             }));
         };
 
-        if let Some(catalog) = &worker.tensor_catalog
-            && req.generation <= catalog.generation
+        if let Some(inventory) = &worker.inventory
+            && req.generation <= inventory.generation
         {
-            return Ok(Response::new(AdvertiseTensorCatalogResponse {
+            return Ok(Response::new(AdvertiseInventoryResponse {
                 success: false,
                 message: format!(
-                    "stale catalog generation {}; current generation is {}",
-                    req.generation, catalog.generation
+                    "stale inventory generation {}; current generation is {}",
+                    req.generation, inventory.generation
                 ),
                 entries_accepted: 0,
-                total_bytes: catalog.total_bytes(),
-                generation: catalog.generation,
+                total_bytes: inventory.total_bytes(),
+                generation: inventory.generation,
             }));
         }
 
@@ -624,25 +620,25 @@ impl P2pService for P2pServiceImpl {
         let mut total_bytes = 0_u64;
         for entry in req.entries {
             if entry.name.is_empty() {
-                return Ok(Response::new(AdvertiseTensorCatalogResponse {
+                return Ok(Response::new(AdvertiseInventoryResponse {
                     success: false,
-                    message: "catalog entry name is required".to_string(),
+                    message: "inventory entry name is required".to_string(),
                     entries_accepted: 0,
                     total_bytes: 0,
                     generation: 0,
                 }));
             }
             if !seen.insert(entry.name.clone()) {
-                return Ok(Response::new(AdvertiseTensorCatalogResponse {
+                return Ok(Response::new(AdvertiseInventoryResponse {
                     success: false,
-                    message: format!("duplicate catalog entry '{}'", entry.name),
+                    message: format!("duplicate inventory entry '{}'", entry.name),
                     entries_accepted: 0,
                     total_bytes: 0,
                     generation: 0,
                 }));
             }
             total_bytes = total_bytes.saturating_add(entry.byte_len);
-            entries.push(TensorCatalogEntryRecord {
+            entries.push(InventoryEntryRecord {
                 name: entry.name,
                 byte_len: entry.byte_len,
                 dtype: entry.dtype,
@@ -654,19 +650,19 @@ impl P2pService for P2pServiceImpl {
             Ok(count) => count,
             Err(_) => u32::MAX,
         };
-        let catalog = TensorCatalogRecord {
+        let inventory = InventoryRecord {
             generation: req.generation,
             entries,
         };
 
         match self
             .state
-            .put_tensor_catalog(&source_id, &req.worker_id, req.worker_rank, catalog)
+            .put_inventory(&source_id, &req.worker_id, req.worker_rank, inventory)
             .await
         {
             Ok(()) => {
                 info!(
-                    "AdvertiseTensorCatalog: source_id={} worker_id={} rank={} entries={} bytes={} gen={}",
+                    "AdvertiseInventory: source_id={} worker_id={} rank={} entries={} bytes={} gen={}",
                     source_id,
                     req.worker_id,
                     req.worker_rank,
@@ -674,9 +670,9 @@ impl P2pService for P2pServiceImpl {
                     total_bytes,
                     req.generation,
                 );
-                Ok(Response::new(AdvertiseTensorCatalogResponse {
+                Ok(Response::new(AdvertiseInventoryResponse {
                     success: true,
-                    message: "catalog accepted".into(),
+                    message: "inventory accepted".into(),
                     entries_accepted,
                     total_bytes,
                     generation: req.generation,
@@ -684,12 +680,12 @@ impl P2pService for P2pServiceImpl {
             }
             Err(e) => {
                 error!(
-                    "AdvertiseTensorCatalog: failed to persist catalog for worker_id={}: {}",
+                    "AdvertiseInventory: failed to persist inventory for worker_id={}: {}",
                     req.worker_id, e
                 );
-                Ok(Response::new(AdvertiseTensorCatalogResponse {
+                Ok(Response::new(AdvertiseInventoryResponse {
                     success: false,
-                    message: format!("failed to persist catalog: {e}"),
+                    message: format!("failed to persist inventory: {e}"),
                     entries_accepted: 0,
                     total_bytes: 0,
                     generation: req.generation,
@@ -699,22 +695,25 @@ impl P2pService for P2pServiceImpl {
     }
 }
 
-fn catalog_entries_for_worker(worker: &WorkerRecord) -> Vec<CatalogEntry> {
+/// The planner's view of what a worker owns, taken from its advertised
+/// inventory. A worker that never advertised owns nothing for planning
+/// purposes (it can't be assigned tensors to serve).
+fn inventory_items_for_worker(worker: &WorkerRecord) -> Vec<InventoryItem> {
     worker
-        .tensor_catalog
+        .inventory
         .as_ref()
-        .map(|catalog| {
-            catalog
+        .map(|inventory| {
+            inventory
                 .entries
                 .iter()
-                .map(|entry| CatalogEntry {
+                .map(|entry| InventoryItem {
                     name: entry.name.clone(),
                     byte_len: entry.byte_len,
                     dtype: entry.dtype.clone(),
                 })
                 .collect()
         })
-        .unwrap_or_else(|| synthetic_catalog_from_worker(worker))
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -722,12 +721,12 @@ fn catalog_entries_for_worker(worker: &WorkerRecord) -> Vec<CatalogEntry> {
 mod tests {
     use super::*;
     use crate::p2p::backend::{
-        BackendMetadataRecord, MockMetadataBackend, ModelMetadataRecord, TensorCatalogEntryRecord,
-        TensorCatalogRecord, TensorRecord, WorkerRecord,
+        BackendMetadataRecord, InventoryEntryRecord, InventoryRecord, MockMetadataBackend,
+        ModelMetadataRecord, TensorRecord, WorkerRecord,
     };
     use crate::p2p::state::P2pStateManager;
     use modelexpress_common::grpc::p2p::{
-        MxSourceType, SourceIdentity, SourceStatus, TensorCatalogEntry,
+        InventoryEntry, MxSourceType, SourceIdentity, SourceStatus,
     };
 
     fn make_service(mock: MockMetadataBackend) -> P2pServiceImpl {
@@ -898,7 +897,7 @@ mod tests {
                         agent_name: String::new(),
                         worker_grpc_endpoint: String::new(),
                         labels: std::collections::HashMap::new(),
-                        tensor_catalog: None,
+                        inventory: None,
                     }],
                     published_at: 1234567890,
                 }))
@@ -1246,7 +1245,20 @@ mod tests {
             agent_name: "test-agent".to_string(),
             worker_grpc_endpoint: "10.0.0.1:50051".to_string(),
             labels: std::collections::HashMap::new(),
-            tensor_catalog: None,
+            // A serving peer has advertised its inventory; the planner only
+            // assigns tensors a peer declares it owns.
+            inventory: Some(InventoryRecord {
+                generation: 1,
+                entries: tensors
+                    .iter()
+                    .map(|(name, size)| InventoryEntryRecord {
+                        name: name.to_string(),
+                        byte_len: *size,
+                        dtype: "bfloat16".to_string(),
+                        shape: Vec::new(),
+                    })
+                    .collect(),
+            }),
         }
     }
 
@@ -1264,8 +1276,8 @@ mod tests {
         }
     }
 
-    fn make_proto_catalog_entry(name: &str, byte_len: u64) -> TensorCatalogEntry {
-        TensorCatalogEntry {
+    fn make_proto_inventory_entry(name: &str, byte_len: u64) -> InventoryEntry {
+        InventoryEntry {
             name: name.to_string(),
             byte_len,
             dtype: "bfloat16".to_string(),
@@ -1273,10 +1285,10 @@ mod tests {
         }
     }
 
-    // ── advertise_tensor_catalog ───────────────────────────────────────────
+    // ── advertise_inventory ───────────────────────────────────────────
 
     #[tokio::test]
-    async fn test_advertise_tensor_catalog_success_persists_entries() {
+    async fn test_advertise_inventory_success_persists_entries() {
         let source_id = compute_mx_source_id(&test_identity());
         let worker = make_worker_record(0, &[("legacy", 100)]);
 
@@ -1290,30 +1302,30 @@ mod tests {
                 Ok(Some(make_model_record(sid, wid, worker.clone())))
             }
         });
-        mock.expect_put_tensor_catalog().once().returning({
+        mock.expect_put_inventory().once().returning({
             let source_id = source_id.clone();
-            move |sid, wid, rank, catalog| {
+            move |sid, wid, rank, inventory| {
                 assert_eq!(sid, source_id);
                 assert_eq!(wid, "worker-uuid-1");
                 assert_eq!(rank, 0);
-                assert_eq!(catalog.generation, 7);
-                assert_eq!(catalog.entries.len(), 2);
-                assert_eq!(catalog.entries[0].name, "a");
-                assert_eq!(catalog.entries[0].shape, vec![4, 8]);
-                assert_eq!(catalog.entries[1].byte_len, 20);
+                assert_eq!(inventory.generation, 7);
+                assert_eq!(inventory.entries.len(), 2);
+                assert_eq!(inventory.entries[0].name, "a");
+                assert_eq!(inventory.entries[0].shape, vec![4, 8]);
+                assert_eq!(inventory.entries[1].byte_len, 20);
                 Ok(())
             }
         });
 
         let svc = make_service(mock);
         let resp = svc
-            .advertise_tensor_catalog(Request::new(AdvertiseTensorCatalogRequest {
+            .advertise_inventory(Request::new(AdvertiseInventoryRequest {
                 identity: Some(test_identity()),
                 worker_id: "worker-uuid-1".to_string(),
                 worker_rank: 0,
                 entries: vec![
-                    make_proto_catalog_entry("a", 10),
-                    make_proto_catalog_entry("b", 20),
+                    make_proto_inventory_entry("a", 10),
+                    make_proto_inventory_entry("b", 20),
                 ],
                 generation: 7,
             }))
@@ -1328,11 +1340,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_advertise_tensor_catalog_rejects_stale_generation() {
+    async fn test_advertise_inventory_rejects_stale_generation() {
         let mut worker = make_worker_record(0, &[("legacy", 100)]);
-        worker.tensor_catalog = Some(TensorCatalogRecord {
+        worker.inventory = Some(InventoryRecord {
             generation: 2,
-            entries: vec![TensorCatalogEntryRecord {
+            entries: vec![InventoryEntryRecord {
                 name: "existing".to_string(),
                 byte_len: 64,
                 dtype: "bfloat16".to_string(),
@@ -1347,11 +1359,11 @@ mod tests {
 
         let svc = make_service(mock);
         let resp = svc
-            .advertise_tensor_catalog(Request::new(AdvertiseTensorCatalogRequest {
+            .advertise_inventory(Request::new(AdvertiseInventoryRequest {
                 identity: Some(test_identity()),
                 worker_id: "worker-uuid-1".to_string(),
                 worker_rank: 0,
-                entries: vec![make_proto_catalog_entry("newer", 32)],
+                entries: vec![make_proto_inventory_entry("newer", 32)],
                 generation: 2,
             }))
             .await
@@ -1359,13 +1371,13 @@ mod tests {
             .into_inner();
 
         assert!(!resp.success);
-        assert!(resp.message.contains("stale catalog generation"));
+        assert!(resp.message.contains("stale inventory generation"));
         assert_eq!(resp.generation, 2);
         assert_eq!(resp.total_bytes, 64);
     }
 
     #[tokio::test]
-    async fn test_advertise_tensor_catalog_rejects_duplicate_names() {
+    async fn test_advertise_inventory_rejects_duplicate_names() {
         let worker = make_worker_record(0, &[("legacy", 100)]);
 
         let mut mock = MockMetadataBackend::new();
@@ -1375,13 +1387,13 @@ mod tests {
 
         let svc = make_service(mock);
         let resp = svc
-            .advertise_tensor_catalog(Request::new(AdvertiseTensorCatalogRequest {
+            .advertise_inventory(Request::new(AdvertiseInventoryRequest {
                 identity: Some(test_identity()),
                 worker_id: "worker-uuid-1".to_string(),
                 worker_rank: 0,
                 entries: vec![
-                    make_proto_catalog_entry("dup", 10),
-                    make_proto_catalog_entry("dup", 20),
+                    make_proto_inventory_entry("dup", 10),
+                    make_proto_inventory_entry("dup", 20),
                 ],
                 generation: 3,
             }))
@@ -1390,7 +1402,7 @@ mod tests {
             .into_inner();
 
         assert!(!resp.success);
-        assert!(resp.message.contains("duplicate catalog entry"));
+        assert!(resp.message.contains("duplicate inventory entry"));
     }
 
     #[tokio::test]
@@ -1598,18 +1610,18 @@ mod tests {
         let diag = resp.diagnostics.expect("diagnostics");
         assert!(
             diag.note
-                .contains("1 requested tensor(s) absent from all peer catalogs")
+                .contains("1 requested tensor(s) absent from all peer inventories")
         );
     }
 
     #[tokio::test]
-    async fn test_compute_transfer_plan_uses_persisted_catalog() {
+    async fn test_compute_transfer_plan_uses_persisted_inventory() {
         let source_id = compute_mx_source_id(&test_identity());
         let mut worker = make_worker_record(0, &[("synthetic-only", 999)]);
-        worker.tensor_catalog = Some(TensorCatalogRecord {
+        worker.inventory = Some(InventoryRecord {
             generation: 5,
-            entries: vec![TensorCatalogEntryRecord {
-                name: "catalog-only".to_string(),
+            entries: vec![InventoryEntryRecord {
+                name: "inventory-only".to_string(),
                 byte_len: 42,
                 dtype: "bfloat16".to_string(),
                 shape: vec![2, 21],
@@ -1650,7 +1662,7 @@ mod tests {
         assert_eq!(resp.peers.len(), 1);
         assert_eq!(
             resp.peers[0].assigned_tensor_names,
-            vec!["catalog-only".to_string()]
+            vec!["inventory-only".to_string()]
         );
         assert!(resp.uncovered_tensor_names.is_empty());
     }

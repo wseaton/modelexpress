@@ -17,7 +17,7 @@ from ... import p2p_pb2
 from ...load_strategy import LoadContext, LoadStrategyChain
 from ...load_strategy.context import LoadResult
 from ...metadata.heartbeat import HeartbeatThread
-from ...metadata.publish import advertise_tensor_catalog, _heartbeat_threads
+from ...metadata.publish import advertise_inventory, _heartbeat_threads
 from ...nixl_transfer import NixlTransferManager
 from .adapter import build_sglang_load_context
 
@@ -320,8 +320,8 @@ class MxModelLoader:
                 )
                 for name, (addr, numel, element_size) in weight_info.items()
             ]
-            catalog_entries = [
-                p2p_pb2.TensorCatalogEntry(
+            inventory_entries = [
+                p2p_pb2.InventoryEntry(
                     name=name,
                     byte_len=numel * element_size,
                     dtype=ctx.identity.dtype,
@@ -357,12 +357,12 @@ class MxModelLoader:
                 ctx.worker_rank,
             )
             return False
-        advertise_tensor_catalog(
+        advertise_inventory(
             mx_client=ctx.mx_client,
             identity=ctx.identity,
             worker_id=ctx.worker_id,
             worker_rank=ctx.worker_rank,
-            entries=catalog_entries,
+            entries=inventory_entries,
         )
         try:
             ctx.mx_client.update_status(

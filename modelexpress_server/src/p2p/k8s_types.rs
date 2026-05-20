@@ -66,25 +66,13 @@ pub struct WorkerStatus {
     #[serde(rename = "transferEngineSessionId", default)]
     pub transfer_engine_session_id: Option<String>,
 
-    /// Number of tensors registered by this worker
-    #[serde(rename = "tensorCount", default)]
-    pub tensor_count: i32,
+    /// Full tensor descriptors (with GPU addresses), served at transfer time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tensors: Option<TensorsStatus>,
 
-    /// Name of ConfigMap containing tensor descriptors
-    #[serde(rename = "tensorConfigMap", default)]
-    pub tensor_config_map: Option<String>,
-
-    /// Name of ConfigMap containing the lightweight tensor catalog.
-    #[serde(rename = "tensorCatalogConfigMap", default)]
-    pub tensor_catalog_config_map: Option<String>,
-
-    /// Monotonic generation for the lightweight tensor catalog.
-    #[serde(rename = "tensorCatalogGeneration", default)]
-    pub tensor_catalog_generation: u64,
-
-    /// Number of entries in the lightweight tensor catalog.
-    #[serde(rename = "tensorCatalogCount", default)]
-    pub tensor_catalog_count: i32,
+    /// Lightweight owned-tensor inventory (no addresses) used for planning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inventory: Option<InventoryStatus>,
 
     /// Worker lifecycle status (Initializing, Ready, Stale)
     #[serde(default)]
@@ -110,6 +98,28 @@ pub struct WorkerStatus {
     /// published by the worker for deployer-meaningful identification.
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub labels: std::collections::HashMap<String, String>,
+}
+
+/// Full tensor descriptors backing a worker (with GPU addresses).
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema)]
+pub struct TensorsStatus {
+    /// Number of tensors registered by this worker.
+    pub count: i32,
+    /// Name of the ConfigMap holding the tensor descriptors.
+    #[serde(rename = "configMap", default, skip_serializing_if = "Option::is_none")]
+    pub config_map: Option<String>,
+}
+
+/// Lightweight owned-tensor inventory for a worker (no GPU addresses).
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema)]
+pub struct InventoryStatus {
+    /// Name of the ConfigMap holding the inventory entries.
+    #[serde(rename = "configMap", default, skip_serializing_if = "Option::is_none")]
+    pub config_map: Option<String>,
+    /// Monotonic generation of the inventory.
+    pub generation: u64,
+    /// Number of entries in the inventory.
+    pub count: i32,
 }
 
 impl WorkerStatus {

@@ -15,7 +15,7 @@ use tracing::{debug, info};
 
 // Re-export types for backwards compatibility
 pub use crate::p2p::backend::{
-    BackendMetadataRecord, ModelMetadataRecord, TensorCatalogEntryRecord, TensorCatalogRecord,
+    BackendMetadataRecord, InventoryEntryRecord, InventoryRecord, ModelMetadataRecord,
     TensorRecord, WorkerRecord,
 };
 
@@ -187,17 +187,17 @@ impl P2pStateManager {
         Ok(())
     }
 
-    /// Replace a worker's lightweight tensor catalog.
-    pub async fn put_tensor_catalog(
+    /// Replace a worker's tensor inventory.
+    pub async fn put_inventory(
         &self,
         source_id: &str,
         worker_id: &str,
         worker_rank: u32,
-        catalog: TensorCatalogRecord,
+        inventory: InventoryRecord,
     ) -> MetadataResult<()> {
         self.get_backend()
             .await?
-            .put_tensor_catalog(source_id, worker_id, worker_rank, catalog)
+            .put_inventory(source_id, worker_id, worker_rank, inventory)
             .await
     }
 }
@@ -372,7 +372,7 @@ mod tests {
                     agent_name: String::new(),
                     worker_grpc_endpoint: String::new(),
                     labels: std::collections::HashMap::new(),
-                    tensor_catalog: None,
+                    inventory: None,
                 },
                 WorkerRecord {
                     worker_rank: 1,
@@ -390,7 +390,7 @@ mod tests {
                     agent_name: String::new(),
                     worker_grpc_endpoint: String::new(),
                     labels: std::collections::HashMap::new(),
-                    tensor_catalog: None,
+                    inventory: None,
                 },
             ],
             published_at: 1234567890,

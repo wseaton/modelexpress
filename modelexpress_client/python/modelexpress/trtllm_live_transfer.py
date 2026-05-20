@@ -26,7 +26,7 @@ from typing import Any, Optional
 import torch
 
 from .client import MxClient
-from .metadata.publish import advertise_tensor_catalog, build_tensor_catalog_entries
+from .metadata.publish import advertise_inventory, build_inventory_entries
 from . import p2p_pb2
 
 logger = logging.getLogger("modelexpress.trtllm_live_transfer")
@@ -145,14 +145,14 @@ def publish_model_params(torch_model: Any) -> None:
             mpi_rank, device_id, total_bytes / 1e9, mx_source_id,
         )
 
-        # Advertise the owned-tensor catalog so the server-side planner can
+        # Advertise the owned-tensor inventory so the server-side planner can
         # spread assignments and validate dtype/shape across peers.
-        advertise_tensor_catalog(
+        advertise_inventory(
             mx_client=mx_client,
             identity=identity,
             worker_id=worker_id,
             worker_rank=mpi_rank,
-            entries=build_tensor_catalog_entries(param_tensors),
+            entries=build_inventory_entries(param_tensors),
         )
     finally:
         mx_client.close()
@@ -265,12 +265,12 @@ def publish_from_worker(worker: Any) -> None:
         mx_source_id = mx_client.publish_metadata(
             identity=identity, worker=my_worker, worker_id=worker_id,
         )
-        advertise_tensor_catalog(
+        advertise_inventory(
             mx_client=mx_client,
             identity=identity,
             worker_id=worker_id,
             worker_rank=mpi_rank,
-            entries=build_tensor_catalog_entries(param_tensors),
+            entries=build_inventory_entries(param_tensors),
         )
     finally:
         mx_client.close()

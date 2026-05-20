@@ -300,19 +300,19 @@ class MxK8sServiceClient(MxClientBase):
             "K8s-Service-routed backends use direct peer discovery"
         )
 
-    def advertise_tensor_catalog(
+    def advertise_inventory(
         self,
         identity: "p2p_pb2.SourceIdentity",
         worker_id: str,
         worker_rank: int,
-        entries: list["p2p_pb2.TensorCatalogEntry"],
+        entries: list["p2p_pb2.InventoryEntry"],
         generation: int,
-    ) -> "p2p_pb2.AdvertiseTensorCatalogResponse":
-        """No-op: this backend has no central planner catalog store."""
+    ) -> "p2p_pb2.AdvertiseInventoryResponse":
+        """No-op: this backend has no central planner inventory store."""
         del identity, worker_id, worker_rank
-        return p2p_pb2.AdvertiseTensorCatalogResponse(
+        return p2p_pb2.AdvertiseInventoryResponse(
             success=True,
-            message="k8s-service backend has no central catalog store",
+            message="k8s-service backend has no central inventory store",
             entries_accepted=len(entries),
             total_bytes=sum(entry.byte_len for entry in entries),
             generation=generation,

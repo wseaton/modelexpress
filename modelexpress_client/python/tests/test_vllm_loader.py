@@ -892,8 +892,8 @@ class TestPublishMetadataAndReady:
 
         mx_client = MagicMock()
         mx_client.publish_metadata.return_value = "abc123def456abcd"
-        mx_client.advertise_tensor_catalog.return_value = (
-            p2p_pb2.AdvertiseTensorCatalogResponse(
+        mx_client.advertise_inventory.return_value = (
+            p2p_pb2.AdvertiseInventoryResponse(
                 success=True,
                 entries_accepted=3,
                 total_bytes=1536,
@@ -924,20 +924,20 @@ class TestPublishMetadataAndReady:
         assert call_args.args[0] is identity
         assert call_args.args[2] == "inst-uuid"
 
-        mx_client.advertise_tensor_catalog.assert_called_once()
-        catalog_call = mx_client.advertise_tensor_catalog.call_args.kwargs
-        assert catalog_call["identity"] is identity
-        assert catalog_call["worker_id"] == "inst-uuid"
-        assert catalog_call["worker_rank"] == 2
-        assert catalog_call["generation"] == 1
-        assert [entry.name for entry in catalog_call["entries"]] == [
+        mx_client.advertise_inventory.assert_called_once()
+        inventory_call = mx_client.advertise_inventory.call_args.kwargs
+        assert inventory_call["identity"] is identity
+        assert inventory_call["worker_id"] == "inst-uuid"
+        assert inventory_call["worker_rank"] == 2
+        assert inventory_call["generation"] == 1
+        assert [entry.name for entry in inventory_call["entries"]] == [
             "layer.0.weight",
             "layer.1.weight",
             "layer.2.weight",
         ]
-        assert catalog_call["entries"][0].byte_len == 512
-        assert catalog_call["entries"][0].dtype == "torch.bfloat16"
-        assert list(catalog_call["entries"][0].shape) == [256]
+        assert inventory_call["entries"][0].byte_len == 512
+        assert inventory_call["entries"][0].dtype == "torch.bfloat16"
+        assert list(inventory_call["entries"][0].shape) == [256]
 
         hb_cls.assert_called_once_with(
             mx_client=mx_client,
@@ -953,7 +953,7 @@ class TestPublishMetadataAndReady:
 
         mx_client = MagicMock()
         mx_client.publish_metadata.return_value = "abc123def456abcd"
-        mx_client.advertise_tensor_catalog.side_effect = RuntimeError("catalog down")
+        mx_client.advertise_inventory.side_effect = RuntimeError("inventory down")
 
         nixl_manager = MagicMock()
         nixl_manager.nixl_metadata = b"nixl-data"
@@ -972,7 +972,7 @@ class TestPublishMetadataAndReady:
                 worker_id="inst-uuid",
             )
 
-        assert any("AdvertiseTensorCatalog failed" in rec.message for rec in caplog.records)
+        assert any("AdvertiseInventory failed" in rec.message for rec in caplog.records)
         mock_hb.start.assert_called_once()
 
     def test_retries_publish_before_starting_heartbeat(self):

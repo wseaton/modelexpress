@@ -34,12 +34,13 @@ PUBLISH_METADATA_RETRYABLE_STATUS_CODES = {
 # Global storage for heartbeat threads and worker servers, keyed by device_id.
 _heartbeat_threads: dict[int, HeartbeatThread] = {}
 _worker_servers: dict[int, "WorkerGrpcServer"] = {}  # P2P mode only
-_catalog_generation_lock = threading.Lock()
-_catalog_generations: dict[tuple[str, int], int] = {}
+_inventory_generation_lock = threading.Lock()
+_inventory_generations: dict[tuple[str, int], int] = {}
 
 
 def build_source_identity(
-    vllm_config, model_config,
+    vllm_config,
+    model_config,
 ) -> p2p_pb2.SourceIdentity:
     """Build a SourceIdentity from vLLM config objects."""
     from importlib.metadata import version as pkg_version
@@ -108,7 +109,7 @@ def collect_worker_labels() -> dict[str, str]:
     for key, value in os.environ.items():
         if not key.startswith(prefix) or not value:
             continue
-        labels[key[len(prefix):].lower()] = value
+        labels[key[len(prefix) :].lower()] = value
     return labels
 
 
@@ -131,11 +132,11 @@ def build_tensor_protos(
     ]
 
 
-def build_tensor_catalog_entries(
+def build_inventory_entries(
     tensors: dict[str, torch.Tensor],
-) -> list["p2p_pb2.TensorCatalogEntry"]:
-    """Build lightweight tensor catalog entries without GPU addresses."""
-    entries: list["p2p_pb2.TensorCatalogEntry"] = []
+) -> list["p2p_pb2.InventoryEntry"]:
+    """Build tensor inventory entries without GPU addresses."""
+    entries: list["p2p_pb2.InventoryEntry"] = []
     for name, tensor in tensors.items():
         shape = getattr(tensor, "shape", ())
         try:
@@ -144,7 +145,7 @@ def build_tensor_catalog_entries(
             shape_values = []
 
         entries.append(
-            p2p_pb2.TensorCatalogEntry(
+            p2p_pb2.InventoryEntry(
                 name=name,
                 byte_len=int(tensor.numel()) * int(tensor.element_size()),
                 dtype=str(tensor.dtype),
@@ -169,7 +170,7 @@ def publish_metadata_and_ready(
     )
 
     tensor_protos = build_tensor_protos(tensors, device_id, worker_rank)
-    catalog_entries = build_tensor_catalog_entries(tensors)
+    inventory_entries = build_inventory_entries(tensors)
     worker_labels = collect_worker_labels()
     if worker_labels:
         logger.info(
@@ -188,10 +189,10 @@ def publish_metadata_and_ready(
 
         # P2P PublishMetadata stays lightweight: it carries endpoint
         # pointers only. The planner learns what each peer owns from its
-        # AdvertiseTensorCatalog call (below), and receivers fetch the
+        # AdvertiseInventory call (below), and receivers fetch the
         # actual GPU addresses from this worker's GetTensorManifest RPC at
         # transfer time. Descriptors used to be duplicated here as well;
-        # now they live solely on the worker gRPC server + the catalog.
+        # now they live solely on the worker gRPC server + the inventory.
         worker = p2p_pb2.WorkerMetadata(
             worker_rank=worker_rank,
             metadata_endpoint=f"{host}:{nixl_manager._listen_port}",
@@ -236,12 +237,12 @@ def publish_metadata_and_ready(
             f"[Worker {worker_rank}] Published P2P metadata to MX server "
             f"(mx_source_id={mx_source_id}, worker_grpc={host}:{actual_port})"
         )
-        advertise_tensor_catalog(
+        advertise_inventory(
             mx_client=mx_client,
             identity=identity,
             worker_id=worker_id,
             worker_rank=worker_rank,
-            entries=catalog_entries,
+            entries=inventory_entries,
         )
     else:
         worker = p2p_pb2.WorkerMetadata(
@@ -261,12 +262,12 @@ def publish_metadata_and_ready(
             f"[Worker {worker_rank}] Published metadata to MX server "
             f"(mx_source_id={mx_source_id}, worker_id={worker_id})"
         )
-        advertise_tensor_catalog(
+        advertise_inventory(
             mx_client=mx_client,
             identity=identity,
             worker_id=worker_id,
             worker_rank=worker_rank,
-            entries=catalog_entries,
+            entries=inventory_entries,
         )
 
     heartbeat = HeartbeatThread(
@@ -280,26 +281,26 @@ def publish_metadata_and_ready(
     _heartbeat_threads[worker_rank] = heartbeat
 
 
-def _next_catalog_generation(worker_id: str, worker_rank: int) -> int:
-    """Return a process-local monotonic catalog generation for this worker."""
+def _next_inventory_generation(worker_id: str, worker_rank: int) -> int:
+    """Return a process-local monotonic inventory generation for this worker."""
     key = (worker_id, worker_rank)
-    with _catalog_generation_lock:
-        generation = _catalog_generations.get(key, 0) + 1
-        _catalog_generations[key] = generation
+    with _inventory_generation_lock:
+        generation = _inventory_generations.get(key, 0) + 1
+        _inventory_generations[key] = generation
         return generation
 
 
-def advertise_tensor_catalog(
+def advertise_inventory(
     mx_client: MxClient,
     identity: "p2p_pb2.SourceIdentity",
     worker_id: str,
     worker_rank: int,
-    entries: list["p2p_pb2.TensorCatalogEntry"],
+    entries: list["p2p_pb2.InventoryEntry"],
 ) -> None:
-    """Best-effort catalog advertisement for planner-owned tensor sets."""
-    generation = _next_catalog_generation(worker_id, worker_rank)
+    """Best-effort inventory advertisement for planner-owned tensor sets."""
+    generation = _next_inventory_generation(worker_id, worker_rank)
     try:
-        response = mx_client.advertise_tensor_catalog(
+        response = mx_client.advertise_inventory(
             identity=identity,
             worker_id=worker_id,
             worker_rank=worker_rank,
@@ -308,7 +309,7 @@ def advertise_tensor_catalog(
         )
     except Exception as exc:
         logger.warning(
-            "[Worker %s] AdvertiseTensorCatalog failed; transfer planning "
+            "[Worker %s] AdvertiseInventory failed; transfer planning "
             "will fall back to PublishMetadata tensors: %s",
             worker_rank,
             exc,
@@ -316,8 +317,7 @@ def advertise_tensor_catalog(
         return
 
     logger.info(
-        "[Worker %s] Advertised tensor catalog generation %d "
-        "(%d entries, %d bytes)",
+        "[Worker %s] Advertised tensor inventory generation %d (%d entries, %d bytes)",
         worker_rank,
         response.generation,
         response.entries_accepted,
@@ -346,7 +346,9 @@ def _publish_metadata_to_server(
             if attempt == PUBLISH_METADATA_MAX_ATTEMPTS:
                 break
 
-            backoff_seconds = PUBLISH_METADATA_INITIAL_BACKOFF_SECONDS * (2 ** (attempt - 1))
+            backoff_seconds = PUBLISH_METADATA_INITIAL_BACKOFF_SECONDS * (
+                2 ** (attempt - 1)
+            )
             logger.warning(
                 f"[Worker {worker_rank}] Publish metadata attempt {attempt}/"
                 f"{PUBLISH_METADATA_MAX_ATTEMPTS} failed with retryable gRPC status "
@@ -384,7 +386,8 @@ def _is_p2p_metadata_enabled(mx_client) -> bool:
             logger.warning(
                 "MX_P2P_METADATA=%r is ignored for backend %s which "
                 "always uses the P2P metadata path",
-                env_value, type(mx_client).__name__,
+                env_value,
+                type(mx_client).__name__,
             )
         return True
     return os.environ.get("MX_P2P_METADATA", "0") == "1"
@@ -397,6 +400,7 @@ def _get_worker_host() -> str:
     Falls back to FQDN. Rejects localhost variants.
     """
     import socket
+
     explicit = os.environ.get("MX_WORKER_HOST", "")
     if explicit:
         return explicit

@@ -6,10 +6,13 @@
 //! Uses ModelMetadata CRD and ConfigMaps for tensor descriptors.
 
 use super::{
-    MetadataBackend, MetadataResult, ModelMetadataRecord, TensorCatalogEntryRecord,
-    TensorCatalogRecord, TensorRecord, WorkerRecord,
+    InventoryEntryRecord, InventoryRecord, MetadataBackend, MetadataResult, ModelMetadataRecord,
+    TensorRecord, WorkerRecord,
 };
-use crate::p2p::k8s_types::{ModelMetadata, ModelMetadataSpec, TensorDescriptorJson, WorkerStatus};
+use crate::p2p::k8s_types::{
+    InventoryStatus, ModelMetadata, ModelMetadataSpec, TensorDescriptorJson, TensorsStatus,
+    WorkerStatus,
+};
 use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use k8s_openapi::api::core::v1::ConfigMap;
@@ -23,7 +26,7 @@ use std::collections::BTreeMap;
 use tracing::{debug, info, warn};
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct TensorCatalogEntryJson {
+struct InventoryEntryJson {
     pub name: String,
     pub byte_len: String,
     pub dtype: String,
@@ -31,8 +34,8 @@ struct TensorCatalogEntryJson {
     pub shape: Vec<i64>,
 }
 
-impl From<&TensorCatalogEntryRecord> for TensorCatalogEntryJson {
-    fn from(record: &TensorCatalogEntryRecord) -> Self {
+impl From<&InventoryEntryRecord> for InventoryEntryJson {
+    fn from(record: &InventoryEntryRecord) -> Self {
         Self {
             name: record.name.clone(),
             byte_len: record.byte_len.to_string(),
@@ -189,28 +192,28 @@ impl KubernetesBackend {
         Ok(tensors)
     }
 
-    /// Create or update a ConfigMap with lightweight tensor catalog entries.
-    async fn upsert_tensor_catalog_configmap(
+    /// Create or update a ConfigMap with tensor inventory entries.
+    async fn upsert_inventory_configmap(
         &self,
         source_id: &str,
         worker_id: &str,
         worker_rank: u32,
-        catalog: &TensorCatalogRecord,
+        inventory: &InventoryRecord,
         owner_name: Option<&str>,
         owner_uid: Option<&str>,
     ) -> MetadataResult<String> {
         let cr_name = format!("mx-source-{}-{}", source_id, worker_id);
-        let cm_name = format!("{}-catalog-worker-{}", cr_name, worker_rank);
+        let cm_name = format!("{}-inventory-worker-{}", cr_name, worker_rank);
 
-        let catalog_json: Vec<TensorCatalogEntryJson> = catalog
+        let inventory_json: Vec<InventoryEntryJson> = inventory
             .entries
             .iter()
-            .map(TensorCatalogEntryJson::from)
+            .map(InventoryEntryJson::from)
             .collect();
-        let catalog_data = serde_json::to_string_pretty(&catalog_json)?;
+        let inventory_data = serde_json::to_string_pretty(&inventory_json)?;
 
         let mut data = BTreeMap::new();
-        data.insert("catalog.json".to_string(), catalog_data);
+        data.insert("inventory.json".to_string(), inventory_data);
 
         let mut labels = BTreeMap::new();
         labels.insert(
@@ -222,7 +225,7 @@ impl KubernetesBackend {
             worker_rank.to_string(),
         );
         labels.insert(
-            "modelexpress.nvidia.com/catalog".to_string(),
+            "modelexpress.nvidia.com/inventory".to_string(),
             "true".to_string(),
         );
 
@@ -255,14 +258,14 @@ impl KubernetesBackend {
         let api = self.configmap_api();
         match api.create(&PostParams::default(), &cm).await {
             Ok(_) => debug!(
-                "Created tensor catalog ConfigMap {} for worker {}",
+                "Created tensor inventory ConfigMap {} for worker {}",
                 cm_name, worker_rank
             ),
             Err(kube::Error::Api(err)) if err.code == 409 => {
                 api.patch(&cm_name, &PatchParams::default(), &Patch::Merge(&cm))
                     .await?;
                 debug!(
-                    "Updated tensor catalog ConfigMap {} for worker {}",
+                    "Updated tensor inventory ConfigMap {} for worker {}",
                     cm_name, worker_rank
                 );
             }
@@ -272,31 +275,31 @@ impl KubernetesBackend {
         Ok(cm_name)
     }
 
-    /// Read lightweight tensor catalog entries from a ConfigMap.
-    async fn read_tensor_catalog_configmap(
+    /// Read tensor inventory entries from a ConfigMap.
+    async fn read_inventory_configmap(
         &self,
         cm_name: &str,
         generation: u64,
-    ) -> MetadataResult<TensorCatalogRecord> {
+    ) -> MetadataResult<InventoryRecord> {
         let api = self.configmap_api();
         let cm = api.get(cm_name).await?;
 
-        let catalog_json = cm
+        let inventory_json = cm
             .data
-            .and_then(|d| d.get("catalog.json").cloned())
-            .ok_or("ConfigMap missing catalog.json")?;
+            .and_then(|d| d.get("inventory.json").cloned())
+            .ok_or("ConfigMap missing inventory.json")?;
 
-        let entries_json: Vec<TensorCatalogEntryJson> = serde_json::from_str(&catalog_json)?;
+        let entries_json: Vec<InventoryEntryJson> = serde_json::from_str(&inventory_json)?;
         let entries = entries_json
             .into_iter()
             .map(|entry| {
                 let byte_len = entry.byte_len.parse::<u64>().map_err(|e| {
                     format!(
-                        "Invalid catalog byte_len '{}' for '{}': {}",
+                        "Invalid inventory byte_len '{}' for '{}': {}",
                         entry.byte_len, entry.name, e
                     )
                 })?;
-                Ok(TensorCatalogEntryRecord {
+                Ok(InventoryEntryRecord {
                     name: entry.name,
                     byte_len,
                     dtype: entry.dtype,
@@ -305,7 +308,7 @@ impl KubernetesBackend {
             })
             .collect::<MetadataResult<Vec<_>>>()?;
 
-        Ok(TensorCatalogRecord {
+        Ok(InventoryRecord {
             generation,
             entries,
         })
@@ -413,11 +416,11 @@ impl MetadataBackend for KubernetesBackend {
             backend_type: Some(backend_type),
             nixl_metadata,
             transfer_engine_session_id,
-            tensor_count: worker_record.tensors.len() as i32,
-            tensor_config_map: Some(cm_name),
-            tensor_catalog_config_map: None,
-            tensor_catalog_generation: 0,
-            tensor_catalog_count: 0,
+            tensors: Some(TensorsStatus {
+                count: worker_record.tensors.len() as i32,
+                config_map: Some(cm_name),
+            }),
+            inventory: None,
             status: WorkerStatus::status_name_from_proto(worker_record.status),
             updated_at: Some(now.clone()),
             metadata_endpoint: worker_record.metadata_endpoint.clone(),
@@ -540,7 +543,11 @@ impl MetadataBackend for KubernetesBackend {
                 worker_status.backend_type.as_deref(),
             );
 
-            let tensors = if let Some(cm_name) = &worker_status.tensor_config_map {
+            let tensors = if let Some(cm_name) = worker_status
+                .tensors
+                .as_ref()
+                .and_then(|t| t.config_map.as_deref())
+            {
                 match self.read_tensor_configmap(cm_name).await {
                     Ok(t) => t,
                     Err(e) => {
@@ -552,17 +559,13 @@ impl MetadataBackend for KubernetesBackend {
                 Vec::new()
             };
 
-            let tensor_catalog = if let Some(cm_name) = &worker_status.tensor_catalog_config_map {
-                match self
-                    .read_tensor_catalog_configmap(cm_name, worker_status.tensor_catalog_generation)
-                    .await
-                {
-                    Ok(catalog) => Some(catalog),
+            let inventory = if let Some(inv) = &worker_status.inventory
+                && let Some(cm_name) = &inv.config_map
+            {
+                match self.read_inventory_configmap(cm_name, inv.generation).await {
+                    Ok(inventory) => Some(inventory),
                     Err(e) => {
-                        warn!(
-                            "Failed to read tensor catalog ConfigMap '{}': {}",
-                            cm_name, e
-                        );
+                        warn!("Failed to read inventory ConfigMap '{}': {}", cm_name, e);
                         None
                     }
                 }
@@ -588,7 +591,7 @@ impl MetadataBackend for KubernetesBackend {
                 agent_name: worker_status.agent_name.clone(),
                 worker_grpc_endpoint: worker_status.worker_grpc_endpoint.clone(),
                 labels: worker_status.labels.clone(),
-                tensor_catalog,
+                inventory,
             });
         }
 
@@ -874,12 +877,12 @@ impl MetadataBackend for KubernetesBackend {
         .into())
     }
 
-    async fn put_tensor_catalog(
+    async fn put_inventory(
         &self,
         source_id: &str,
         worker_id: &str,
         worker_rank: u32,
-        catalog: TensorCatalogRecord,
+        inventory: InventoryRecord,
     ) -> MetadataResult<()> {
         let api = self.model_metadata_api();
         let cr_name = format!("mx-source-{}-{}", source_id, worker_id);
@@ -893,45 +896,41 @@ impl MetadataBackend for KubernetesBackend {
             .and_then(|status| status.worker.as_ref())
             .ok_or_else(|| {
                 format!(
-                    "put_tensor_catalog: no worker in source '{}' worker '{}'",
+                    "put_inventory: no worker in source '{}' worker '{}'",
                     source_id, worker_id
                 )
             })?;
 
         if current_worker.worker_rank as u32 != worker_rank {
             return Err(format!(
-                "put_tensor_catalog: worker rank mismatch for source '{}' worker '{}': request={}, stored={}",
+                "put_inventory: worker rank mismatch for source '{}' worker '{}': request={}, stored={}",
                 source_id, worker_id, worker_rank, current_worker.worker_rank
             )
             .into());
         }
 
-        if current_worker.tensor_catalog_config_map.is_some()
-            && catalog.generation <= current_worker.tensor_catalog_generation
+        if let Some(existing) = &current_worker.inventory
+            && inventory.generation <= existing.generation
         {
             return Err(format!(
-                "stale tensor catalog generation {} for source '{}' worker '{}' rank {}; current generation is {}",
-                catalog.generation,
-                source_id,
-                worker_id,
-                worker_rank,
-                current_worker.tensor_catalog_generation
+                "stale inventory generation {} for source '{}' worker '{}' rank {}; current generation is {}",
+                inventory.generation, source_id, worker_id, worker_rank, existing.generation
             )
             .into());
         }
 
         let cm_name = self
-            .upsert_tensor_catalog_configmap(
+            .upsert_inventory_configmap(
                 source_id,
                 worker_id,
                 worker_rank,
-                &catalog,
+                &inventory,
                 owner_name,
                 owner_uid,
             )
             .await?;
 
-        let entry_count = match i32::try_from(catalog.entries.len()) {
+        let entry_count = match i32::try_from(inventory.entries.len()) {
             Ok(count) => count,
             Err(_) => i32::MAX,
         };
@@ -940,43 +939,41 @@ impl MetadataBackend for KubernetesBackend {
             let current = api.get(&cr_name).await?;
             let mut crd_status = current.status.ok_or_else(|| {
                 format!(
-                    "put_tensor_catalog: no status in source '{}' worker '{}'",
+                    "put_inventory: no status in source '{}' worker '{}'",
                     source_id, worker_id
                 )
             })?;
 
             let mut worker = crd_status.worker.take().ok_or_else(|| {
                 format!(
-                    "put_tensor_catalog: no worker in source '{}' worker '{}'",
+                    "put_inventory: no worker in source '{}' worker '{}'",
                     source_id, worker_id
                 )
             })?;
 
             if worker.worker_rank as u32 != worker_rank {
                 return Err(format!(
-                    "put_tensor_catalog: worker rank mismatch for source '{}' worker '{}': request={}, stored={}",
+                    "put_inventory: worker rank mismatch for source '{}' worker '{}': request={}, stored={}",
                     source_id, worker_id, worker_rank, worker.worker_rank
                 )
                 .into());
             }
 
-            if worker.tensor_catalog_config_map.is_some()
-                && catalog.generation <= worker.tensor_catalog_generation
+            if let Some(existing) = &worker.inventory
+                && inventory.generation <= existing.generation
             {
                 return Err(format!(
-                    "stale tensor catalog generation {} for source '{}' worker '{}' rank {}; current generation is {}",
-                    catalog.generation,
-                    source_id,
-                    worker_id,
-                    worker_rank,
-                    worker.tensor_catalog_generation
+                    "stale inventory generation {} for source '{}' worker '{}' rank {}; current generation is {}",
+                    inventory.generation, source_id, worker_id, worker_rank, existing.generation
                 )
                 .into());
             }
 
-            worker.tensor_catalog_config_map = Some(cm_name.clone());
-            worker.tensor_catalog_generation = catalog.generation;
-            worker.tensor_catalog_count = entry_count;
+            worker.inventory = Some(InventoryStatus {
+                config_map: Some(cm_name.clone()),
+                generation: inventory.generation,
+                count: entry_count,
+            });
 
             let generation = current.metadata.generation.unwrap_or(0);
             let resource_version = current.metadata.resource_version.unwrap_or_default();
@@ -999,14 +996,14 @@ impl MetadataBackend for KubernetesBackend {
             {
                 Ok(_) => {
                     debug!(
-                        "Updated tensor catalog for source '{}' worker '{}' rank {} ({} entries, generation={})",
-                        source_id, worker_id, worker_rank, entry_count, catalog.generation
+                        "Updated tensor inventory for source '{}' worker '{}' rank {} ({} entries, generation={})",
+                        source_id, worker_id, worker_rank, entry_count, inventory.generation
                     );
                     return Ok(());
                 }
                 Err(kube::Error::Api(err)) if err.code == 409 => {
                     debug!(
-                        "Conflict updating tensor catalog for source '{}' worker '{}', retrying ({}/{})",
+                        "Conflict updating tensor inventory for source '{}' worker '{}', retrying ({}/{})",
                         source_id,
                         worker_id,
                         attempt.saturating_add(1),
@@ -1022,7 +1019,7 @@ impl MetadataBackend for KubernetesBackend {
         }
 
         Err(format!(
-            "Failed to update tensor catalog for source '{}' worker '{}' rank {} after {} retries",
+            "Failed to update tensor inventory for source '{}' worker '{}' rank {} after {} retries",
             source_id, worker_id, worker_rank, max_retries
         )
         .into())

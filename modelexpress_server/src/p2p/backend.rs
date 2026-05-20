@@ -120,10 +120,10 @@ pub struct WorkerRecord {
     /// External-identity labels (e.g. `pod`, `namespace`, `node`)
     /// published by the worker for deployer-meaningful identification.
     pub labels: std::collections::HashMap<String, String>,
-    /// Lightweight owned-tensor catalog used by transfer planning.
-    /// `None` means the worker has not advertised a catalog yet and
+    /// Lightweight owned-tensor inventory used by transfer planning.
+    /// `None` means the worker has not advertised a inventory yet and
     /// planners should fall back to the full tensor descriptors.
-    pub tensor_catalog: Option<TensorCatalogRecord>,
+    pub inventory: Option<InventoryRecord>,
 }
 
 /// Tensor descriptor record
@@ -136,14 +136,14 @@ pub struct TensorRecord {
     pub dtype: String,
 }
 
-/// Lightweight owned-tensor catalog for one worker.
+/// Lightweight owned-tensor inventory for one worker.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TensorCatalogRecord {
+pub struct InventoryRecord {
     pub generation: u64,
-    pub entries: Vec<TensorCatalogEntryRecord>,
+    pub entries: Vec<InventoryEntryRecord>,
 }
 
-impl TensorCatalogRecord {
+impl InventoryRecord {
     pub fn total_bytes(&self) -> u64 {
         self.entries
             .iter()
@@ -151,9 +151,9 @@ impl TensorCatalogRecord {
     }
 }
 
-/// One lightweight owned-tensor catalog entry.
+/// One lightweight owned-tensor inventory entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TensorCatalogEntryRecord {
+pub struct InventoryEntryRecord {
     pub name: String,
     pub byte_len: u64,
     pub dtype: String,
@@ -181,7 +181,7 @@ impl From<WorkerMetadata> for WorkerRecord {
             agent_name: meta.agent_name,
             worker_grpc_endpoint: meta.worker_grpc_endpoint,
             labels: meta.labels,
-            tensor_catalog: None,
+            inventory: None,
         }
     }
 }
@@ -293,16 +293,16 @@ pub trait MetadataBackend: Send + Sync {
         updated_at: i64,
     ) -> MetadataResult<()>;
 
-    /// Replace a worker's lightweight tensor catalog.
+    /// Replace a worker's tensor inventory.
     ///
     /// Backends must reject stale generations (new generation must be
     /// strictly greater than any stored generation for this worker).
-    async fn put_tensor_catalog(
+    async fn put_inventory(
         &self,
         source_id: &str,
         worker_id: &str,
         worker_rank: u32,
-        catalog: TensorCatalogRecord,
+        inventory: InventoryRecord,
     ) -> MetadataResult<()>;
 }
 

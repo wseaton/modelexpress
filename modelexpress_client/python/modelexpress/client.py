@@ -76,15 +76,15 @@ class MxClientBase(ABC):
         """Update a source worker's lifecycle status."""
 
     @abstractmethod
-    def advertise_tensor_catalog(
+    def advertise_inventory(
         self,
         identity: "p2p_pb2.SourceIdentity",
         worker_id: str,
         worker_rank: int,
-        entries: list["p2p_pb2.TensorCatalogEntry"],
+        entries: list["p2p_pb2.InventoryEntry"],
         generation: int,
-    ) -> "p2p_pb2.AdvertiseTensorCatalogResponse":
-        """Persist this worker's lightweight owned-tensor catalog."""
+    ) -> "p2p_pb2.AdvertiseInventoryResponse":
+        """Persist this worker's lightweight owned-tensor inventory."""
 
     @abstractmethod
     def compute_transfer_plan(
@@ -243,25 +243,25 @@ class MxClient(MxClientBase):
             logger.error("UpdateStatus failed: %s", response.message)
         return response.success
 
-    def advertise_tensor_catalog(
+    def advertise_inventory(
         self,
         identity: "p2p_pb2.SourceIdentity",
         worker_id: str,
         worker_rank: int,
-        entries: list["p2p_pb2.TensorCatalogEntry"],
+        entries: list["p2p_pb2.InventoryEntry"],
         generation: int,
-    ) -> "p2p_pb2.AdvertiseTensorCatalogResponse":
-        """Persist this worker's lightweight catalog for transfer planning."""
-        request = p2p_pb2.AdvertiseTensorCatalogRequest(
+    ) -> "p2p_pb2.AdvertiseInventoryResponse":
+        """Persist this worker's lightweight inventory for transfer planning."""
+        request = p2p_pb2.AdvertiseInventoryRequest(
             identity=identity,
             worker_id=worker_id,
             worker_rank=worker_rank,
             entries=entries,
             generation=generation,
         )
-        response = self.stub.AdvertiseTensorCatalog(request, timeout=30)
+        response = self.stub.AdvertiseInventory(request, timeout=30)
         if not response.success:
-            raise RuntimeError(f"AdvertiseTensorCatalog failed: {response.message}")
+            raise RuntimeError(f"AdvertiseInventory failed: {response.message}")
         return response
 
     def compute_transfer_plan(
