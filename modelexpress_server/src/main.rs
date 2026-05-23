@@ -7,8 +7,9 @@ use modelexpress_common::grpc::{
     model::model_service_server::ModelServiceServer, p2p::p2p_service_server::P2pServiceServer,
 };
 use modelexpress_server::{
+    auth::{AuthLayer, AuthState},
     cache::CacheEvictionService,
-    config::{ServerArgs, ServerConfig},
+    config::{AuthMode, ServerArgs, ServerConfig, detect_in_cluster},
     p2p::{service::P2pServiceImpl, state::P2pStateManager},
     registry::state::RegistryManager,
     services::{
@@ -18,7 +19,8 @@ use modelexpress_server::{
 };
 use std::sync::Arc;
 use tonic::transport::Server;
-use tracing::{error, info};
+use tower::Layer;
+use tracing::{error, info, warn};
 use tracing_subscriber::{EnvFilter, FmtSubscriber};
 
 /// Maximum gRPC message size (100MB) for large models like DeepSeek-V3.
@@ -172,20 +174,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     };
 
-    // Start the gRPC server
+    let resolved_mode = config.security.resolve_mode(detect_in_cluster());
+    if let Err(e) = config.security.validate_resolved(resolved_mode) {
+        error!("Invalid security configuration: {e}");
+        return Err(e.into());
+    }
+
+    // Enforce fails closed if auth init fails; Permissive warns and continues without it.
+    let auth_state = if resolved_mode == AuthMode::Off {
+        info!("P2P gRPC auth: disabled (mode=off)");
+        None
+    } else {
+        match build_auth_state(&config, resolved_mode).await {
+            Ok(state) => {
+                info!("P2P gRPC auth: enabled (mode={resolved_mode:?})");
+                Some(Arc::new(state))
+            }
+            Err(e) => {
+                if resolved_mode == AuthMode::Enforce {
+                    error!("security mode 'enforce' could not initialize auth: {e}");
+                    return Err(e);
+                }
+                warn!("P2P gRPC auth: initialization failed, auth disabled (permissive): {e}");
+                None
+            }
+        }
+    };
+
     info!("Starting gRPC server on: {addr}");
-    let server_result = Server::builder()
+
+    let p2p_server = P2pServiceServer::new(p2p_service)
+        .max_decoding_message_size(MAX_MESSAGE_SIZE)
+        .max_encoding_message_size(MAX_MESSAGE_SIZE);
+    let router = Server::builder()
         .add_service(health_service_v1)
         .add_service(HealthServiceServer::new(health_service))
         .add_service(ApiServiceServer::new(api_service))
-        .add_service(ModelServiceServer::new(model_service))
-        .add_service(
-            P2pServiceServer::new(p2p_service)
-                .max_decoding_message_size(MAX_MESSAGE_SIZE)
-                .max_encoding_message_size(MAX_MESSAGE_SIZE),
-        )
-        .serve_with_shutdown(addr, shutdown_signal)
-        .await;
+        .add_service(ModelServiceServer::new(model_service));
+    // Wrap only P2pService so health/Api/Model are never gated; routing IS the allowlist.
+    let router = match auth_state {
+        Some(state) => router.add_service(AuthLayer::new(state).layer(p2p_server)),
+        None => router.add_service(p2p_server),
+    };
+    let server_result = router.serve_with_shutdown(addr, shutdown_signal).await;
 
     // Wait for background services to complete
     if let Some(handle) = cache_handle
@@ -200,4 +231,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     server_result?;
     info!("Server shutdown complete");
     Ok(())
+}
+
+/// Timeout-bounded so a stuck initial reflector sync cannot hang startup.
+async fn build_auth_state(
+    config: &ServerConfig,
+    mode: AuthMode,
+) -> Result<AuthState, Box<dyn std::error::Error + Send + Sync>> {
+    let client = kube::Client::try_default().await?;
+    let state = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        AuthState::new(client, &config.security, mode),
+    )
+    .await
+    .map_err(|_| "timed out waiting for auth reflectors to sync")??;
+    Ok(state)
 }

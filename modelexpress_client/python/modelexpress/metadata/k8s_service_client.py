@@ -48,6 +48,7 @@ import grpc
 
 from .. import p2p_pb2
 from .. import p2p_pb2_grpc
+from ..auth import create_channel
 from ..client import MxClientBase
 from .source_id import compute_mx_source_id
 
@@ -187,7 +188,7 @@ class MxK8sServiceClient(MxClientBase):
         last_error: Exception | None = None
 
         for attempt in range(1, self._max_retries + 2):
-            channel = grpc.insecure_channel(endpoint)
+            channel = create_channel(endpoint)
             try:
                 stub = p2p_pb2_grpc.WorkerServiceStub(channel)
                 req = p2p_pb2.GetTensorManifestRequest(mx_source_id=mx_source_id)

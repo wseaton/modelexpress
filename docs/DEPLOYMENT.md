@@ -352,6 +352,65 @@ See [`K8S_SERVICE_BACKEND.md`](K8S_SERVICE_BACKEND.md) for the design rationale,
 
 Each GPU worker publishes independently using its global rank (`torch.distributed.get_rank()`). No inter-worker coordination or barriers required.
 
+### Device Authorization
+
+**Server config (env or helm `p2pAuth.*`):**
+
+| Variable | Helm value | Default | Description |
+|----------|------------|---------|-------------|
+| | `p2pAuth.enabled` | `false` | Turn the feature on. When false, MODE is forced `off` and no RBAC is created. |
+| `MODEL_EXPRESS_SECURITY_MODE` | `p2pAuth.mode` | `permissive` when enabled | `permissive` \| `enforce` (the chart forces `off` when `enabled: false`). The server's own default outside Helm is `permissive` in-cluster, `off` otherwise. |
+| `MODEL_EXPRESS_SECURITY_TOKEN_AUDIENCES` | `p2pAuth.audiences` | (empty) | Comma-separated audiences the caller token must carry. Required for `enforce`. |
+| `MODEL_EXPRESS_SECURITY_DEVICE_RESOURCES` | `p2pAuth.deviceResources` | (empty) | Comma-separated device-plugin resource names that prove fabric possession (e.g. `rdma/ib`, `rdma/roce`, `vpc.amazonaws.com/efa`). |
+| `MODEL_EXPRESS_SECURITY_DEVICE_CLASSES` | `p2pAuth.deviceClasses` | (empty) | Comma-separated DRA device class names that prove fabric possession (e.g. `rdma.nvidia.com`). Leave empty to skip the DRA path (no ResourceClaim reads). |
+| `MODEL_EXPRESS_SECURITY_POD_LABEL_SELECTOR` | `p2pAuth.podLabelSelector` | (empty) | Optional label selector narrowing the background pod reflector on large clusters (e.g. `modelexpress.nvidia.com/p2p=true`). Pods not matching it are not watched and **fail closed**, so every caller pod must carry the label. Empty watches all pods. |
+| `MODEL_EXPRESS_SECURITY_CACHE_TTL_SECS` | `p2pAuth.cacheTtlSeconds` | `60` | TTL for the token-review cache (the device check is a live in-memory store lookup, not cached). |
+
+A caller pod passes the device check on **either** signal: a device-plugin resource
+(`device_resources`) in its container requests/limits, **or** a DRA `ResourceClaim` whose
+request's `deviceClassName` is in `device_classes`. `enforce` requires at least one of
+the two lists (and audiences) to be non-empty, and a working Kubernetes client.
+
+**Server RBAC:** caller pods live in a background reflector (in-memory, watch-fed), so the
+device check is an O(1) lookup with no API round-trip on the request path. `TokenReview`
+is cluster-scoped, so the server needs a ClusterRole granting
+`authentication.k8s.io/tokenreviews: create` + `pods: list,watch` cluster-wide (and
+`resource.k8s.io/resourceclaims: list,watch` when `device_classes` is set). The chart
+creates this when `p2pAuth.enabled=true`; set `p2pAuth.createClusterRBAC=false` to manage
+it yourself (see `ci/k8s/server/rbac-p2p-auth.yaml`).
+
+**Client config (Python client env):**
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MX_AUTH_TOKEN_PATH` | `/var/run/secrets/tokens/modelexpress` | Path to the projected token file. The client re-reads it on rotation; absent file = no token attached (a warning is logged once). The token value is never logged. |
+| `MX_AUTH_TOKEN_TTL_SECONDS` | `60` | How long the client caches the token before re-reading. |
+
+**Caller pod token projection:** mount a projected token whose `audience` matches the
+server's. Any ServiceAccount works; no caller RBAC needed.
+
+```yaml
+volumes:
+  - name: mx-p2p-token
+    projected:
+      sources:
+        - serviceAccountToken:
+            path: modelexpress
+            audience: modelexpress-p2p
+            expirationSeconds: 3600
+# container:
+volumeMounts:
+  - name: mx-p2p-token
+    mountPath: /var/run/secrets/tokens
+    readOnly: true
+env:
+  - name: MX_AUTH_TOKEN_PATH
+    value: /var/run/secrets/tokens/modelexpress
+```
+
+See `ci/k8s/client/vllm/manifest-azure.yaml` for a full example. Every worker manifest
+needs this block before flipping the server to `enforce`.
+
 ### NIXL Backend Selection
 
 `MX_NIXL_BACKEND` selects the NIXL plugin used for GPU-to-GPU RDMA.

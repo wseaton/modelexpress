@@ -1,0 +1,52 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Cluster-scoped RBAC for device authorization. TokenReview is cluster-scoped and caller
+# pods may live in any namespace, so cluster-wide pod read is required. Out-of-band variant
+# of the helm chart's templates/rbac-p2p-auth.yaml. Required for permissive or enforce mode.
+#
+# Apply with:
+#   NAMESPACE=<your-ns> envsubst < ci/k8s/server/rbac-p2p-auth.yaml | kubectl apply -f -
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: modelexpress-p2p-auth
+  labels:
+    app.kubernetes.io/name: modelexpress
+rules:
+  - apiGroups:
+      - authentication.k8s.io
+    resources:
+      - tokenreviews
+    verbs:
+      - create
+  - apiGroups:
+      - ""
+    resources:
+      - pods
+    verbs:
+      - list
+      - watch
+  - apiGroups:
+      - resource.k8s.io
+    resources:
+      - resourceclaims
+    verbs:
+      - list
+      - watch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: modelexpress-p2p-auth
+  labels:
+    app.kubernetes.io/name: modelexpress
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: modelexpress-p2p-auth
+subjects:
+  - kind: ServiceAccount
+    name: modelexpress
+    namespace: ${NAMESPACE}

@@ -12,6 +12,132 @@ use tracing::Level;
 
 use crate::cache::CacheEvictionConfig;
 
+/// P2P gRPC authentication enforcement mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum AuthMode {
+    /// No authentication; trusted-network / dev.
+    #[default]
+    Off,
+    /// Verify and log violations, but never block. Safe rollout step before Enforce.
+    Permissive,
+    /// Verify and reject callers without a valid token + device-holding pod.
+    Enforce,
+}
+
+fn default_cache_ttl_secs() -> u64 {
+    60
+}
+
+/// Comma-separated CLI/env list, ignoring blanks. An empty/whitespace value parses to an
+/// empty `Vec` rather than `[""]`, so an unset env var doesn't look like a single-element
+/// list (which, for device classes, would wrongly enable DRA).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommaList(Vec<String>);
+
+impl CommaList {
+    #[must_use]
+    pub fn into_inner(self) -> Vec<String> {
+        self.0
+    }
+}
+
+impl std::str::FromStr for CommaList {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Self(
+            s.split(',')
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+                .map(str::to_owned)
+                .collect(),
+        ))
+    }
+}
+
+/// P2P gRPC authentication configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecurityConfig {
+    /// `None` resolves to Permissive in-cluster, Off otherwise.
+    #[serde(default)]
+    pub mode: Option<AuthMode>,
+    /// Audiences the caller's bound projected SA token must carry.
+    #[serde(default)]
+    pub token_audiences: Vec<String>,
+    /// Device-plugin resource names that prove fabric possession (e.g. `rdma/ib`).
+    #[serde(default)]
+    pub device_resources: Vec<String>,
+    /// DRA device class names that prove fabric possession (e.g. `rdma.nvidia.com`).
+    #[serde(default)]
+    pub device_classes: Vec<String>,
+    /// Label selector narrowing the pod reflector (e.g. `modelexpress.nvidia.com/p2p=true`).
+    /// Pods not matching are absent and fail closed. Empty watches all pods.
+    #[serde(default)]
+    pub pod_label_selector: Option<String>,
+    /// TTL for the token-review cache, in seconds.
+    #[serde(default = "default_cache_ttl_secs")]
+    pub cache_ttl_secs: u64,
+}
+
+impl Default for SecurityConfig {
+    fn default() -> Self {
+        Self {
+            mode: None,
+            token_audiences: Vec::new(),
+            device_resources: Vec::new(),
+            device_classes: Vec::new(),
+            pod_label_selector: None,
+            cache_ttl_secs: default_cache_ttl_secs(),
+        }
+    }
+}
+
+impl SecurityConfig {
+    /// Unset defaults to Permissive in-cluster (so upgrades don't silently start
+    /// rejecting traffic), Off otherwise.
+    #[must_use]
+    pub fn resolve_mode(&self, in_cluster: bool) -> AuthMode {
+        self.mode.unwrap_or({
+            if in_cluster {
+                AuthMode::Permissive
+            } else {
+                AuthMode::Off
+            }
+        })
+    }
+
+    /// Enforce requires a non-empty device list (else it would reject everything) and a
+    /// non-empty audience list (else the apiserver accepts tokens minted for any audience).
+    pub fn validate_resolved(&self, mode: AuthMode) -> Result<(), String> {
+        if mode == AuthMode::Enforce {
+            if self.device_resources.is_empty() && self.device_classes.is_empty() {
+                return Err(
+                    "security mode 'enforce' requires at least one device resource or device \
+                    class (MODEL_EXPRESS_SECURITY_DEVICE_RESOURCES / \
+                    MODEL_EXPRESS_SECURITY_DEVICE_CLASSES)"
+                        .to_string(),
+                );
+            }
+            if self.token_audiences.is_empty() {
+                return Err(
+                    "security mode 'enforce' requires at least one token audience \
+                    (MODEL_EXPRESS_SECURITY_TOKEN_AUDIENCES)"
+                        .to_string(),
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Detect whether the server is running as an in-cluster k8s workload.
+#[must_use]
+pub fn detect_in_cluster() -> bool {
+    std::path::Path::new("/var/run/secrets/kubernetes.io/serviceaccount/token").exists()
+        || std::env::var("KUBERNETES_SERVICE_HOST").is_ok()
+}
+
 /// Command line arguments for the server
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -44,6 +170,30 @@ pub struct ServerArgs {
     #[arg(long, env = "MODEL_EXPRESS_CACHE_EVICTION_ENABLED")]
     pub cache_eviction_enabled: Option<bool>,
 
+    /// Device authorization mode: off | permissive | enforce
+    #[arg(long, env = "MODEL_EXPRESS_SECURITY_MODE", value_enum)]
+    pub security_mode: Option<AuthMode>,
+
+    /// Comma-separated SA token audiences the caller's token must carry
+    #[arg(long, env = "MODEL_EXPRESS_SECURITY_TOKEN_AUDIENCES")]
+    pub security_token_audiences: Option<CommaList>,
+
+    /// Comma-separated device-plugin resource names that prove InfiniBand possession
+    #[arg(long, env = "MODEL_EXPRESS_SECURITY_DEVICE_RESOURCES")]
+    pub security_device_resources: Option<CommaList>,
+
+    /// Comma-separated DRA device class names that prove InfiniBand possession
+    #[arg(long, env = "MODEL_EXPRESS_SECURITY_DEVICE_CLASSES")]
+    pub security_device_classes: Option<CommaList>,
+
+    /// Label selector narrowing the background pod reflector (empty = all pods)
+    #[arg(long, env = "MODEL_EXPRESS_SECURITY_POD_LABEL_SELECTOR")]
+    pub security_pod_label_selector: Option<String>,
+
+    /// Cache TTL (seconds) for token-review and device lookups
+    #[arg(long, env = "MODEL_EXPRESS_SECURITY_CACHE_TTL_SECS")]
+    pub security_cache_ttl_secs: Option<u64>,
+
     /// Validate configuration and exit
     #[arg(long)]
     pub validate_config: bool,
@@ -58,6 +208,9 @@ pub struct ServerConfig {
     pub cache: CacheConfig,
     /// Logging configuration
     pub logging: LoggingConfig,
+    /// P2P gRPC authentication configuration
+    #[serde(default)]
+    pub security: SecurityConfig,
 }
 
 /// Server-specific settings
@@ -173,6 +326,31 @@ impl ServerConfig {
             config.cache.eviction.enabled = cache_eviction_enabled;
         }
 
+        // Apply security overrides
+        if let Some(security_mode) = args.security_mode {
+            config.security.mode = Some(security_mode);
+        }
+
+        if let Some(token_audiences) = args.security_token_audiences {
+            config.security.token_audiences = token_audiences.into_inner();
+        }
+
+        if let Some(device_resources) = args.security_device_resources {
+            config.security.device_resources = device_resources.into_inner();
+        }
+
+        if let Some(device_classes) = args.security_device_classes {
+            config.security.device_classes = device_classes.into_inner();
+        }
+
+        if let Some(pod_label_selector) = args.security_pod_label_selector {
+            config.security.pod_label_selector = Some(pod_label_selector);
+        }
+
+        if let Some(cache_ttl_secs) = args.security_cache_ttl_secs {
+            config.security.cache_ttl_secs = cache_ttl_secs;
+        }
+
         // Validate the final configuration
         config.validate()?;
 
@@ -232,6 +410,7 @@ impl ServerConfig {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
     use chrono::Duration;
@@ -239,6 +418,27 @@ mod tests {
     use modelexpress_common::config::{DurationConfig, parse_duration_string};
     use std::fs;
     use tempfile::tempdir;
+
+    #[test]
+    fn comma_list_drops_blanks_and_empty_is_empty() {
+        use std::str::FromStr;
+        assert_eq!(
+            CommaList::from_str("").expect("parse").0,
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            CommaList::from_str("  ").expect("parse").0,
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            CommaList::from_str("rdma/ib").expect("parse").0,
+            vec!["rdma/ib".to_string()]
+        );
+        assert_eq!(
+            CommaList::from_str("a, ,b,").expect("parse").0,
+            vec!["a".to_string(), "b".to_string()]
+        );
+    }
 
     #[test]
     fn test_log_level_enum_parsing() {
@@ -492,6 +692,12 @@ mod tests {
             log_format: None,
             cache_directory: None,
             cache_eviction_enabled: None,
+            security_mode: None,
+            security_token_audiences: None,
+            security_device_resources: None,
+            security_device_classes: None,
+            security_pod_label_selector: None,
+            security_cache_ttl_secs: None,
             validate_config: false,
         };
 
@@ -531,6 +737,12 @@ mod tests {
             log_format: None,
             cache_directory: None,
             cache_eviction_enabled: None,
+            security_mode: None,
+            security_token_audiences: None,
+            security_device_resources: None,
+            security_device_classes: None,
+            security_pod_label_selector: None,
+            security_cache_ttl_secs: None,
             validate_config: false,
         };
 
@@ -576,6 +788,12 @@ mod tests {
             log_format: Some(LogFormat::Json),
             cache_directory: Some(PathBuf::from("/tmp/override_cache")),
             cache_eviction_enabled: Some(false),
+            security_mode: None,
+            security_token_audiences: None,
+            security_device_resources: None,
+            security_device_classes: None,
+            security_pod_label_selector: None,
+            security_cache_ttl_secs: None,
             validate_config: false,
         };
 
@@ -603,6 +821,12 @@ mod tests {
             log_format: None,
             cache_directory: None,
             cache_eviction_enabled: None,
+            security_mode: None,
+            security_token_audiences: None,
+            security_device_resources: None,
+            security_device_classes: None,
+            security_pod_label_selector: None,
+            security_cache_ttl_secs: None,
             validate_config: false,
         };
 
@@ -614,5 +838,106 @@ mod tests {
         assert_eq!(config.server.host, "localhost");
         assert_eq!(config.server.port.get(), 9001);
         assert_eq!(config.logging.level, LogLevel::Warn);
+    }
+
+    #[test]
+    fn resolve_mode_defaults_by_environment_when_unset() {
+        let cfg = SecurityConfig::default();
+        assert_eq!(cfg.resolve_mode(true), AuthMode::Permissive);
+        assert_eq!(cfg.resolve_mode(false), AuthMode::Off);
+    }
+
+    #[test]
+    fn resolve_mode_honors_explicit_setting() {
+        let cfg = SecurityConfig {
+            mode: Some(AuthMode::Enforce),
+            ..SecurityConfig::default()
+        };
+        assert_eq!(cfg.resolve_mode(true), AuthMode::Enforce);
+        assert_eq!(cfg.resolve_mode(false), AuthMode::Enforce);
+    }
+
+    #[test]
+    fn validate_resolved_requires_devices_and_audiences_for_enforce() {
+        let missing_both = SecurityConfig::default();
+        assert!(missing_both.validate_resolved(AuthMode::Enforce).is_err());
+
+        let missing_audiences = SecurityConfig {
+            device_resources: vec!["rdma/ib".to_string()],
+            ..SecurityConfig::default()
+        };
+        assert!(
+            missing_audiences
+                .validate_resolved(AuthMode::Enforce)
+                .is_err()
+        );
+
+        let complete = SecurityConfig {
+            device_resources: vec!["rdma/ib".to_string()],
+            token_audiences: vec!["modelexpress-p2p".to_string()],
+            ..SecurityConfig::default()
+        };
+        assert!(complete.validate_resolved(AuthMode::Enforce).is_ok());
+
+        // DRA device classes alone (no device-plugin resources) also satisfy enforce.
+        let dra_only = SecurityConfig {
+            device_classes: vec!["rdma.nvidia.com".to_string()],
+            token_audiences: vec!["modelexpress-p2p".to_string()],
+            ..SecurityConfig::default()
+        };
+        assert!(dra_only.validate_resolved(AuthMode::Enforce).is_ok());
+    }
+
+    #[test]
+    fn validate_resolved_is_lenient_for_off_and_permissive() {
+        let empty = SecurityConfig::default();
+        assert!(empty.validate_resolved(AuthMode::Off).is_ok());
+        assert!(empty.validate_resolved(AuthMode::Permissive).is_ok());
+    }
+
+    #[test]
+    fn parses_security_args_with_comma_lists() {
+        let args = ServerArgs::try_parse_from([
+            "test",
+            "--security-mode",
+            "enforce",
+            "--security-token-audiences",
+            "modelexpress-p2p,other",
+            "--security-device-resources",
+            "rdma/ib,rdma/roce",
+            "--security-device-classes",
+            "rdma.nvidia.com,gpu.nvidia.com",
+            "--security-cache-ttl-secs",
+            "30",
+        ]);
+        let Ok(args) = args else {
+            panic!("expected security args to parse");
+        };
+        assert_eq!(args.security_mode, Some(AuthMode::Enforce));
+        assert_eq!(
+            args.security_token_audiences.map(CommaList::into_inner),
+            Some(vec!["modelexpress-p2p".to_string(), "other".to_string()])
+        );
+        assert_eq!(
+            args.security_device_resources.map(CommaList::into_inner),
+            Some(vec!["rdma/ib".to_string(), "rdma/roce".to_string()])
+        );
+        assert_eq!(
+            args.security_device_classes.map(CommaList::into_inner),
+            Some(vec![
+                "rdma.nvidia.com".to_string(),
+                "gpu.nvidia.com".to_string()
+            ])
+        );
+        assert_eq!(args.security_cache_ttl_secs, Some(30));
+    }
+
+    #[test]
+    fn security_mode_defaults_to_none_when_absent() {
+        let Ok(args) = ServerArgs::try_parse_from(["test"]) else {
+            panic!("expected bare args to parse");
+        };
+        assert_eq!(args.security_mode, None);
+        assert!(args.security_token_audiences.is_none());
     }
 }

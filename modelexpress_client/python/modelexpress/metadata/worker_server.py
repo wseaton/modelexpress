@@ -19,6 +19,7 @@ import grpc
 
 from .. import p2p_pb2
 from .. import p2p_pb2_grpc
+from ..auth import create_channel
 
 logger = logging.getLogger("modelexpress.metadata.worker_server")
 
@@ -128,7 +129,7 @@ def fetch_tensor_manifest(
     wire size of the protobuf response (`response.ByteSize()`); callers
     use it to instrument manifest fetch timing.
     """
-    channel = grpc.insecure_channel(endpoint)
+    channel = create_channel(endpoint)
     stub = p2p_pb2_grpc.WorkerServiceStub(channel)
     request = p2p_pb2.GetTensorManifestRequest(mx_source_id=mx_source_id)
     response = stub.GetTensorManifest(request, timeout=timeout)

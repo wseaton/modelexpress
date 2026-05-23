@@ -43,14 +43,39 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy | default "IfNotPresent" }}
           {{- end }}
           ports:
-            - name: http
+            - name: grpc
               containerPort: {{ .Values.service.port | default 8001 }}
               protocol: TCP
-          {{- if or .Values.env .Values.extraEnv }}
+          {{- if or .Values.env .Values.extraEnv .Values.p2pAuth }}
           env:
             {{- range $key, $value := .Values.env }}
             - name: {{ $key }}
               value: {{ $value | quote }}
+            {{- end }}
+            {{- if .Values.p2pAuth.enabled }}
+            - name: MODEL_EXPRESS_SECURITY_MODE
+              value: {{ .Values.p2pAuth.mode | quote }}
+            - name: MODEL_EXPRESS_SECURITY_TOKEN_AUDIENCES
+              value: {{ .Values.p2pAuth.audiences | quote }}
+            {{- if .Values.p2pAuth.deviceResources }}
+            - name: MODEL_EXPRESS_SECURITY_DEVICE_RESOURCES
+              value: {{ .Values.p2pAuth.deviceResources | quote }}
+            {{- end }}
+            {{- if .Values.p2pAuth.deviceClasses }}
+            - name: MODEL_EXPRESS_SECURITY_DEVICE_CLASSES
+              value: {{ .Values.p2pAuth.deviceClasses | quote }}
+            {{- end }}
+            {{- if .Values.p2pAuth.podLabelSelector }}
+            - name: MODEL_EXPRESS_SECURITY_POD_LABEL_SELECTOR
+              value: {{ .Values.p2pAuth.podLabelSelector | quote }}
+            {{- end }}
+            - name: MODEL_EXPRESS_SECURITY_CACHE_TTL_SECS
+              value: {{ .Values.p2pAuth.cacheTtlSeconds | quote }}
+            {{- else }}
+            # Auth disabled: force off so the server's in-cluster permissive default
+            # does not silently take effect.
+            - name: MODEL_EXPRESS_SECURITY_MODE
+              value: "off"
             {{- end }}
             {{- if .Values.extraEnv }}
             {{- toYaml .Values.extraEnv | nindent 12 }}

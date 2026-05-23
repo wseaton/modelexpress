@@ -1,30 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-
-# Azure GB200 single-job template for P2P RDMA weight-transfer CI tests.
 #
-# Applied twice by the workflow — once for the source, once for the target —
-# with different env var substitutions each time:
+# vLLM P2P worker for ci/k8s/auth/gpu-e2e.sh; applied as both source and target. Central
+# metadata mode (no worker-to-worker hop), audience-scoped projected SA token.
 #
-#   Source apply:  JOB_NAME=mx-source  WORKER_PORT=<source_port>
-#   Target apply:  JOB_NAME=mx-target  WORKER_PORT=<worker_port>
-#
-# The workflow (via run-mx-test) gates target apply on the ModelMetadata CR
-# appearing in the namespace, replacing the need for an initContainer.
-#
-# Azure-specific differences vs manifest-gcp.yaml:
-#   - No GKE multi-network annotations (not supported on AKS)
-#   - rdma/ib resource limit exposes InfiniBand RDMA device (A100 SXM4 nodes)
-#   - UCX_TLS=rc_x,rc,dc_x,dc,cuda_copy for InfiniBand (no GID index needed)
-#   - MX_RDMA_NIC_PIN=auto for per-rank IB NIC pinning (workaround for ucx#11259)
-#   - nvidia.com/gpu + no-datadog tolerations for AKS A100 node pools (amd64)
-#
-# Environment variables substituted by envsubst before each apply:
-#   JOB_NAME      — mx-source or mx-target
-#   WORKER_IMAGE  — image built from ci/k8s/client/vllm/Dockerfile
-#   WORKER_PORT   — port the vLLM server listens on
-#   MX_CI_MODEL   — HuggingFace model id
-
+# envsubst vars: JOB_NAME ROLE WORKER_IMAGE MX_CI_MODEL WORKER_PORT USE_PLAN DEADLINE
 ---
 apiVersion: batch/v1
 kind: Job
@@ -32,36 +12,35 @@ metadata:
   name: ${JOB_NAME}
 spec:
   backoffLimit: 0
+  activeDeadlineSeconds: ${DEADLINE}
   template:
     metadata:
       labels:
         app: mx-p2p-worker
+        role: ${ROLE}
     spec:
       restartPolicy: Never
-      imagePullSecrets:
-        - name: worker-registry
-      affinity:
-        podAntiAffinity:
-          requiredDuringSchedulingIgnoredDuringExecution:
-            - labelSelector:
-                matchLabels:
-                  app: mx-p2p-worker
-              topologyKey: kubernetes.io/hostname
+      serviceAccountName: modelexpress
       tolerations:
         - key: nvidia.com/gpu
           operator: Exists
           effect: NoSchedule
-        - key: no-datadog
-          operator: Exists
-          effect: NoExecute
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: mx-p2p-worker
+                topologyKey: kubernetes.io/hostname
       volumes:
         - name: shm
           emptyDir:
             medium: Memory
             sizeLimit: 64Gi
-        # Bound projected SA token the ModelExpress client attaches to P2P RPCs so the
-        # server can authorize this (InfiniBand-holding) pod.
-        - name: mx-p2p-token
+        # Bound, audience-scoped projected SA token the MX client presents to the server.
+        - name: mx-token
           projected:
             sources:
               - serviceAccountToken:
@@ -71,8 +50,6 @@ spec:
       containers:
         - name: ${JOB_NAME}
           image: ${WORKER_IMAGE}
-          # Force re-pull on every pod creation so CI/dev iterations on the same
-          # tag pick up freshly pushed images instead of the node's cached copy.
           imagePullPolicy: Always
           command: ["python3", "-m", "vllm.entrypoints.openai.api_server"]
           args:
@@ -90,29 +67,45 @@ spec:
               value: "modelexpress"
             - name: MX_SERVER_ADDRESS
               value: "mx-server:8000"
-            - name: MX_CONTIGUOUS_REG
+            # Central metadata mode: no worker-to-worker WorkerService (which is plaintext).
+            - name: MX_P2P_METADATA
               value: "0"
+            - name: MX_USE_TRANSFER_PLAN
+              value: "${USE_PLAN}"
             - name: MX_RDMA_NIC_PIN
               value: "auto"
+            - name: MX_CONTIGUOUS_REG
+              value: "0"
             - name: UCX_TLS
               value: "rc_x,rc,dc_x,dc,cuda_copy"
             - name: UCX_RNDV_SCHEME
               value: "get_zcopy"
             - name: UCX_RNDV_THRESH
               value: "0"
+            - name: NIXL_LOG_LEVEL
+              value: "INFO"
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: MX_LABEL_pod
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: MX_LABEL_role
+              value: "${JOB_NAME}"
             - name: HF_TOKEN
               valueFrom:
                 secretKeyRef:
                   name: hf-token-secret
                   key: HF_TOKEN
-            - name: MX_AUTH_TOKEN_PATH
-              value: /var/run/secrets/tokens/modelexpress
           ports:
             - containerPort: ${WORKER_PORT}
+              name: metrics
           resources:
             requests:
               cpu: "4"
-              memory: "16Gi"
+              memory: "32Gi"
               nvidia.com/gpu: "1"
               rdma/ib: "1"
             limits:
@@ -121,7 +114,7 @@ spec:
           volumeMounts:
             - name: shm
               mountPath: /dev/shm
-            - name: mx-p2p-token
+            - name: mx-token
               mountPath: /var/run/secrets/tokens
               readOnly: true
           securityContext:

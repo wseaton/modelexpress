@@ -1,0 +1,24 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Disconnect-safe teardown: after a TTL, deletes the test namespace and the cluster-scoped
+# RBAC the run created, so nothing leaks if the driving script dies. envsubst vars:
+# JOB_NAME REAP_TTL REAP_CMD
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ${JOB_NAME}
+spec:
+  backoffLimit: 1
+  activeDeadlineSeconds: ${REAP_TTL}
+  template:
+    spec:
+      restartPolicy: Never
+      serviceAccountName: reaper
+      containers:
+        - name: reaper
+          image: docker.io/bitnami/kubectl:latest
+          command: ["/bin/sh", "-c"]
+          args:
+            - "${REAP_CMD}"

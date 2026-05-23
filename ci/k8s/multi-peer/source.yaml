@@ -1,0 +1,128 @@
+# Source worker for multi-peer transfer plan testing. Deploy multiple instances
+# (mx-source-0, mx-source-1, ...) with distinct JOB_NAME values.
+#
+# envsubst vars: JOB_NAME, WORKER_IMAGE, WORKER_PORT, MX_CI_MODEL.
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ${JOB_NAME}
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: mx-p2p-worker
+        role: source
+    spec:
+      restartPolicy: Never
+      serviceAccountName: modelexpress
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: mx-p2p-worker
+                topologyKey: kubernetes.io/hostname
+      volumes:
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Gi
+      containers:
+        - name: ${JOB_NAME}
+          image: ${WORKER_IMAGE}
+          imagePullPolicy: Always
+          command: ["python3", "-m", "vllm.entrypoints.openai.api_server"]
+          args:
+            - --model
+            - "${MX_CI_MODEL}"
+            - --load-format
+            - mx
+            - --tensor-parallel-size
+            - "1"
+            - --trust-remote-code
+            - --port
+            - "${WORKER_PORT}"
+          env:
+            - name: VLLM_PLUGINS
+              value: "modelexpress"
+            - name: MX_SERVER_ADDRESS
+              value: "mx-server:8000"
+            - name: MX_P2P_METADATA
+              value: "1"
+            - name: MX_METADATA_PORT
+              value: "5555"
+            - name: MX_WORKER_GRPC_PORT
+              value: "6555"
+            - name: MX_RDMA_NIC_PIN
+              value: "auto"
+            - name: MX_CONTIGUOUS_REG
+              value: "0"
+            - name: UCX_TLS
+              value: "rc_x,rc,dc_x,dc,cuda_copy"
+            - name: UCX_RNDV_SCHEME
+              value: "get_zcopy"
+            - name: UCX_RNDV_THRESH
+              value: "0"
+            - name: NIXL_LOG_LEVEL
+              value: "INFO"
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            # Advertise k8s identity as MX worker labels so the planner's
+            # external-data informers (e.g. Prometheus scrapes labelled
+            # by `pod`) can join against the right MX peer.
+            - name: MX_LABEL_pod
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: MX_LABEL_namespace
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: MX_LABEL_node
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            # Pod IP for direct /metrics scrape by VllmMetricsInformer.
+            - name: MX_LABEL_pod_ip
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            # Stable role name (pod names have random suffixes) so the
+            # static mock informer can key scores by a predictable value.
+            - name: MX_LABEL_role
+              value: "${JOB_NAME}"
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token-secret
+                  key: HF_TOKEN
+          ports:
+            # vLLM serves /metrics on the same port as the OpenAI API.
+            # Named `metrics` so a PodMonitor can target it by name.
+            - containerPort: ${WORKER_PORT}
+              name: metrics
+          resources:
+            requests:
+              cpu: "4"
+              memory: "32Gi"
+              nvidia.com/gpu: "1"
+              rdma/ib: "1"
+            limits:
+              nvidia.com/gpu: "1"
+              rdma/ib: "1"
+          volumeMounts:
+            - name: shm
+              mountPath: /dev/shm
+          securityContext:
+            capabilities:
+              add: [IPC_LOCK]

@@ -42,6 +42,14 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
+            # Permissive verifies and logs but never blocks; flip to "enforce" after
+            # callers send tokens.
+            - name: MODEL_EXPRESS_SECURITY_MODE
+              value: "permissive"
+            - name: MODEL_EXPRESS_SECURITY_TOKEN_AUDIENCES
+              value: "modelexpress-p2p"
+            - name: MODEL_EXPRESS_SECURITY_DEVICE_RESOURCES
+              value: "rdma/ib"
           ports:
             - containerPort: 8000
           resources:

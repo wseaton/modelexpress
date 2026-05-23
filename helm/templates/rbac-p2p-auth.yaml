@@ -1,0 +1,42 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Cluster-scoped RBAC for device authorization. TokenReview is cluster-scoped and the
+# pod/ResourceClaim reflectors watch cluster-wide.
+{{- if and .Values.serviceAccount.create .Values.p2pAuth.enabled .Values.p2pAuth.createClusterRBAC }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "modelexpress.fullname" . }}-p2p-auth
+  labels:
+    {{- include "modelexpress.labels" . | nindent 4 }}
+rules:
+  # Verify caller ServiceAccount tokens.
+  - apiGroups: ["authentication.k8s.io"]
+    resources: ["tokenreviews"]
+    verbs: ["create"]
+  # Background pod reflector (any namespace) to check caller device requests.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["list", "watch"]
+  # Background ResourceClaim reflector for the DRA path (device classes).
+  - apiGroups: ["resource.k8s.io"]
+    resources: ["resourceclaims"]
+    verbs: ["list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "modelexpress.fullname" . }}-p2p-auth
+  labels:
+    {{- include "modelexpress.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "modelexpress.fullname" . }}-p2p-auth
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "modelexpress.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}

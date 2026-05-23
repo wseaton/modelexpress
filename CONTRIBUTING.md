@@ -110,6 +110,7 @@ Run pre-commit after every code change, even before creating commits. Do not wai
 | `MODEL_EXPRESS_LOG_FORMAT` | `pretty` | Log format (json, pretty, compact) |
 | `MX_METADATA_BACKEND` | (required) | `redis` or `kubernetes` — drives both the P2P metadata and model registry backends |
 | `REDIS_URL` | `redis://localhost:6379` | Redis URL (when backend is `redis`) |
+| `MODEL_EXPRESS_SECURITY_MODE` | `off` outside K8s | Device authorization: `off`/`permissive`/`enforce`. Outside Kubernetes it defaults to `off`, so local dev needs no token. See [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md). |
 
 For local dev the quickest Redis is a one-liner:
 

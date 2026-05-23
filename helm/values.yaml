@@ -27,6 +27,31 @@ serviceAccount:
     # Required when MX_METADATA_BACKEND=kubernetes.
     enabled: false
 
+# Device authorization: the server verifies each P2pService caller's bound projected
+# ServiceAccount token (Kubernetes TokenReview) and confirms the caller's pod holds a
+# fabric device (IB / RoCE / EFA).
+p2pAuth:
+  # When false, auth is forced off and no cluster RBAC is created.
+  enabled: false
+  #   permissive - verify and log violations, but never block (safe rollout step).
+  #   enforce    - reject callers without a valid token + device-holding pod.
+  mode: permissive
+  # Audiences the caller's projected token must carry (comma-separated).
+  audiences: "modelexpress-p2p"
+  # Device-plugin resource names that prove fabric possession (comma-separated), e.g.
+  # "rdma/ib", "rdma/roce", "vpc.amazonaws.com/efa".
+  deviceResources: "rdma/ib"
+  # DRA device class names that prove fabric possession (comma-separated). Empty skips
+  # the DRA path (no ResourceClaim reflector).
+  deviceClasses: ""
+  # Label selector narrowing the pod reflector on large clusters (e.g.
+  # "modelexpress.nvidia.com/p2p=true"). Unmatched pods fail closed. Empty = watch all.
+  podLabelSelector: ""
+  cacheTtlSeconds: 60
+  # Cluster-scoped RBAC (TokenReview + pod/ResourceClaim reflectors). Set false to manage
+  # the ClusterRole/ClusterRoleBinding yourself (e.g. namespace-admin install).
+  createClusterRBAC: true
+
 podAnnotations: {}
 
 podLabels: {}
