@@ -20,6 +20,7 @@ import grpc
 
 from . import p2p_pb2
 from . import p2p_pb2_grpc
+from .transport import create_channel, parse_target
 
 logger = logging.getLogger("modelexpress.client")
 
@@ -80,18 +81,10 @@ class MxClientBase(ABC):
         """Release any resources held by the client."""
 
 
-def _parse_server_address(address: str) -> str:
-    """Strip http:// or https:// prefix from server address for gRPC."""
-    if address.startswith("http://"):
-        return address[7:]
-    elif address.startswith("https://"):
-        return address[8:]
-    return address
-
-
-def _get_server_url(explicit_url: str | None = None) -> str:
+def _resolve_server(explicit_url: str | None = None) -> tuple[str, bool]:
     """
-    Resolve the ModelExpress server URL.
+    Resolve the server address to ``(host:port, use_tls)``; ``use_tls`` reflects whether
+    the configured URL carries an ``https://``/``grpcs://`` scheme.
 
     Priority:
     1. Explicit ``server_url`` argument
@@ -99,13 +92,11 @@ def _get_server_url(explicit_url: str | None = None) -> str:
     3. ``MX_SERVER_ADDRESS`` env var (backward compat)
     4. Default ``localhost:8001``
     """
-    if explicit_url:
-        return _parse_server_address(explicit_url)
-    url = os.environ.get(
+    raw = explicit_url or os.environ.get(
         "MODEL_EXPRESS_URL",
         os.environ.get("MX_SERVER_ADDRESS", "localhost:8001"),
     )
-    return _parse_server_address(url)
+    return parse_target(raw)
 
 
 class MxClient(MxClientBase):
@@ -132,7 +123,7 @@ class MxClient(MxClientBase):
         server_url: str | None = None,
         max_message_size: int = 100 * 1024 * 1024,  # 100 MB
     ):
-        self.server_url = _get_server_url(server_url)
+        self.server_url, self._use_tls = _resolve_server(server_url)
         self._max_message_size = max_message_size
         self._channel: grpc.Channel | None = None
         self._stub: p2p_pb2_grpc.P2pServiceStub | None = None
@@ -147,7 +138,9 @@ class MxClient(MxClientBase):
                 ("grpc.max_send_message_length", self._max_message_size),
                 ("grpc.max_receive_message_length", self._max_message_size),
             ]
-            self._channel = grpc.insecure_channel(self.server_url, options=options)
+            self._channel = create_channel(
+                self.server_url, options=options, use_tls=self._use_tls
+            )
             self._stub = p2p_pb2_grpc.P2pServiceStub(self._channel)
             logger.debug("MxClient connected to %s", self.server_url)
         return self._stub

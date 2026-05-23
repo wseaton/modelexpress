@@ -6,6 +6,10 @@ metadata:
   name: {{ include "modelexpress.fullname" . }}
   labels:
     {{- include "modelexpress.labels" . | nindent 4 }}
+  {{- if and .Values.tls.enabled .Values.tls.reloaderAnnotation }}
+  annotations:
+    secret.reloader.stakater.com/reload: {{ include "modelexpress.tlsSecretName" . }}
+  {{- end }}
 spec:
   replicas: {{ .Values.replicaCount | default 1 }}
   selector:
@@ -46,11 +50,17 @@ spec:
             - name: http
               containerPort: {{ .Values.service.port | default 8001 }}
               protocol: TCP
-          {{- if or .Values.env .Values.extraEnv }}
+          {{- if or .Values.env .Values.extraEnv .Values.tls.enabled }}
           env:
             {{- range $key, $value := .Values.env }}
             - name: {{ $key }}
               value: {{ $value | quote }}
+            {{- end }}
+            {{- if .Values.tls.enabled }}
+            - name: MODEL_EXPRESS_TLS_CERT
+              value: {{ printf "%s/tls.crt" .Values.tls.mountPath | quote }}
+            - name: MODEL_EXPRESS_TLS_KEY
+              value: {{ printf "%s/tls.key" .Values.tls.mountPath | quote }}
             {{- end }}
             {{- if .Values.extraEnv }}
             {{- toYaml .Values.extraEnv | nindent 12 }}
@@ -88,22 +98,32 @@ spec:
           {{- end }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
-          {{- if or (and .Values.persistence .Values.persistence.enabled) .Values.extraVolumeMounts }}
+          {{- if or (and .Values.persistence .Values.persistence.enabled) .Values.extraVolumeMounts .Values.tls.enabled }}
           volumeMounts:
             {{- if and .Values.persistence .Values.persistence.enabled }}
             - name: model-cache
               mountPath: {{ .Values.persistence.mountPath | default "/root" }}
             {{- end }}
+            {{- if .Values.tls.enabled }}
+            - name: tls
+              mountPath: {{ .Values.tls.mountPath }}
+              readOnly: true
+            {{- end }}
             {{- if .Values.extraVolumeMounts }}
             {{- toYaml .Values.extraVolumeMounts | nindent 12 }}
             {{- end }}
           {{- end }}
-      {{- if or (and .Values.persistence .Values.persistence.enabled) .Values.extraVolumes }}
+      {{- if or (and .Values.persistence .Values.persistence.enabled) .Values.extraVolumes .Values.tls.enabled }}
       volumes:
         {{- if and .Values.persistence .Values.persistence.enabled }}
         - name: model-cache
           persistentVolumeClaim:
             claimName: {{ include "modelexpress.fullname" . }}-pvc
+        {{- end }}
+        {{- if .Values.tls.enabled }}
+        - name: tls
+          secret:
+            secretName: {{ include "modelexpress.tlsSecretName" . }}
         {{- end }}
         {{- if .Values.extraVolumes }}
         {{- toYaml .Values.extraVolumes | nindent 8 }}

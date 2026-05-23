@@ -173,6 +173,36 @@ GCS uses the configured/default ModelExpress cache root; `MODEL_EXPRESS_CACHE_DI
 
 See [`CLI.md`](CLI.md) for full CLI usage documentation.
 
+## Transport TLS
+
+Optional and off by default; the cert is loaded once at startup, so rotation requires a
+restart.
+
+### Server
+
+Setting one of cert/key without the other is rejected at startup.
+
+| CLI Flag | Env Var | Description |
+|----------|---------|-------------|
+| `--tls-cert` | `MODEL_EXPRESS_TLS_CERT` | PEM certificate chain path |
+| `--tls-key` | `MODEL_EXPRESS_TLS_KEY` | PEM private key path |
+
+On Kubernetes the Helm chart wires this via `tls.*` in `values.yaml`. `tls.enabled=true`
+mounts the cert Secret, injects the env vars, and adds a `stakater/reloader` annotation
+for restart-on-rotation. The bundled `tls.certManager.*` integration issues the cert
+(self-signed CA chain by default, or your `issuerRef`); to BYO Secret, set
+`tls.secretName` and `tls.certManager.enabled=false`.
+
+### Client (Python)
+
+`MODEL_EXPRESS_URL` (or `MX_SERVER_ADDRESS`) with `https://`/`grpcs://` selects TLS;
+anything else stays plaintext.
+
+| Env Var | Description |
+|---------|-------------|
+| `MX_TLS_CA` | PEM CA bundle to verify the server cert; unset = gRPC's default root store |
+| `MX_TLS_SERVER_NAME` | Overrides the authority used for cert hostname verification |
+
 ## Docker
 
 ### Production Image

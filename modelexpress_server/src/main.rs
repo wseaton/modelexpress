@@ -8,7 +8,7 @@ use modelexpress_common::grpc::{
 };
 use modelexpress_server::{
     cache::CacheEvictionService,
-    config::{ServerArgs, ServerConfig},
+    config::{ServerArgs, ServerConfig, TlsError},
     p2p::{service::P2pServiceImpl, state::P2pStateManager},
     registry::state::RegistryManager,
     services::{
@@ -17,7 +17,7 @@ use modelexpress_server::{
     },
 };
 use std::sync::Arc;
-use tonic::transport::Server;
+use tonic::transport::{Identity, Server, ServerTlsConfig};
 use tracing::{error, info};
 use tracing_subscriber::{EnvFilter, FmtSubscriber};
 
@@ -174,7 +174,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // Start the gRPC server
     info!("Starting gRPC server on: {addr}");
-    let server_result = Server::builder()
+
+    let mut builder = Server::builder();
+    if config.tls.enabled() {
+        builder = builder.tls_config(load_tls_config(&config)?)?;
+        info!("TLS: enabled");
+    } else {
+        info!("TLS: disabled (plaintext)");
+    }
+
+    let server_result = builder
         .add_service(health_service_v1)
         .add_service(HealthServiceServer::new(health_service))
         .add_service(ApiServiceServer::new(api_service))
@@ -200,4 +209,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     server_result?;
     info!("Server shutdown complete");
     Ok(())
+}
+
+fn load_tls_config(config: &ServerConfig) -> Result<ServerTlsConfig, TlsError> {
+    let (cert, key) = config.tls.load_pem()?;
+    Ok(ServerTlsConfig::new().identity(Identity::from_pem(cert, key)))
 }

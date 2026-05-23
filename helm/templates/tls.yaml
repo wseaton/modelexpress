@@ -1,0 +1,78 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+{{- if and .Values.tls.enabled .Values.tls.certManager.enabled }}
+# Requires cert-manager in the cluster.
+{{- if not .Values.tls.certManager.issuerRef }}
+# Bootstrap a self-signed CA chain when no external issuer is supplied.
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: {{ include "modelexpress.fullname" . }}-selfsigned
+  labels:
+    {{- include "modelexpress.labels" . | nindent 4 }}
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ include "modelexpress.fullname" . }}-ca
+  labels:
+    {{- include "modelexpress.labels" . | nindent 4 }}
+spec:
+  isCA: true
+  commonName: {{ include "modelexpress.fullname" . }}-ca
+  secretName: {{ include "modelexpress.fullname" . }}-ca
+  duration: {{ .Values.tls.certManager.caDuration | default "8760h" }}
+  renewBefore: {{ .Values.tls.certManager.caRenewBefore | default "720h" }}
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+  issuerRef:
+    name: {{ include "modelexpress.fullname" . }}-selfsigned
+    kind: Issuer
+    group: cert-manager.io
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: {{ include "modelexpress.fullname" . }}-ca
+  labels:
+    {{- include "modelexpress.labels" . | nindent 4 }}
+spec:
+  ca:
+    secretName: {{ include "modelexpress.fullname" . }}-ca
+{{- end }}
+---
+# Server leaf certificate; dnsNames cover the Service's in-cluster names.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ include "modelexpress.fullname" . }}-tls
+  labels:
+    {{- include "modelexpress.labels" . | nindent 4 }}
+spec:
+  secretName: {{ include "modelexpress.tlsSecretName" . }}
+  duration: {{ .Values.tls.certManager.duration | default "2160h" }}
+  renewBefore: {{ .Values.tls.certManager.renewBefore | default "360h" }}
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+  dnsNames:
+    - {{ include "modelexpress.fullname" . }}
+    - {{ include "modelexpress.fullname" . }}.{{ .Release.Namespace }}
+    - {{ include "modelexpress.fullname" . }}.{{ .Release.Namespace }}.svc
+    - {{ include "modelexpress.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local
+    {{- with .Values.tls.certManager.extraDnsNames }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  issuerRef:
+    {{- if .Values.tls.certManager.issuerRef }}
+    {{- toYaml .Values.tls.certManager.issuerRef | nindent 4 }}
+    {{- else }}
+    name: {{ include "modelexpress.fullname" . }}-ca
+    kind: Issuer
+    group: cert-manager.io
+    {{- end }}
+{{- end }}

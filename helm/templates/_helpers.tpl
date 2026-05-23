@@ -63,3 +63,8 @@ Create the name of the service account to use
 {{- default "default" .Values.serviceAccount.name }}
 {{- end }}
 {{- end }}
+
+{{/* Server TLS Secret name; defaults to <fullname>-tls (what cert-manager writes). */}}
+{{- define "modelexpress.tlsSecretName" -}}
+{{- default (printf "%s-tls" (include "modelexpress.fullname" .)) .Values.tls.secretName }}
+{{- end }}

@@ -27,6 +27,25 @@ serviceAccount:
     # Required when MX_METADATA_BACKEND=kubernetes.
     enabled: false
 
+tls:
+  enabled: false
+  mountPath: /etc/modelexpress/tls
+  secretName: ""
+  # inject the annotation for reloader
+  reloaderAnnotation: true
+  certManager:
+    enabled: true
+    # Existing (Cluster)Issuer to use instead of the bundled self-signed CA, e.g.
+    # { name: my-ca, kind: ClusterIssuer, group: cert-manager.io }.
+    issuerRef: {}
+    duration: "2160h"
+    renewBefore: "360h"
+    # Bundled self-signed CA lifetime; ignored when issuerRef is set.
+    caDuration: "8760h"
+    caRenewBefore: "720h"
+    # Extra SANs for the server cert (e.g. an external hostname).
+    extraDnsNames: []
+
 podAnnotations: {}
 
 podLabels: {}

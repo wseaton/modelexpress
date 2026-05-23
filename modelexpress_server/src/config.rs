@@ -12,6 +12,67 @@ use tracing::Level;
 
 use crate::cache::CacheEvictionConfig;
 
+/// Transport TLS for the gRPC server. Loaded once at startup; rotation needs a restart.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TlsConfig {
+    #[serde(default)]
+    pub cert_path: Option<PathBuf>,
+    #[serde(default)]
+    pub key_path: Option<PathBuf>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum TlsError {
+    #[error("TLS is enabled but the {0} path is not set")]
+    MissingPath(&'static str),
+    #[error("failed to read TLS {kind} from {path}: {source}")]
+    Read {
+        kind: &'static str,
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+}
+
+impl TlsConfig {
+    #[must_use]
+    pub fn enabled(&self) -> bool {
+        self.cert_path.is_some() && self.key_path.is_some()
+    }
+
+    /// A half-configured pair is almost always a deployment mistake; reject it.
+    pub fn validate(&self) -> Result<(), String> {
+        match (self.cert_path.is_some(), self.key_path.is_some()) {
+            (true, false) => Err("TLS cert path set without a key path \
+                (MODEL_EXPRESS_TLS_KEY)"
+                .to_string()),
+            (false, true) => Err("TLS key path set without a cert path \
+                (MODEL_EXPRESS_TLS_CERT)"
+                .to_string()),
+            _ => Ok(()),
+        }
+    }
+
+    pub fn load_pem(&self) -> Result<(Vec<u8>, Vec<u8>), TlsError> {
+        let cert_path = self
+            .cert_path
+            .as_ref()
+            .ok_or(TlsError::MissingPath("cert"))?;
+        let key_path = self.key_path.as_ref().ok_or(TlsError::MissingPath("key"))?;
+        let cert = std::fs::read(cert_path).map_err(|source| TlsError::Read {
+            kind: "cert",
+            path: cert_path.clone(),
+            source,
+        })?;
+        let key = std::fs::read(key_path).map_err(|source| TlsError::Read {
+            kind: "key",
+            path: key_path.clone(),
+            source,
+        })?;
+        Ok((cert, key))
+    }
+}
+
 /// Command line arguments for the server
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -44,6 +105,14 @@ pub struct ServerArgs {
     #[arg(long, env = "MODEL_EXPRESS_CACHE_EVICTION_ENABLED")]
     pub cache_eviction_enabled: Option<bool>,
 
+    /// PEM certificate chain path; enables TLS when set together with --tls-key
+    #[arg(long, env = "MODEL_EXPRESS_TLS_CERT")]
+    pub tls_cert: Option<PathBuf>,
+
+    /// PEM private key path; enables TLS when set together with --tls-cert
+    #[arg(long, env = "MODEL_EXPRESS_TLS_KEY")]
+    pub tls_key: Option<PathBuf>,
+
     /// Validate configuration and exit
     #[arg(long)]
     pub validate_config: bool,
@@ -58,6 +127,9 @@ pub struct ServerConfig {
     pub cache: CacheConfig,
     /// Logging configuration
     pub logging: LoggingConfig,
+    /// Transport TLS configuration
+    #[serde(default)]
+    pub tls: TlsConfig,
 }
 
 /// Server-specific settings
@@ -173,6 +245,13 @@ impl ServerConfig {
             config.cache.eviction.enabled = cache_eviction_enabled;
         }
 
+        if let Some(tls_cert) = args.tls_cert {
+            config.tls.cert_path = Some(tls_cert);
+        }
+        if let Some(tls_key) = args.tls_key {
+            config.tls.key_path = Some(tls_key);
+        }
+
         // Validate the final configuration
         config.validate()?;
 
@@ -190,6 +269,8 @@ impl ServerConfig {
                 parent.display()
             )));
         }
+
+        self.tls.validate().map_err(ConfigError::Message)?;
 
         Ok(())
     }
@@ -239,6 +320,63 @@ mod tests {
     use modelexpress_common::config::{DurationConfig, parse_duration_string};
     use std::fs;
     use tempfile::tempdir;
+
+    #[test]
+    fn tls_enabled_only_when_both_paths_set() {
+        let neither = TlsConfig::default();
+        assert!(!neither.enabled());
+
+        let both = TlsConfig {
+            cert_path: Some(PathBuf::from("/c")),
+            key_path: Some(PathBuf::from("/k")),
+        };
+        assert!(both.enabled());
+    }
+
+    #[test]
+    fn tls_validate_rejects_half_configured() {
+        let cert_only = TlsConfig {
+            cert_path: Some(PathBuf::from("/c")),
+            key_path: None,
+        };
+        assert!(cert_only.validate().is_err());
+
+        let key_only = TlsConfig {
+            cert_path: None,
+            key_path: Some(PathBuf::from("/k")),
+        };
+        assert!(key_only.validate().is_err());
+
+        assert!(TlsConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn tls_load_pem_reads_both_files() {
+        let dir = tempdir().expect("tempdir");
+        let cert_path = dir.path().join("tls.crt");
+        let key_path = dir.path().join("tls.key");
+        fs::write(&cert_path, b"CERT").expect("write cert");
+        fs::write(&key_path, b"KEY").expect("write key");
+        let tls = TlsConfig {
+            cert_path: Some(cert_path),
+            key_path: Some(key_path),
+        };
+        let (cert, key) = tls.load_pem().expect("load");
+        assert_eq!(cert, b"CERT");
+        assert_eq!(key, b"KEY");
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn tls_load_pem_reports_missing_file() {
+        let tls = TlsConfig {
+            cert_path: Some(PathBuf::from("/no/such/cert")),
+            key_path: Some(PathBuf::from("/no/such/key")),
+        };
+        let err = tls.load_pem().expect_err("should fail");
+        assert!(matches!(err, TlsError::Read { kind: "cert", .. }));
+    }
 
     #[test]
     fn test_log_level_enum_parsing() {
@@ -492,6 +630,8 @@ mod tests {
             log_format: None,
             cache_directory: None,
             cache_eviction_enabled: None,
+            tls_cert: None,
+            tls_key: None,
             validate_config: false,
         };
 
@@ -531,6 +671,8 @@ mod tests {
             log_format: None,
             cache_directory: None,
             cache_eviction_enabled: None,
+            tls_cert: None,
+            tls_key: None,
             validate_config: false,
         };
 
@@ -576,6 +718,8 @@ mod tests {
             log_format: Some(LogFormat::Json),
             cache_directory: Some(PathBuf::from("/tmp/override_cache")),
             cache_eviction_enabled: Some(false),
+            tls_cert: None,
+            tls_key: None,
             validate_config: false,
         };
 
@@ -603,6 +747,8 @@ mod tests {
             log_format: None,
             cache_directory: None,
             cache_eviction_enabled: None,
+            tls_cert: None,
+            tls_key: None,
             validate_config: false,
         };
 
