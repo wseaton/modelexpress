@@ -6,6 +6,7 @@
 //! Metadata is keyed by mx_source_id, a 16-char hex hash of SourceIdentity.
 //! Clients send the full SourceIdentity; the server computes and returns the hash.
 
+use crate::auth::{CallerIdentity, derive_worker_id};
 use crate::p2p::backend::SourceInstanceInfo;
 use crate::p2p::source_identity::{compute_mx_source_id, validate_identity};
 use crate::p2p::state::P2pStateManager;
@@ -16,7 +17,7 @@ use modelexpress_common::grpc::p2p::{
 };
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 /// P2P Service implementation
 pub struct P2pServiceImpl {
@@ -36,6 +37,10 @@ impl P2pService for P2pServiceImpl {
         &self,
         request: Request<PublishMetadataRequest>,
     ) -> Result<Response<PublishMetadataResponse>, Status> {
+        // The auth layer plants a verified CallerIdentity in extensions on success;
+        // its absence means auth is off (local dev) and we fall back to the
+        // client-supplied worker_id for backwards compatibility.
+        let caller = request.extensions().get::<CallerIdentity>().cloned();
         let req = request.into_inner();
 
         let identity = match req.identity {
@@ -59,15 +64,6 @@ impl P2pService for P2pServiceImpl {
             }));
         }
 
-        if req.worker_id.is_empty() {
-            return Ok(Response::new(PublishMetadataResponse {
-                success: false,
-                message: "worker_id is required".to_string(),
-                mx_source_id: String::new(),
-                worker_id: String::new(),
-            }));
-        }
-
         let worker = match req.worker {
             Some(w) => w,
             None => {
@@ -80,8 +76,37 @@ impl P2pService for P2pServiceImpl {
             }
         };
 
+        // Bind worker_id to the verified caller when present. Without this, any
+        // authorized caller can reuse another publisher's client-chosen worker_id
+        // and silently overwrite their record (both backends are upsert-on-conflict).
+        let worker_id = match caller.as_ref() {
+            Some(c) => {
+                let derived = derive_worker_id(c, worker.worker_rank);
+                if !req.worker_id.is_empty() && req.worker_id != derived {
+                    warn!(
+                        client_supplied = %req.worker_id,
+                        server_derived = %derived,
+                        namespace = %c.namespace,
+                        pod = c.pod_name.as_deref().unwrap_or("?"),
+                        "ignoring client-supplied worker_id; using server-derived value"
+                    );
+                }
+                derived
+            }
+            None => {
+                if req.worker_id.is_empty() {
+                    return Ok(Response::new(PublishMetadataResponse {
+                        success: false,
+                        message: "worker_id is required".to_string(),
+                        mx_source_id: String::new(),
+                        worker_id: String::new(),
+                    }));
+                }
+                req.worker_id.clone()
+            }
+        };
+
         let source_id = compute_mx_source_id(&identity);
-        let worker_id = req.worker_id.clone();
         let model_name = identity.model_name.clone();
         let worker_rank = worker.worker_rank;
         let tensor_count = worker.tensors.len();
@@ -233,6 +258,7 @@ impl P2pService for P2pServiceImpl {
         &self,
         request: Request<UpdateStatusRequest>,
     ) -> Result<Response<UpdateStatusResponse>, Status> {
+        let caller = request.extensions().get::<CallerIdentity>().cloned();
         let req = request.into_inner();
 
         if req.mx_source_id.is_empty() {
@@ -242,12 +268,28 @@ impl P2pService for P2pServiceImpl {
             }));
         }
 
-        if req.worker_id.is_empty() {
-            return Ok(Response::new(UpdateStatusResponse {
-                success: false,
-                message: "worker_id is required".to_string(),
-            }));
-        }
+        let worker_id = match caller.as_ref() {
+            Some(c) => {
+                let derived = derive_worker_id(c, req.worker_rank);
+                if !req.worker_id.is_empty() && req.worker_id != derived {
+                    warn!(
+                        client_supplied = %req.worker_id,
+                        server_derived = %derived,
+                        "ignoring client-supplied worker_id on update_status"
+                    );
+                }
+                derived
+            }
+            None => {
+                if req.worker_id.is_empty() {
+                    return Ok(Response::new(UpdateStatusResponse {
+                        success: false,
+                        message: "worker_id is required".to_string(),
+                    }));
+                }
+                req.worker_id.clone()
+            }
+        };
 
         let status = match SourceStatus::try_from(req.status) {
             Ok(s) => s,
@@ -261,14 +303,14 @@ impl P2pService for P2pServiceImpl {
 
         match self
             .state
-            .update_worker_status(&req.mx_source_id, &req.worker_id, req.worker_rank, status)
+            .update_worker_status(&req.mx_source_id, &worker_id, req.worker_rank, status)
             .await
         {
             Ok(()) => Ok(Response::new(UpdateStatusResponse {
                 success: true,
                 message: format!(
                     "Updated status for source '{}' worker_id '{}' rank {}",
-                    req.mx_source_id, req.worker_id, req.worker_rank
+                    req.mx_source_id, worker_id, req.worker_rank
                 ),
             })),
             Err(e) => {
@@ -349,11 +391,20 @@ mod tests {
 
     #[tokio::test]
     async fn test_publish_metadata_missing_worker_id() {
+        // Auth-off path: no CallerIdentity in extensions, so client-supplied
+        // worker_id is still required.
         let svc = make_service(MockMetadataBackend::new());
         let resp = svc
             .publish_metadata(Request::new(PublishMetadataRequest {
                 identity: Some(test_identity()),
-                worker: None,
+                worker: Some(WorkerMetadata {
+                    worker_rank: 0,
+                    backend_metadata: None,
+                    tensors: vec![],
+                    status: SourceStatus::Initializing as i32,
+                    updated_at: 0,
+                    ..Default::default()
+                }),
                 worker_id: String::new(),
             }))
             .await
@@ -761,6 +812,69 @@ mod tests {
     }
 
     // ── update_status (additional) ──────────────────────────────────────────
+
+    fn test_caller() -> CallerIdentity {
+        CallerIdentity {
+            namespace: "ns-a".to_string(),
+            service_account: "sa-a".to_string(),
+            pod_name: Some("pod-a".to_string()),
+            pod_uid: Some("uid-a".to_string()),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_update_status_caller_binds_worker_id() {
+        let expected = derive_worker_id(&test_caller(), 2);
+        let mut mock = MockMetadataBackend::new();
+        let expected_for_mock = expected.clone();
+        mock.expect_update_status()
+            .withf(move |_, worker_id, rank, _, _| worker_id == expected_for_mock && *rank == 2)
+            .once()
+            .returning(|_, _, _, _, _| Ok(()));
+
+        let svc = make_service(mock);
+        let mut req = Request::new(UpdateStatusRequest {
+            mx_source_id: "abc123def456abcd".to_string(),
+            worker_id: "spoofed-id".to_string(),
+            worker_rank: 2,
+            status: SourceStatus::Stale as i32,
+        });
+        req.extensions_mut().insert(test_caller());
+
+        let resp = svc.update_status(req).await.expect("rpc").into_inner();
+        assert!(resp.success);
+        assert!(resp.message.contains(&expected));
+    }
+
+    #[tokio::test]
+    async fn test_publish_metadata_caller_binds_worker_id() {
+        let expected = derive_worker_id(&test_caller(), 1);
+        let mut mock = MockMetadataBackend::new();
+        let expected_for_mock = expected.clone();
+        mock.expect_publish_metadata()
+            .withf(move |_, worker_id, _| worker_id == expected_for_mock)
+            .once()
+            .returning(|_, _, _| Ok(()));
+
+        let svc = make_service(mock);
+        let mut req = Request::new(PublishMetadataRequest {
+            identity: Some(test_identity()),
+            worker: Some(WorkerMetadata {
+                worker_rank: 1,
+                backend_metadata: None,
+                tensors: vec![],
+                status: SourceStatus::Initializing as i32,
+                updated_at: 0,
+                ..Default::default()
+            }),
+            worker_id: "spoofed-id".to_string(),
+        });
+        req.extensions_mut().insert(test_caller());
+
+        let resp = svc.publish_metadata(req).await.expect("rpc").into_inner();
+        assert!(resp.success);
+        assert_eq!(resp.worker_id, expected);
+    }
 
     #[tokio::test]
     async fn test_update_status_backend_error() {

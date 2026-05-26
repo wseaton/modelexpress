@@ -85,6 +85,10 @@ where
                         path = %req.uri().path(),
                         "device authorization ok"
                     );
+                    // Downstream services read this to bind ownership (e.g.
+                    // server-derived worker_id) to the verified caller.
+                    let mut req = req;
+                    req.extensions_mut().insert(caller);
                     inner.call(req).await
                 }
                 Err(denial) if state.mode == AuthMode::Enforce => {

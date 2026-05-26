@@ -12,6 +12,7 @@ mod store;
 mod token;
 
 pub use layer::AuthLayer;
+pub use token::CallerIdentity;
 
 use std::time::Duration;
 
@@ -24,7 +25,28 @@ use sha2::{Digest, Sha256};
 use crate::config::{AuthMode, SecurityConfig};
 use device::DeviceResource;
 use store::{DeviceDecision, DeviceStore};
-use token::{CallerIdentity, extract_bearer, review_token};
+use token::{extract_bearer, review_token};
+
+/// Deterministic server-derived worker_id from the verified caller identity.
+///
+/// Replaces client-supplied `worker_id` so that the `(source_id, worker_id)` keyspace
+/// is partitioned per publisher by construction. An authorized caller can only ever
+/// publish under keys that hash from *their* identity, so cross-publisher overwrite
+/// becomes impossible without renaming the worker_id field on the wire.
+#[must_use]
+pub fn derive_worker_id(caller: &CallerIdentity, worker_rank: u32) -> String {
+    let pod_uid = caller.pod_uid.as_deref().unwrap_or("");
+    let mut hasher = Sha256::new();
+    hasher.update(caller.namespace.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(pod_uid.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(worker_rank.to_le_bytes());
+    let digest = hasher.finalize();
+    // 16 hex chars = 64 bits; matches the source_id width and the existing 8-byte
+    // uuid.uuid4().hex[:8] client-side worker_id length.
+    format!("{digest:x}")[..16].to_string()
+}
 
 /// Reason a gated request was rejected.
 #[derive(Debug, thiserror::Error)]

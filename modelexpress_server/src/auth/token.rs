@@ -16,11 +16,11 @@ const EXTRA_POD_NAME: &str = "authentication.kubernetes.io/pod-name";
 const EXTRA_POD_UID: &str = "authentication.kubernetes.io/pod-uid";
 
 #[derive(Debug, Clone)]
-pub(crate) struct CallerIdentity {
-    pub(crate) namespace: String,
-    pub(crate) service_account: String,
-    pub(crate) pod_name: Option<String>,
-    pub(crate) pod_uid: Option<String>,
+pub struct CallerIdentity {
+    pub namespace: String,
+    pub service_account: String,
+    pub pod_name: Option<String>,
+    pub pod_uid: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
