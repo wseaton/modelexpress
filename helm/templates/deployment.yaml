@@ -46,8 +46,17 @@ spec:
             - name: http
               containerPort: {{ .Values.service.port | default 8001 }}
               protocol: TCP
-          {{- if or .Values.env .Values.extraEnv }}
           env:
+            # The kubernetes metadata backend resolves its namespace from
+            # MX_METADATA_NAMESPACE or POD_NAMESPACE; without either, the server
+            # fails to start with the misleading "MX_METADATA_BACKEND is not set
+            # or invalid". Expose the pod's namespace via the downward API so the
+            # backend works out of the box (operators can still override with
+            # MX_METADATA_NAMESPACE via .Values.env / .Values.extraEnv).
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
             {{- range $key, $value := .Values.env }}
             - name: {{ $key }}
               value: {{ $value | quote }}
@@ -55,7 +64,6 @@ spec:
             {{- if .Values.extraEnv }}
             {{- toYaml .Values.extraEnv | nindent 12 }}
             {{- end }}
-          {{- end }}
           {{- if .Values.command }}
           command:
             {{- toYaml .Values.command | nindent 12 }}
