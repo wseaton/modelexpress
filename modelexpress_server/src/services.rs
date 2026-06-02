@@ -1508,6 +1508,60 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "memory-backend")]
+    #[tokio::test]
+    async fn terminal_write_failure_must_not_block() {
+        use crate::registry::backend::ClaimOutcome;
+        use crate::registry::backend::faulty::{Fault, FaultyRegistryBackend, RegistryOp};
+        use crate::registry::backend::memory::InMemoryRegistryBackend;
+        use crate::registry::state::RegistryManager;
+
+        // Fail only the completion write (set_status -> DOWNLOADED); everything else real.
+        let backend = Arc::new(FaultyRegistryBackend::new(
+            Arc::new(InMemoryRegistryBackend::new()),
+            |op, _| match op {
+                RegistryOp::SetStatus {
+                    status: ModelStatus::DOWNLOADED,
+                    ..
+                } => Fault::Fail("redis SET timed out".to_string()),
+                _ => Fault::Pass,
+            },
+        ));
+        let registry = Arc::new(RegistryManager::with_backend(backend));
+        let tracker = ModelDownloadTracker::new(registry.clone());
+
+        // Owner claims the model: the registry now reports DOWNLOADING.
+        let claimed = registry
+            .try_claim_for_download("m", ModelProvider::HuggingFace)
+            .await
+            .expect("claim");
+        assert!(matches!(claimed, ClaimOutcome::Claimed));
+
+        // A client is waiting for the completion broadcast.
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        tracker.add_waiting_channel("m", tx);
+
+        // The download finished successfully; the task reports DOWNLOADED. The write fails.
+        tracker
+            .set_status_and_notify(
+                "m".to_string(),
+                ModelStatus::DOWNLOADED,
+                ModelProvider::HuggingFace,
+                Some("done".to_string()),
+            )
+            .await;
+
+        let notified = rx.try_recv().is_ok();
+        let stuck = matches!(
+            tracker.get_status("m").await,
+            Some(ModelStatus::DOWNLOADING)
+        );
+        assert!(
+            !stuck,
+            "BUG: completion write failed, model left stuck at DOWNLOADING forever; (waiter_notified={notified})"
+        );
+    }
+
     /// Model service for the file-serving tests, which don't touch the tracker. A
     /// no-expectation mock backend keeps them off the `memory-backend` feature.
     fn test_model_service() -> ModelServiceImpl {
