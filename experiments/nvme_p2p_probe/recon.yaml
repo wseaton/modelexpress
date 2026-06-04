@@ -1,0 +1,45 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: rdma-recon
+  namespace: weaton-dev
+  annotations:
+    sidecar.istio.io/inject: "false"
+spec:
+  restartPolicy: Never
+  containers:
+    - name: recon
+      image: vllm/vllm-openai:v0.17.1
+      command: ["bash","-lc"]
+      args:
+        - |
+          set +e
+          echo "===== RDMA DEVICES ====="
+          ls -l /dev/infiniband 2>/dev/null || echo "no /dev/infiniband"
+          ibv_devinfo 2>/dev/null | grep -iE 'hca_id|state|link_layer|rate' | head -30 || echo "no ibv_devinfo"
+          echo "===== UCX TRANSPORTS ====="
+          ucx_info -d 2>/dev/null | grep -iE 'Transport|Device:|link' | head -40 || echo "no ucx_info"
+          echo "===== LOCAL NVMe O_DIRECT WRITE (4GB) ====="
+          dd if=/dev/zero of=/scratch/t bs=1M count=4096 oflag=direct 2>&1 | tail -1
+          echo "===== LOCAL NVMe O_DIRECT READ (4GB) ====="
+          dd if=/scratch/t of=/dev/null bs=1M iflag=direct 2>&1 | tail -1
+          rm -f /scratch/t
+          echo "===== SCRATCH MOUNT (what backs emptyDir) ====="
+          df -h /scratch; findmnt /scratch 2>/dev/null
+          echo "===== HF EGRESS CHECK ====="
+          curl -sS -m 10 -o /dev/null -w "huggingface.co -> HTTP %{http_code}\n" https://huggingface.co 2>&1 || echo "no egress"
+          echo "===== DONE ====="
+      env:
+        - name: UCX_TLS
+          value: "rc,sm,self"
+      resources:
+        limits:
+          rdma/ib: 1
+          cpu: "4"
+          memory: 8Gi
+      volumeMounts:
+        - name: scratch
+          mountPath: /scratch
+  volumes:
+    - name: scratch
+      emptyDir: {}

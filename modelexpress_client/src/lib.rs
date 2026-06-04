@@ -34,6 +34,9 @@ pub mod auth;
 pub use modelexpress_common::client_config::{ClientArgs, ClientConfig};
 pub use modelexpress_common::models::ModelProvider;
 
+/// Self-healing NVMe model-weight cache daemon (puller/reconciler + stager).
+pub mod cached;
+
 use auth::{AuthInterceptor, TokenProvider};
 use std::sync::Arc;
 use tonic::service::interceptor::InterceptedService;

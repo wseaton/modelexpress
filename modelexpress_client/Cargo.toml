@@ -27,6 +27,10 @@ thiserror = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
 colored = { workspace = true }
+memmap2 = { workspace = true }
+nixl-sys = { workspace = true, features = ["stub-api"], optional = true }
+libc = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
 
 [dev-dependencies]
 modelexpress-common = { workspace = true, features = ["test-support"] }
@@ -40,3 +44,13 @@ workspace = true
 [[bin]]
 name = "modelexpress-cli"
 path = "src/bin/cli.rs"
+
+[[bin]]
+name = "modelexpress-cached"
+path = "src/bin/cached.rs"
+
+[features]
+# Enables the NIXL FFI transport (the stager/puller RDMA transfer legs). Off by
+# default so the library, CLI, and unit tests build with no RDMA hardware or
+# libnixl; the dedicated daemon image builds with it on.
+nixl = ["dep:nixl-sys", "dep:libc", "dep:sha2"]

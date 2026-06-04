@@ -1,0 +1,40 @@
+# Puller: connects to the holder over IB, pulls each shard into DRAM, writes to
+# its own node-local NVMe, SHA-verifies. HOLDER_IP is substituted at apply time.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: bench-puller
+  namespace: weaton-dev
+  labels: {app: nvme-bench, role: puller}
+  annotations:
+    sidecar.istio.io/inject: "false"
+spec:
+  restartPolicy: Never
+  nodeSelector:
+    kubernetes.io/hostname: gd91fda
+  containers:
+    - name: puller
+      image: vllm/vllm-openai:v0.17.1
+      command: ["bash","-lc"]
+      args:
+        - |
+          set -euo pipefail
+          mkdir -p /scratch/recv
+          exec python3 /bench/bench.py --role puller --name puller --peer holder \
+            --port 7001 --dir /scratch/recv --peer-ip "$HOLDER_IP" --peer-port 7000
+      env:
+        - name: HOLDER_IP
+          value: "__HOLDER_IP__"
+      resources:
+        limits:
+          rdma/ib: 1
+          cpu: "8"
+          memory: 24Gi
+      volumeMounts:
+        - {name: scratch, mountPath: /scratch}
+        - {name: bench, mountPath: /bench}
+  volumes:
+    - name: scratch
+      emptyDir: {}
+    - name: bench
+      configMap: {name: nvme-bench-src}

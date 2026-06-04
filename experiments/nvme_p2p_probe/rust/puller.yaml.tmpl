@@ -1,0 +1,32 @@
+# Puller for the Rust spike: the slim daemon pulls every shard from the holder
+# into its own node-local NVMe and SHA-verifies. __IMAGE__, __HOLDER_NAME__, and
+# __HOLDER_MD__ are substituted by run.sh from the holder's stdout.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: cached-puller
+  namespace: weaton-dev
+  labels: {app: cached-spike, role: puller}
+  annotations:
+    sidecar.istio.io/inject: "false"
+spec:
+  restartPolicy: Never
+  nodeSelector:
+    kubernetes.io/hostname: gd91fda
+  containers:
+    - name: puller
+      image: __IMAGE__
+      args: ["--role", "puller", "--name", "puller", "--dir", "/scratch/recv", "--holder-name", "__HOLDER_NAME__", "--buf-gib", "4"]
+      env:
+        - {name: HOLDER_MD, value: "__HOLDER_MD__"}
+        - {name: RUST_LOG, value: "info"}
+      resources:
+        limits:
+          rdma/ib: 1
+          cpu: "8"
+          memory: 24Gi
+      volumeMounts:
+        - {name: scratch, mountPath: /scratch}
+  volumes:
+    - name: scratch
+      emptyDir: {}

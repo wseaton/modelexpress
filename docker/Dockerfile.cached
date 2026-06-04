@@ -1,0 +1,95 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Dedicated slim image for the modelexpress-cached daemon (self-healing NVMe
+# model-weight cache). GPU-less and Python-free: a CPU-only UCX + NIXL (UCX +
+# POSIX backends) and one Rust binary on a Debian-slim runtime with rdma-core.
+#
+# Build flags for UCX/NIXL are adapted from llm-d/llm-d docker/Dockerfile.cuda +
+# build-{ucx,nixl}.sh, dropping all CUDA/GDRCopy (we never touch GPU memory).
+#
+# nixl-sys is built with its `stub-api` feature: no NIXL headers/bindgen at Rust
+# build time; libnixl.so is dlopen'd at runtime from /opt/nixl. Until the FFI
+# transfer module lands, build with CARGO_FEATURES unset (plain binary); then
+# set --build-arg CARGO_FEATURES=nixl.
+
+ARG DEBIAN_TAG=bookworm
+ARG RUST_TAG=1-bookworm
+ARG UCX_VERSION=v1.20.0
+# Keep libnixl in lockstep with the nixl-sys crate's expected C ABI (1.2.0).
+ARG NIXL_VERSION=v1.2.0
+
+# ---------------------------------------------------------------- libs --------
+FROM debian:${DEBIAN_TAG} AS libs
+ARG UCX_VERSION
+ARG NIXL_VERSION
+ENV UCX_PREFIX=/opt/ucx \
+    NIXL_PREFIX=/opt/nixl
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential cmake pkg-config git ca-certificates \
+        autoconf automake libtool \
+        python3 python3-pip python3-venv \
+        rdma-core libibverbs-dev librdmacm-dev libnuma-dev \
+    && rm -rf /var/lib/apt/lists/*
+RUN pip3 install --no-cache-dir --break-system-packages meson ninja pybind11 tomlkit
+
+# CPU-only UCX with RDMA (verbs), no CUDA, no GDRCopy.
+RUN git clone --depth 1 -b ${UCX_VERSION} https://github.com/openucx/ucx.git /tmp/ucx \
+    && cd /tmp/ucx \
+    && ./autogen.sh \
+    && ./contrib/configure-release \
+        --prefix=${UCX_PREFIX} \
+        --enable-shared --disable-static --disable-doxygen-doc \
+        --enable-cma --enable-mt --with-verbs --with-dm \
+    && make -j"$(nproc)" && make install-strip && ldconfig \
+    && rm -rf /tmp/ucx
+
+# Extra build deps for NIXL, in their own layer so the UCX layer stays cached:
+# python3-dev (NIXL builds its pybind11 bindings unconditionally) and libaio +
+# liburing (the POSIX plugin's async IO, which is where its bandwidth comes from).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3-dev libaio-dev liburing-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# NIXL with only the backends we use; CUDA/GDS plugins auto-skip without CUDA.
+RUN git clone --depth 1 -b ${NIXL_VERSION} https://github.com/ai-dynamo/nixl.git /tmp/nixl \
+    && cd /tmp/nixl \
+    && meson setup build \
+        --prefix=${NIXL_PREFIX} \
+        -Dbuildtype=release \
+        -Ducx_path=${UCX_PREFIX} \
+        -Denable_plugins=UCX,POSIX \
+        -Dinstall_headers=true \
+        -Dwerror=false \
+    && ninja -C build -j"$(nproc)" && ninja -C build install \
+    && rm -rf /tmp/nixl
+
+# ---------------------------------------------------------------- rust ---------
+FROM rust:${RUST_TAG} AS rust
+# g++ for the nixl-sys stub-api stubs.cpp; clang/libclang for its bindgen step
+# (stub-api still generates bindings from a vendored header, only the library is
+# dlopen'd at runtime); protoc for the workspace's build.rs.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        g++ clang libclang-dev protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/*
+ARG CARGO_FEATURES=""
+WORKDIR /src
+COPY . .
+RUN cargo build --release -p modelexpress-client --bin modelexpress-cached \
+        $( [ -n "${CARGO_FEATURES}" ] && echo --features "${CARGO_FEATURES}" )
+
+# ---------------------------------------------------------------- runtime ------
+FROM debian:${DEBIAN_TAG}-slim AS runtime
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libibverbs1 librdmacm1 ibverbs-providers libnuma1 libstdc++6 ca-certificates \
+        libaio1 liburing2 \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=libs /opt/ucx /opt/ucx
+COPY --from=libs /opt/nixl /opt/nixl
+COPY --from=rust /src/target/release/modelexpress-cached /usr/local/bin/modelexpress-cached
+# NIXL installs to the Debian multiarch libdir; UCX (autotools) to plain lib.
+ENV LD_LIBRARY_PATH=/opt/nixl/lib/x86_64-linux-gnu:/opt/ucx/lib \
+    UCX_PREFIX=/opt/ucx \
+    NIXL_PREFIX=/opt/nixl \
+    NIXL_PLUGIN_DIR=/opt/nixl/lib/x86_64-linux-gnu/plugins
+ENTRYPOINT ["/usr/local/bin/modelexpress-cached"]

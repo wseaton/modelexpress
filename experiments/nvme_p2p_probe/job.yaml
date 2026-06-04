@@ -1,0 +1,44 @@
+# GPU-less NIXL FILE/DRAM probe. Single pod, two in-process agents, UCX/TCP.
+# Image carries the production nixl + UCX stack; we request no GPU and force
+# UCX onto TCP so nothing here touches CUDA or RDMA hardware.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: nvme-p2p-probe
+  namespace: weaton-dev
+spec:
+  backoffLimit: 0
+  completions: 1
+  template:
+    metadata:
+      labels:
+        app: nvme-p2p-probe
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: probe
+          image: vllm/vllm-openai:v0.17.1
+          command: ["python3", "/probe/probe.py"]
+          env:
+            - name: UCX_TLS
+              value: "tcp"
+            - name: PROBE_TMPDIR
+              value: "/scratch"
+          volumeMounts:
+            - name: probe
+              mountPath: /probe
+            - name: scratch
+              mountPath: /scratch
+          resources:
+            requests:
+              cpu: "2"
+              memory: 4Gi
+            limits:
+              cpu: "2"
+              memory: 4Gi
+      volumes:
+        - name: probe
+          configMap:
+            name: nvme-p2p-probe-src
+        - name: scratch
+          emptyDir: {}

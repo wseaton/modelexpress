@@ -1,0 +1,48 @@
+# Holder: downloads a real safetensors model to node-local NVMe, then runs the
+# storage-server role. Pinned to one node; puller runs on another.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: bench-holder
+  namespace: weaton-dev
+  labels: {app: nvme-bench, role: holder}
+  annotations:
+    sidecar.istio.io/inject: "false"
+spec:
+  restartPolicy: Never
+  nodeSelector:
+    kubernetes.io/hostname: gf48cf2
+  containers:
+    - name: holder
+      image: vllm/vllm-openai:v0.17.1
+      command: ["bash","-lc"]
+      args:
+        - |
+          set -euo pipefail
+          mkdir -p /scratch/model
+          echo "[holder] downloading $MODEL ..."
+          huggingface-cli download "$MODEL" --include "*.safetensors" \
+            --local-dir /scratch/model >/tmp/dl.log 2>&1
+          echo "[holder] download done: $(du -sh /scratch/model | cut -f1)"
+          exec python3 /bench/bench.py --role holder --name holder --peer puller \
+            --port 7000 --dir /scratch/model
+      env:
+        - name: MODEL
+          value: "Qwen/Qwen2.5-7B-Instruct"
+        - name: HF_HUB_ENABLE_HF_TRANSFER
+          value: "0"
+      ports:
+        - {containerPort: 7000}
+      resources:
+        limits:
+          rdma/ib: 1
+          cpu: "8"
+          memory: 24Gi
+      volumeMounts:
+        - {name: scratch, mountPath: /scratch}
+        - {name: bench, mountPath: /bench}
+  volumes:
+    - name: scratch
+      emptyDir: {}
+    - name: bench
+      configMap: {name: nvme-bench-src}
