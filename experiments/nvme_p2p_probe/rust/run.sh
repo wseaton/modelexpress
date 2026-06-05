@@ -9,10 +9,10 @@
 # reachable ModelExpress server at <registry-endpoint> (deploy one separately;
 # the daemon only needs ListSources/GetMetadata/PublishMetadata/UpdateStatus).
 set -euo pipefail
-IMAGE="${1:?usage: run.sh <image-ref> <registry-endpoint>}"
-REGISTRY="${2:?usage: run.sh <image-ref> <registry-endpoint>}"
+IMAGE="${1:?usage: run.sh <image-ref> [registry-endpoint]}"
+REGISTRY="${2:-http://modelexpress-server:8001}"
 CTX=coreweave-waldorf
-NS=weaton-dev
+NS=mx-selfheal
 DIR="$(cd "$(dirname "$0")" && pwd)"
 K="kubectl --context $CTX -n $NS"
 

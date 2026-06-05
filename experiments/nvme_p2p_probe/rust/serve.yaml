@@ -10,7 +10,7 @@ apiVersion: v1
 kind: Pod
 metadata:
   name: cached-serve
-  namespace: weaton-dev
+  namespace: mx-selfheal
   labels: {app: cached-selfheal, role: serve}
   annotations:
     sidecar.istio.io/inject: "false"
