@@ -1,0 +1,43 @@
+# Node B (puller) for the registry self-heal run: with a cold cache, the daemon
+# discovers a peer holding the model through the registry and pulls the whole
+# snapshot into its own node-local cache. No model name -> blob is hand-passed;
+# discovery is by model identity via the registry. __IMAGE__ and __REGISTRY__ are
+# substituted by run.sh.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: cached-pull
+  namespace: weaton-dev
+  labels: {app: cached-selfheal, role: pull}
+  annotations:
+    sidecar.istio.io/inject: "false"
+spec:
+  restartPolicy: Never
+  nodeSelector:
+    kubernetes.io/hostname: gd91fda
+  containers:
+    - name: pull
+      image: __IMAGE__
+      args:
+        - "--pull"
+        - "--model"
+        - "google-t5/t5-small"
+        - "--name"
+        - "pull-b"
+        - "--buf-gib"
+        - "4"
+        - "--cache-dir"
+        - "/scratch/hf/hub"
+      env:
+        - {name: MODEL_EXPRESS_ENDPOINT, value: "__REGISTRY__"}
+        - {name: RUST_LOG, value: "info"}
+      resources:
+        limits:
+          rdma/ib: 1
+          cpu: "8"
+          memory: 24Gi
+      volumeMounts:
+        - {name: scratch, mountPath: /scratch}
+  volumes:
+    - name: scratch
+      emptyDir: {}

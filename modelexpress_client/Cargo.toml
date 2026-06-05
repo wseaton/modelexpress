@@ -28,9 +28,9 @@ anyhow = { workspace = true }
 clap = { workspace = true }
 colored = { workspace = true }
 memmap2 = { workspace = true }
+libc = { workspace = true }
+sha2 = { workspace = true }
 nixl-sys = { workspace = true, features = ["stub-api"], optional = true }
-libc = { workspace = true, optional = true }
-sha2 = { workspace = true, optional = true }
 
 [dev-dependencies]
 modelexpress-common = { workspace = true, features = ["test-support"] }
@@ -53,4 +53,4 @@ path = "src/bin/cached.rs"
 # Enables the NIXL FFI transport (the stager/puller RDMA transfer legs). Off by
 # default so the library, CLI, and unit tests build with no RDMA hardware or
 # libnixl; the dedicated daemon image builds with it on.
-nixl = ["dep:nixl-sys", "dep:libc", "dep:sha2"]
+nixl = ["dep:nixl-sys"]

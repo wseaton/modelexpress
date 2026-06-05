@@ -1,0 +1,66 @@
+# Node A (server side) for the registry self-heal run: an init container
+# downloads a real model into the HuggingFace cache layout the daemon's locator
+# expects (models--<org>--<name>/snapshots/<rev>/), then the cache daemon
+# advertises it to the registry and serves its whole snapshot over RDMA.
+#
+# __IMAGE__ and __REGISTRY__ are substituted by run.sh. The data path is pure IB
+# (the puller connects via the advertised NIXL metadata blob); only the registry
+# endpoint needs TCP reachability.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: cached-serve
+  namespace: weaton-dev
+  labels: {app: cached-selfheal, role: serve}
+  annotations:
+    sidecar.istio.io/inject: "false"
+spec:
+  restartPolicy: Never
+  nodeSelector:
+    kubernetes.io/hostname: gf48cf2
+  initContainers:
+    - name: fetch
+      image: vllm/vllm-openai:v0.17.1
+      command: ["bash", "-lc"]
+      args:
+        - |
+          set -euo pipefail
+          # Full snapshot (weights + config + tokenizer), into the HF cache root
+          # the daemon reads via --cache-dir below.
+          huggingface-cli download "$MODEL"
+          echo "fetched into $HF_HOME/hub:"
+          ls -R "$HF_HOME/hub" | head -40
+      env:
+        - {name: MODEL, value: "google-t5/t5-small"}
+        - {name: HF_HOME, value: "/scratch/hf"}
+      volumeMounts:
+        - {name: scratch, mountPath: /scratch}
+  containers:
+    - name: serve
+      image: __IMAGE__
+      args:
+        - "--serve"
+        - "--model"
+        - "google-t5/t5-small"
+        - "--name"
+        - "serve-a"
+        - "--nixl-port"
+        - "7000"
+        - "--buf-gib"
+        - "4"
+        - "--cache-dir"
+        - "/scratch/hf/hub"
+      env:
+        - {name: MODEL_EXPRESS_ENDPOINT, value: "__REGISTRY__"}
+        - {name: POD_IP, valueFrom: {fieldRef: {fieldPath: status.podIP}}}
+        - {name: RUST_LOG, value: "info"}
+      resources:
+        limits:
+          rdma/ib: 1
+          cpu: "8"
+          memory: 24Gi
+      volumeMounts:
+        - {name: scratch, mountPath: /scratch}
+  volumes:
+    - name: scratch
+      emptyDir: {}

@@ -219,6 +219,19 @@ mod tests {
     }
 
     #[test]
+    fn test_file_cache_source_type_is_distinct() {
+        // A cached-weight-file source must not collide with a GPU weights source
+        // for the same model, so the cache daemon discovers file peers, not
+        // GPU-tensor peers.
+        let mut file_cache = base_identity();
+        file_cache.mx_source_type = 10; // FILE_CACHE
+        assert_ne!(
+            compute_mx_source_id(&base_identity()),
+            compute_mx_source_id(&file_cache)
+        );
+    }
+
+    #[test]
     fn test_extra_parameters_sorted() {
         let mut a = base_identity();
         a.extra_parameters

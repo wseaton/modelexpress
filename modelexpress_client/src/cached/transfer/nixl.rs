@@ -184,73 +184,80 @@ impl NixlAgent {
         let mut map = NotificationMap::new()?;
         self.agent.get_notifications(&mut map, None)?;
         // Collect sender names first so the immutable `agents()` borrow is
-        // released before the per-sender `get_notifications` borrow.
-        let mut senders = Vec::new();
-        for a in map.agents() {
-            senders.push(a?.to_string());
-        }
-        let mut out = Vec::new();
-        for sender in senders {
-            for note in map.get_notifications(&sender)? {
-                out.push((sender.clone(), note?));
-            }
-        }
-        Ok(out)
+        // released before the per-sender `get_notifications` borrow below.
+        let senders = map
+            .agents()
+            .map(|a| a.map(|s| s.to_string()))
+            .collect::<Result<Vec<_>, _>>()?;
+        senders
+            .into_iter()
+            .map(|sender| {
+                map.get_notifications(&sender)?
+                    .map(|note| note.map(|payload| (sender.clone(), payload)))
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(|nested| nested.into_iter().flatten().collect())
     }
 
-    /// Local storage leg: read a registered file into the registered host
-    /// buffer via POSIX (`O_DIRECT`), `n_chunks * CHUNK` bytes.
+    /// Local storage leg: read exactly `size` bytes of a registered file into
+    /// the registered host buffer via POSIX.
     pub fn read_file_to_dram(
         &self,
         dram_base: usize,
         fd: RawFd,
-        n_chunks: u64,
+        size: u64,
     ) -> Result<(), NixlError> {
-        let dram = Self::chunk_dlist(MemType::Dram, dram_base, n_chunks, 0)?;
-        let file = Self::chunk_dlist(MemType::File, 0, n_chunks, u64::try_from(fd).unwrap_or(0))?;
+        let dram = Self::chunk_dlist(MemType::Dram, dram_base, size, 0)?;
+        let file = Self::chunk_dlist(MemType::File, 0, size, u64::try_from(fd).unwrap_or(0))?;
         self.run_leg(XferOp::Read, &dram, &file, &self.name.clone(), &self.posix)
     }
 
-    /// Network leg: RDMA-write the registered host buffer into a peer's
-    /// registered buffer at `peer_base` over UCX.
+    /// Network leg: RDMA-write exactly `size` bytes from the registered host
+    /// buffer into a peer's registered buffer at `peer_base` over UCX.
     pub fn write_dram_to_peer(
         &self,
         dram_base: usize,
         peer_base: usize,
         peer: &str,
-        n_chunks: u64,
+        size: u64,
     ) -> Result<(), NixlError> {
-        let local = Self::chunk_dlist(MemType::Dram, dram_base, n_chunks, 0)?;
-        let remote = Self::chunk_dlist(MemType::Dram, peer_base, n_chunks, 0)?;
+        let local = Self::chunk_dlist(MemType::Dram, dram_base, size, 0)?;
+        let remote = Self::chunk_dlist(MemType::Dram, peer_base, size, 0)?;
         self.run_leg(XferOp::Write, &local, &remote, peer, &self.ucx)
     }
 
-    /// Local storage leg: write the registered host buffer down to a registered
-    /// file via POSIX (`O_DIRECT`).
+    /// Local storage leg: write exactly `size` bytes of the registered host
+    /// buffer down to a registered file via POSIX.
     pub fn write_dram_to_file(
         &self,
         dram_base: usize,
         fd: RawFd,
-        n_chunks: u64,
+        size: u64,
     ) -> Result<(), NixlError> {
-        let dram = Self::chunk_dlist(MemType::Dram, dram_base, n_chunks, 0)?;
-        let file = Self::chunk_dlist(MemType::File, 0, n_chunks, u64::try_from(fd).unwrap_or(0))?;
+        let dram = Self::chunk_dlist(MemType::Dram, dram_base, size, 0)?;
+        let file = Self::chunk_dlist(MemType::File, 0, size, u64::try_from(fd).unwrap_or(0))?;
         self.run_leg(XferOp::Write, &dram, &file, &self.name.clone(), &self.posix)
     }
 
-    /// Build a chunked transfer descriptor list over a registered region. The
-    /// chunking is what lets the POSIX backend issue parallel IO.
+    /// Build a transfer descriptor list covering exactly `size` bytes from
+    /// `base`: full `CHUNK` descriptors plus a final partial one. The chunking
+    /// is what lets the POSIX backend issue parallel IO; the partial tail keeps
+    /// the transfer byte-exact so source files need no padding.
     fn chunk_dlist(
         mem: MemType,
         base: usize,
-        n_chunks: u64,
+        size: u64,
         dev_id: u64,
     ) -> Result<XferDescList<'static>, NixlError> {
         let mut dl = XferDescList::new(mem)?;
-        let chunk = usize::try_from(CHUNK).map_err(|_| NixlError::InvalidParam)?;
         let mut i = 0u64;
-        while i < n_chunks {
-            dl.add_desc(chunk_offset(base, i)?, chunk, dev_id);
+        let mut moved = 0u64;
+        while moved < size {
+            let len = CHUNK.min(size.saturating_sub(moved));
+            let len = usize::try_from(len).map_err(|_| NixlError::InvalidParam)?;
+            dl.add_desc(chunk_offset(base, i)?, len, dev_id);
+            moved = moved.checked_add(CHUNK).ok_or(NixlError::InvalidParam)?;
             i = i.checked_add(1).ok_or(NixlError::InvalidParam)?;
         }
         Ok(dl)
@@ -277,5 +284,61 @@ impl NixlAgent {
             }
             std::thread::sleep(Duration::from_micros(50));
         }
+    }
+}
+
+/// Map a `NixlError` into `anyhow` so the FFI implements the feature-independent
+/// [`super::Transport`] trait the protocol is written against.
+fn ax<T>(r: Result<T, NixlError>) -> anyhow::Result<T> {
+    r.map_err(|e| anyhow::anyhow!("nixl: {e:?}"))
+}
+
+// Each method delegates to the inherent method of the same name (inherent
+// methods take priority in resolution), converting the error.
+impl super::Transport for NixlAgent {
+    fn name(&self) -> &str {
+        self.name()
+    }
+
+    fn local_md(&self) -> anyhow::Result<Vec<u8>> {
+        ax(self.local_md())
+    }
+
+    fn load_remote(&mut self, blob: &[u8]) -> anyhow::Result<String> {
+        ax(NixlAgent::load_remote(self, blob))
+    }
+
+    fn send_notif(&self, peer: &str, msg: &[u8]) -> anyhow::Result<()> {
+        ax(self.send_notif(peer, msg))
+    }
+
+    fn drain_notifs(&self) -> anyhow::Result<Vec<(String, Vec<u8>)>> {
+        ax(self.drain_notifs())
+    }
+
+    fn register_dram(&mut self, base: usize, len: usize) -> anyhow::Result<()> {
+        ax(self.register_dram(base, len))
+    }
+
+    fn register_file(&mut self, fd: RawFd, len: usize) -> anyhow::Result<()> {
+        ax(self.register_file(fd, len))
+    }
+
+    fn read_file_to_dram(&self, dram_base: usize, fd: RawFd, size: u64) -> anyhow::Result<()> {
+        ax(self.read_file_to_dram(dram_base, fd, size))
+    }
+
+    fn write_dram_to_peer(
+        &self,
+        dram_base: usize,
+        peer_base: usize,
+        peer: &str,
+        size: u64,
+    ) -> anyhow::Result<()> {
+        ax(self.write_dram_to_peer(dram_base, peer_base, peer, size))
+    }
+
+    fn write_dram_to_file(&self, dram_base: usize, fd: RawFd, size: u64) -> anyhow::Result<()> {
+        ax(self.write_dram_to_file(dram_base, fd, size))
     }
 }

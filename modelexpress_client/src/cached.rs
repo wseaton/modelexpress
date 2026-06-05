@@ -12,13 +12,24 @@
 //! stager (serving peers).
 //!
 //! Module map (built out across phases; see the design plan):
-//! - [`transfer`] - the wire protocol and the NIXL transfer legs.
-//!
-//! The transfer's NIXL/FFI surface is feature-gated (`nixl`) so the default
-//! build and unit tests need no RDMA hardware or `libnixl`.
+//! - [`transfer`] - the wire protocol, the on-disk cache layout, and the
+//!   stager/puller halves driving a [`transfer::Transport`]. The NIXL FFI
+//!   implementor is the only piece behind the `nixl` feature; the protocol is
+//!   transport-generic and unit-tested with an in-process loopback.
+//! - [`registry`] - thin P2P metadata gRPC client (publish / heartbeat / list /
+//!   get); no NIXL, exercised against a real in-process server in CI.
+//! - [`advertise`] - builds the `FILE_CACHE` identity + worker metadata a node
+//!   publishes for the models it holds, plus its stable per-node worker id.
+//! - [`discover`] - resolves a model identity to a peer's NIXL blob to pull.
+//! - [`locator`] - maps a model name to the on-disk snapshot the node holds,
+//!   so the server can serve it.
 
 // Scaffolding is introduced ahead of its callers across the implementation
 // phases; allow until the daemon loop wires everything together.
 #![allow(dead_code)]
 
+pub mod advertise;
+pub mod discover;
+pub mod locator;
+pub mod registry;
 pub mod transfer;

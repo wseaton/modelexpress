@@ -76,5 +76,10 @@ name = "auth_e2e"
 path = "tests/auth_e2e.rs"
 required-features = ["integration-tests"]
 
+[[test]]
+name = "p2p_file_cache"
+path = "tests/p2p_file_cache.rs"
+required-features = ["integration-tests"]
+
 [lints]
 workspace = true
