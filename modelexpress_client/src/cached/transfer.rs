@@ -28,7 +28,7 @@ pub mod nixl;
 /// without RDMA hardware. It moves real bytes (real file IO, real `memcpy`
 /// between two staging buffers), so the SHA verification on the puller is
 /// genuine; only the fabric (notifications, metadata) is local.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub mod loopback;
 
 /// Transfer descriptor granularity. Files transfer as `CHUNK`-sized descriptors

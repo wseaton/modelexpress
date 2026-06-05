@@ -23,13 +23,18 @@
 //! - [`discover`] - resolves a model identity to a peer's NIXL blob to pull.
 //! - [`locator`] - maps a model name to the on-disk snapshot the node holds,
 //!   so the server can serve it.
+//! - [`desired`] - the declared desired set of models a node should hold.
+//! - [`reconcile`] - the reconcile loop: diff desired vs local, pull the
+//!   difference (peer or origin), advertise residency.
 
 // Scaffolding is introduced ahead of its callers across the implementation
 // phases; allow until the daemon loop wires everything together.
 #![allow(dead_code)]
 
 pub mod advertise;
+pub mod desired;
 pub mod discover;
 pub mod locator;
+pub mod reconcile;
 pub mod registry;
 pub mod transfer;

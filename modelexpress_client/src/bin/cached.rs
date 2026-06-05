@@ -3,15 +3,21 @@
 
 //! `modelexpress-cached`: the self-healing cache daemon.
 //!
-//! Two modes are wired today (the full reconcile loop lands in a later phase):
+//! Three modes:
 //! - `--serve --model <m>...`: advertise the held models to the P2P registry and
 //!   serve their snapshots to pullers over RDMA.
 //! - `--pull --model <m>`: discover a peer holding the model through the registry
-//!   and pull it into the local cache.
+//!   and pull it into the local cache (one-shot).
+//! - `--reconcile --model <m>...`: the full self-healing loop. Serve held models
+//!   AND, on an interval, converge the local cache toward the desired `--model`
+//!   set: pull each missing model from a peer (or origin if none holds it) and
+//!   advertise residency so other nodes can pull from this one.
 //!
-//! Both require the `nixl` build. `NixlAgent` is `!Send`, so it is confined to a
-//! dedicated thread and never held across an `.await`; only its metadata blob
-//! crosses to the async side that talks to the registry.
+//! All require the `nixl` build. `NixlAgent` is `!Send`, so it is confined to a
+//! dedicated thread (serve) or a `spawn_blocking` worker (pull) and never held
+//! across an `.await`; only its metadata blob crosses to the async side that
+//! talks to the registry. In `--reconcile` the serve agent and the per-pull
+//! agent are co-resident in one process.
 
 use std::path::PathBuf;
 
@@ -30,9 +36,24 @@ struct Cli {
     #[arg(long)]
     pull: bool,
 
-    /// Model to serve or pull (repeat for several; `--pull` uses the first).
+    /// Run the self-healing loop: serve held models and converge the local
+    /// cache toward the `--model` set (peer-pull, else origin), advertising what
+    /// this node holds.
+    #[arg(long)]
+    reconcile: bool,
+
+    /// Model to serve, pull, or converge toward (repeat for several; `--pull`
+    /// uses the first).
     #[arg(long = "model")]
     models: Vec<String>,
+
+    /// Seconds between reconcile passes in `--reconcile` mode.
+    #[arg(
+        long,
+        env = "MODEL_EXPRESS_CACHED_RECONCILE_SECS",
+        default_value_t = 60
+    )]
+    reconcile_secs: u64,
 
     /// NIXL agent name for this process.
     #[arg(long, default_value = "mx-cached")]
@@ -74,13 +95,12 @@ async fn main() -> std::process::ExitCode {
 }
 
 async fn run(cli: &Cli) -> anyhow::Result<()> {
-    match (cli.serve, cli.pull) {
-        (true, false) => run_serve(cli).await,
-        (false, true) => run_pull(cli).await,
-        (true, true) => anyhow::bail!("--serve and --pull are mutually exclusive"),
-        (false, false) => {
-            anyhow::bail!("specify --serve or --pull (the reconcile loop lands in a later phase)")
-        }
+    match (cli.serve, cli.pull, cli.reconcile) {
+        (true, false, false) => run_serve(cli).await,
+        (false, true, false) => run_pull(cli).await,
+        (false, false, true) => run_reconcile(cli).await,
+        (false, false, false) => anyhow::bail!("specify one of --serve, --pull, or --reconcile"),
+        _ => anyhow::bail!("--serve, --pull, and --reconcile are mutually exclusive"),
     }
 }
 
@@ -123,32 +143,25 @@ async fn wait_for_shutdown() {
     }
 }
 
+/// Spawn the serve agent on its own thread (the `!Send` `NixlAgent` lives only
+/// there) and block until it hands back its metadata blob. Shared by `--serve`
+/// and `--reconcile`, which both serve held models out while doing their own
+/// async work against the registry. Flipping `stop` ends the serve loop.
 #[cfg(feature = "nixl")]
-async fn run_serve(cli: &Cli) -> anyhow::Result<()> {
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
-
-    use modelexpress_client::cached::advertise;
-    use modelexpress_client::cached::locator::{HfLocator, locate_hf};
-    use modelexpress_client::cached::registry::Registry;
+fn start_serve_thread(
+    name: String,
+    port: u16,
+    buf_gib: u32,
+    cache_root: PathBuf,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> anyhow::Result<(std::thread::JoinHandle<anyhow::Result<()>>, Vec<u8>)> {
+    use modelexpress_client::cached::locator::HfLocator;
     use modelexpress_client::cached::transfer::{nixl::NixlAgent, stager::CacheServer};
-    use modelexpress_common::grpc::p2p::SourceStatus;
 
-    if cli.models.is_empty() {
-        anyhow::bail!("--serve needs at least one --model");
-    }
-    let cache_root = cache_root(cli)?;
-    let stop = Arc::new(AtomicBool::new(false));
     let (md_tx, md_rx) = std::sync::mpsc::channel::<anyhow::Result<Vec<u8>>>();
-
-    let serve_stop = stop.clone();
-    let name = cli.name.clone();
-    let port = cli.nixl_port;
-    let buf_gib = cli.buf_gib;
-    let serve_root = cache_root.clone();
     let serve_thread = std::thread::spawn(move || -> anyhow::Result<()> {
         let mut agent = NixlAgent::new(&name, port)?;
-        let locator = HfLocator::new(serve_root);
+        let locator = HfLocator::new(cache_root);
         let mut server = match CacheServer::new(&mut agent, locator, buf_gib, false) {
             Ok(server) => server,
             Err(e) => {
@@ -165,18 +178,48 @@ async fn run_serve(cli: &Cli) -> anyhow::Result<()> {
                 return Ok(());
             }
         }
-        server.serve(&serve_stop)
+        server.serve(&stop)
     });
 
-    let md = match md_rx.recv() {
-        Ok(Ok(md)) => md,
-        Ok(Err(e)) => return Err(e),
-        Err(_) => {
-            return serve_thread
-                .join()
-                .map_err(|_| anyhow::anyhow!("serve thread panicked"))?;
+    match md_rx.recv() {
+        Ok(Ok(md)) => Ok((serve_thread, md)),
+        Ok(Err(e)) => {
+            let _ = serve_thread.join();
+            Err(e)
         }
-    };
+        Err(_) => {
+            serve_thread
+                .join()
+                .map_err(|_| anyhow::anyhow!("serve thread panicked"))??;
+            Err(anyhow::anyhow!(
+                "serve thread exited before sending metadata"
+            ))
+        }
+    }
+}
+
+#[cfg(feature = "nixl")]
+async fn run_serve(cli: &Cli) -> anyhow::Result<()> {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use modelexpress_client::cached::advertise;
+    use modelexpress_client::cached::locator::locate_hf;
+    use modelexpress_client::cached::registry::Registry;
+    use modelexpress_common::grpc::p2p::SourceStatus;
+
+    if cli.models.is_empty() {
+        anyhow::bail!("--serve needs at least one --model");
+    }
+    let cache_root = cache_root(cli)?;
+    let stop = Arc::new(AtomicBool::new(false));
+    let (serve_thread, md) = start_serve_thread(
+        cli.name.clone(),
+        cli.nixl_port,
+        cli.buf_gib,
+        cache_root.clone(),
+        stop.clone(),
+    )?;
 
     let mut registry = Registry::connect(cli.endpoint.clone()).await?;
     let worker_id = advertise::worker_id();
@@ -283,6 +326,116 @@ async fn run_pull(cli: &Cli) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "nixl")]
+async fn run_reconcile(cli: &Cli) -> anyhow::Result<()> {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    use modelexpress_client::cached::advertise;
+    use modelexpress_client::cached::desired::{DesiredSet, StaticDesiredSet};
+    use modelexpress_client::cached::reconcile::{NixlFetcher, Reconciler};
+    use modelexpress_client::cached::registry::Registry;
+    use modelexpress_common::grpc::p2p::SourceStatus;
+
+    if cli.models.is_empty() {
+        anyhow::bail!("--reconcile needs at least one --model");
+    }
+    let cache_root = cache_root(cli)?;
+    let stop = Arc::new(AtomicBool::new(false));
+    let (serve_thread, md) = start_serve_thread(
+        cli.name.clone(),
+        cli.nixl_port,
+        cli.buf_gib,
+        cache_root.clone(),
+        stop.clone(),
+    )?;
+
+    let registry = Registry::connect(cli.endpoint.clone()).await?;
+    let worker_id = advertise::worker_id();
+    let endpoint = metadata_endpoint(cli.nixl_port);
+    let desired = StaticDesiredSet::from_models(cli.models.clone()).desired();
+
+    // The advertised map is shared with the heartbeat task. The reconcile loop
+    // is its only writer and locks it only momentarily, so a long pull never
+    // blocks heartbeats: model name -> mx_source_id.
+    let advertised: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
+
+    // Heartbeat advertised sources within the reaper's window. A background task
+    // with nothing to drain, so it is stopped by aborting its handle on shutdown
+    // rather than polling a flag (which would lag shutdown by a whole tick).
+    let mut heartbeat = registry.clone();
+    let hb_advertised = advertised.clone();
+    let hb_id = worker_id.clone();
+    let heartbeat_task = tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(30));
+        loop {
+            tick.tick().await;
+            let snapshot: Vec<String> = match hb_advertised.lock() {
+                Ok(map) => map.values().cloned().collect(),
+                Err(_) => {
+                    tracing::error!("advertised map poisoned; stopping heartbeat");
+                    break;
+                }
+            };
+            for source_id in snapshot {
+                if let Err(e) = heartbeat
+                    .update_status(source_id.clone(), 0, SourceStatus::Ready, hb_id.clone())
+                    .await
+                {
+                    tracing::warn!(source_id, error = %e, "heartbeat failed");
+                }
+            }
+        }
+    });
+
+    let mut reconciler = Reconciler::new(
+        registry,
+        cache_root,
+        md,
+        cli.name.clone(),
+        endpoint,
+        worker_id,
+    );
+    let fetcher = NixlFetcher {
+        agent_name: cli.name.clone(),
+        buf_gib: cli.buf_gib,
+        endpoint: cli.endpoint.clone(),
+    };
+
+    tracing::info!(
+        models = desired.len(),
+        interval_secs = cli.reconcile_secs,
+        "reconcile loop started; serving and converging"
+    );
+    let shutdown = wait_for_shutdown();
+    tokio::pin!(shutdown);
+    let mut tick = tokio::time::interval(Duration::from_secs(cli.reconcile_secs));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            _ = tick.tick() => {
+                if let Err(e) = reconciler
+                    .reconcile_once(&desired, &fetcher, &advertised)
+                    .await
+                {
+                    tracing::warn!(error = %e, "reconcile pass failed; retrying next interval");
+                }
+            }
+            _ = &mut shutdown => break,
+        }
+    }
+
+    heartbeat_task.abort();
+    stop.store(true, Ordering::Relaxed);
+    serve_thread
+        .join()
+        .map_err(|_| anyhow::anyhow!("serve thread panicked"))??;
+    Ok(())
+}
+
 #[cfg(not(feature = "nixl"))]
 async fn run_serve(_cli: &Cli) -> anyhow::Result<()> {
     anyhow::bail!("the cache daemon requires the `nixl` build feature")
@@ -290,5 +443,10 @@ async fn run_serve(_cli: &Cli) -> anyhow::Result<()> {
 
 #[cfg(not(feature = "nixl"))]
 async fn run_pull(_cli: &Cli) -> anyhow::Result<()> {
+    anyhow::bail!("the cache daemon requires the `nixl` build feature")
+}
+
+#[cfg(not(feature = "nixl"))]
+async fn run_reconcile(_cli: &Cli) -> anyhow::Result<()> {
     anyhow::bail!("the cache daemon requires the `nixl` build feature")
 }

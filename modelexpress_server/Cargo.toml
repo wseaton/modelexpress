@@ -64,7 +64,7 @@ mockall = { workspace = true }
 tempfile = "3.20"
 tokio-test = "0.4"
 tonic-build = { workspace = true }
-modelexpress-client.workspace = true
+modelexpress-client = { workspace = true, features = ["test-support"] }
 
 [[test]]
 name = "in_process_server"

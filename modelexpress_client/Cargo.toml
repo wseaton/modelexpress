@@ -54,3 +54,8 @@ path = "src/bin/cached.rs"
 # default so the library, CLI, and unit tests build with no RDMA hardware or
 # libnixl; the dedicated daemon image builds with it on.
 nixl = ["dep:nixl-sys"]
+# Exposes the in-process loopback transport (transfer::loopback) outside this
+# crate's own unit tests, so server-side integration tests can drive the
+# transfer protocol honestly (real bytes) against a real registry server. Test
+# scaffolding only; never enabled in production builds.
+test-support = []
