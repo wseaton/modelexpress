@@ -82,6 +82,13 @@ struct Cli {
     #[arg(long, env = "MODEL_EXPRESS_CACHED_POOL_DEPTH", default_value_t = 2)]
     pool_depth: usize,
 
+    /// Write pulled files with `O_DIRECT`, bypassing the page cache. Much faster
+    /// for the sustained large writes the puller does (block-aligned, with the
+    /// partial tail truncated back). Requires a filesystem that supports
+    /// `O_DIRECT` (real NVMe does; tmpfs does not).
+    #[arg(long, env = "MODEL_EXPRESS_CACHED_O_DIRECT")]
+    o_direct: bool,
+
     /// Local model cache root. Defaults to the standard ModelExpress cache
     /// discovery (`MODEL_EXPRESS_CACHE_DIRECTORY`, config file, or `~`).
     #[arg(long, env = "MODEL_EXPRESS_CACHE_DIRECTORY")]
@@ -307,11 +314,12 @@ async fn run_pull(cli: &Cli) -> anyhow::Result<()> {
     let name = cli.name.clone();
     let buf_gib = cli.buf_gib;
     let pool_depth = cli.pool_depth;
+    let o_direct = cli.o_direct;
     let pull_model = model.clone();
     // NixlAgent lives only on the blocking thread, never across an .await.
     let dest = tokio::task::spawn_blocking(move || -> anyhow::Result<PathBuf> {
         let mut agent = NixlAgent::new(&name, 0)?;
-        let mut puller = Puller::new(&mut agent, buf_gib, pool_depth, false)?;
+        let mut puller = Puller::new(&mut agent, buf_gib, pool_depth, o_direct)?;
         let summary = puller.pull(&blob, &pull_model, |rev| {
             resolve_model_path(
                 &cache_root,
@@ -411,6 +419,7 @@ async fn run_reconcile(cli: &Cli) -> anyhow::Result<()> {
         agent_name: cli.name.clone(),
         buf_gib: cli.buf_gib,
         pool_depth: cli.pool_depth,
+        direct: cli.o_direct,
         endpoint: cli.endpoint.clone(),
     };
 

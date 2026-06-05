@@ -55,6 +55,22 @@ pub fn open_direct(path: &Path, write: bool, direct: bool) -> std::io::Result<Fi
     opts.open(path)
 }
 
+/// Round `n` up to the next multiple of `align`, which must be a power of two
+/// (the logical block size for `O_DIRECT`). On add overflow `n` is returned
+/// unchanged. The puller writes this rounded length so an `O_DIRECT` write's
+/// final partial chunk is block-aligned, then truncates the file back to the
+/// exact size.
+pub fn align_up(n: u64, align: u64) -> u64 {
+    if align == 0 {
+        return n;
+    }
+    let mask = align.wrapping_sub(1);
+    match n.checked_add(mask) {
+        Some(sum) => sum & !mask,
+        None => n,
+    }
+}
+
 /// SHA-256 of an in-memory byte slice. The puller hashes the freshly-received
 /// staging-buffer bytes directly instead of reading the file back off disk,
 /// which would compete with the write-bound NVMe path; this verifies the data
@@ -230,6 +246,18 @@ mod tests {
         mark_complete(dir.path()).expect("sentinel");
         // Only internal files present -> nothing to serve.
         assert!(scan_manifest(dir.path(), "r").is_err());
+    }
+
+    #[test]
+    fn align_up_rounds_to_block_multiple() {
+        assert_eq!(align_up(0, 4096), 0);
+        assert_eq!(align_up(1, 4096), 4096);
+        assert_eq!(align_up(4096, 4096), 4096, "already aligned is unchanged");
+        assert_eq!(align_up(4097, 4096), 8192);
+        // A 16 MiB chunk plus a 100-byte tail rounds the tail up by one block.
+        assert_eq!(align_up((16 << 20) + 100, 4096), (16 << 20) + 4096);
+        // Degenerate alignment is a no-op.
+        assert_eq!(align_up(12345, 0), 12345);
     }
 
     #[test]

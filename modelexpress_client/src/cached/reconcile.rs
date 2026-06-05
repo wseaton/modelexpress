@@ -262,6 +262,8 @@ pub struct NixlFetcher {
     pub buf_gib: u32,
     /// Receive pipeline depth (slots the staging buffer is carved into).
     pub pool_depth: usize,
+    /// Write pulled files with `O_DIRECT` (bypass the page cache).
+    pub direct: bool,
     /// Registry/server endpoint used for the origin fallback download.
     pub endpoint: String,
 }
@@ -282,12 +284,13 @@ impl Fetcher for NixlFetcher {
         let name = format!("{}-pull", self.agent_name);
         let buf_gib = self.buf_gib;
         let pool_depth = self.pool_depth;
+        let direct = self.direct;
         let model = spec.model.clone();
         let dest_root = dest_root.to_path_buf();
         // NixlAgent is !Send: confine it to the blocking worker, never across .await.
         tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             let mut agent = NixlAgent::new(&name, 0)?;
-            let mut puller = Puller::new(&mut agent, buf_gib, pool_depth, false)?;
+            let mut puller = Puller::new(&mut agent, buf_gib, pool_depth, direct)?;
             puller.pull(&holder_md, &model, |rev| {
                 resolve_model_path(&dest_root, ModelProvider::HuggingFace, &model, Some(rev))
                     .unwrap_or_else(|_| {

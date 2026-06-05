@@ -8,10 +8,11 @@
 //!
 //! The receive is double-buffered: the staging buffer is carved into `depth`
 //! slots, and the puller keeps the NVMe write of one shard in flight (posted via
-//! [`Transport::post_write_dram_to_file`]) while it receives the next shard into
-//! another slot. The NVMe write is the bottleneck (~3 GB/s) and the holder's
-//! read+RDMA is far faster (~7 GB/s), so overlapping them keeps the disk writing
-//! continuously and lifts throughput toward the write ceiling. Only one shard is
+//! [`Transport::post_write_dram_to_file`]) while it receives and verifies the
+//! next. The write is the bottleneck by far (the holder's read+RDMA is ~7 GB/s);
+//! with `O_DIRECT` writes the overlap lets the disk keep moving instead of
+//! stalling on the page-cache flush a buffered `sync_all` forces. The measured
+//! single-stream write ceiling on the target RAID is ~2 GB/s. Only one shard is
 //! ever requested from the holder at a time, so the holder side stays simple.
 //!
 //! Each shard is SHA-verified from the staging buffer the moment it arrives (not
@@ -36,6 +37,9 @@ use super::{CHUNK, Manifest, Transport, cache_layout, gbps, notif};
 const POLL: Duration = Duration::from_micros(200);
 const NOTIF_TIMEOUT: Duration = Duration::from_secs(300);
 const GIB: u64 = 1 << 30;
+/// Logical-block alignment for `O_DIRECT` writes. 4 KiB is a superset of every
+/// common block size, so a length rounded up to it is always acceptable.
+const O_DIRECT_ALIGN: u64 = 4096;
 
 /// Outcome of a completed pull.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -200,16 +204,28 @@ impl<'a, T: Transport> Puller<'a, T> {
                 }
             }
 
+            // O_DIRECT needs block-aligned write lengths, so the final partial
+            // chunk is rounded up; the slot already holds those extra bytes, and
+            // `finalize` truncates the file back to the exact size. Buffered
+            // writes use the exact size unchanged.
+            let write_size = if self.direct {
+                cache_layout::align_up(size, O_DIRECT_ALIGN)
+            } else {
+                size
+            };
             let final_path = dest.join(&shard.rel_path);
             cache_layout::ensure_parent(&final_path)?;
             let tmp = cache_layout::temp_path(&final_path);
             let file = cache_layout::open_direct(&tmp, true, self.direct)?;
-            file.set_len(size)?;
+            file.set_len(write_size)?;
 
             let handle = if size > 0 {
                 let fd = file.as_raw_fd();
-                self.agent.register_file(fd, usize::try_from(size)?)?;
-                Some(self.agent.post_write_dram_to_file(slot_base, fd, size)?)
+                self.agent.register_file(fd, usize::try_from(write_size)?)?;
+                Some(
+                    self.agent
+                        .post_write_dram_to_file(slot_base, fd, write_size)?,
+                )
             } else {
                 None
             };
@@ -255,6 +271,9 @@ impl<'a, T: Transport> Puller<'a, T> {
         if let Some(handle) = done.handle {
             self.agent.wait_write(handle)?;
         }
+        // Drop any O_DIRECT alignment padding so the file ends at its exact size
+        // (a no-op for buffered writes, which wrote exactly `size`).
+        done.file.set_len(done.size)?;
         done.file.sync_all()?;
         drop(done.file);
         cache_layout::finalize_shard(&done.tmp, &done.final_path)?;
