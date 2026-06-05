@@ -26,7 +26,7 @@ pub mod nixl;
 
 /// In-process loopback transport used to exercise the protocol in unit tests
 /// without RDMA hardware. It moves real bytes (real file IO, real `memcpy`
-/// between two staging buffers), so the SHA verification on the puller is
+/// between two staging buffers), so the hash verification on the puller is
 /// genuine; only the fabric (notifications, metadata) is local.
 #[cfg(any(test, feature = "test-support"))]
 pub mod loopback;
@@ -49,9 +49,9 @@ pub struct Shard {
     /// Exact size in bytes; the transfer moves exactly this many bytes and the
     /// dest file ends at this size, no padding or truncation.
     pub true_size: u64,
-    /// SHA-256 of the content, verified on the puller before the file is renamed
+    /// BLAKE3 of the content, verified on the puller before the file is renamed
     /// into place.
-    pub sha256: String,
+    pub hash: String,
 }
 
 /// The files a stager will serve for one model, sent in reply to a manifest
@@ -226,7 +226,7 @@ mod tests {
         Shard {
             rel_path: rel_path.into(),
             true_size,
-            sha256: String::new(),
+            hash: String::new(),
         }
     }
 

@@ -29,8 +29,8 @@ clap = { workspace = true }
 colored = { workspace = true }
 memmap2 = { workspace = true }
 libc = { workspace = true }
-sha2 = { workspace = true }
 nixl-sys = { workspace = true, features = ["stub-api"], optional = true }
+blake3 = { workspace = true }
 
 [dev-dependencies]
 modelexpress-common = { workspace = true, features = ["test-support"] }

@@ -15,7 +15,7 @@
 //! single-stream write ceiling on the target RAID is ~2 GB/s. Only one shard is
 //! ever requested from the holder at a time, so the holder side stays simple.
 //!
-//! Each shard is SHA-verified from the staging buffer the moment it arrives (not
+//! Each shard is hash-verified from the staging buffer the moment it arrives (not
 //! by reading the file back off disk, which would compete with the writes), then
 //! its write is posted; once the write completes the temp file is renamed into
 //! place. When every file is in, the directory gets its
@@ -212,10 +212,10 @@ impl<'a, T: Transport> Puller<'a, T> {
                     .context("received range outside staging buffer")?;
                 let got = {
                     let _hash = tracing::debug_span!("hash", idx).entered();
-                    cache_layout::sha256_mem(received)
+                    cache_layout::hash_mem(received)
                 };
-                if got != shard.sha256 {
-                    bail!("{} sha mismatch: {got} != {}", shard.rel_path, shard.sha256);
+                if got != shard.hash {
+                    bail!("{} hash mismatch: {got} != {}", shard.rel_path, shard.hash);
                 }
             }
 
@@ -513,7 +513,7 @@ mod tests {
             let err = puller
                 .pull(b"h", "m", |rev| dst_root.join(rev))
                 .expect_err("should reject corruption");
-            assert!(err.to_string().contains("sha mismatch"));
+            assert!(err.to_string().contains("hash mismatch"));
             assert!(!cache_layout::is_complete(&dst_root.join("rev1")));
             stop.store(true, Ordering::Relaxed);
             served.join().expect("join").expect("serve ok");

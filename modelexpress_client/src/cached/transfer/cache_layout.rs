@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! On-disk layout for the cache transfer: turning a model snapshot directory
-//! into a shard [`Manifest`], opening files for the transfer legs, SHA-256
+//! into a shard [`Manifest`], opening files for the transfer legs, BLAKE3
 //! verification, and atomically publishing a freshly pulled model.
 //!
 //! The whole snapshot is served (weights, config, tokenizer, ...) so a pulled
@@ -11,7 +11,7 @@
 //!
 //! A model is published in two steps so a crashed pull never leaves a
 //! half-written file masquerading as real: each file lands under a temp name
-//! (`<file>.mxtmp`) and is renamed into place only after its SHA matches, then
+//! (`<file>.mxtmp`) and is renamed into place only after its hash matches, then
 //! the model directory gets a [`COMPLETE_SENTINEL`] once every file is in. A
 //! model directory without the sentinel is treated as absent and re-pulled.
 
@@ -21,7 +21,6 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
-use sha2::{Digest, Sha256};
 
 use super::{Manifest, Shard};
 
@@ -71,20 +70,24 @@ pub fn align_up(n: u64, align: u64) -> u64 {
     }
 }
 
-/// SHA-256 of an in-memory byte slice. The puller hashes the freshly-received
-/// staging-buffer bytes directly instead of reading the file back off disk,
-/// which would compete with the write-bound NVMe path; this verifies the data
-/// that arrived over the wire (the FS/NVMe is trusted for the write itself).
-pub fn sha256_mem(bytes: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    format!("{:x}", hasher.finalize())
+/// BLAKE3 of an in-memory byte slice, multithreaded across the rayon pool. The
+/// puller hashes the freshly-received staging-buffer bytes directly instead of
+/// reading the file back off disk (which would compete with the write-bound NVMe
+/// path); BLAKE3 keeps verification from becoming the bottleneck. This verifies
+/// the data that arrived over the wire (the FS/NVMe is trusted for the write).
+pub fn hash_mem(bytes: &[u8]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update_rayon(bytes);
+    hasher.finalize().to_hex().to_string()
 }
 
-/// SHA-256 of the first `n` bytes of `path` (pass the file's size to hash it all).
-pub fn sha256_prefix(path: &Path, n: u64) -> std::io::Result<String> {
+/// BLAKE3 of the first `n` bytes of `path` (pass the file's size to hash it all).
+/// Streamed, so a multi-GB shard is not read wholly into memory; the holder runs
+/// this once per model when scanning the manifest. Produces the same hash as
+/// [`hash_mem`] over the same bytes (BLAKE3 is chunking-independent).
+pub fn hash_prefix(path: &Path, n: u64) -> std::io::Result<String> {
     let mut f = File::open(path)?;
-    let mut hasher = Sha256::new();
+    let mut hasher = blake3::Hasher::new();
     let mut buf = vec![0u8; 1 << 20];
     let mut left = n;
     while left > 0 {
@@ -96,12 +99,12 @@ pub fn sha256_prefix(path: &Path, n: u64) -> std::io::Result<String> {
         hasher.update(&buf[..r]);
         left = left.saturating_sub(r as u64);
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(hasher.finalize().to_hex().to_string())
 }
 
 /// Scan every file under `dir` (recursively, following the symlinks an HF
 /// snapshot uses) into a manifest for `revision`. Records each file's path
-/// relative to `dir`, its exact size, and its SHA-256. Our own scratch and
+/// relative to `dir`, its exact size, and its BLAKE3 hash. Our own scratch and
 /// sentinel files are skipped; nothing is mutated.
 pub fn scan_manifest(dir: &Path, revision: &str) -> anyhow::Result<Manifest> {
     let mut shards = Vec::new();
@@ -137,11 +140,11 @@ fn collect_shards(root: &Path, dir: &Path, out: &mut Vec<Shard>) -> anyhow::Resu
             continue;
         }
         let true_size = meta.len();
-        let sha256 = sha256_prefix(&path, true_size)?;
+        let hash = hash_prefix(&path, true_size)?;
         out.push(Shard {
             rel_path,
             true_size,
-            sha256,
+            hash,
         });
     }
     Ok(())
@@ -197,10 +200,8 @@ mod tests {
         f.write_all(bytes).expect("write");
     }
 
-    fn sha256_hex(bytes: &[u8]) -> String {
-        let mut h = Sha256::new();
-        h.update(bytes);
-        format!("{:x}", h.finalize())
+    fn blake3_hex(bytes: &[u8]) -> String {
+        blake3::hash(bytes).to_hex().to_string()
     }
 
     #[test]
@@ -229,7 +230,7 @@ mod tests {
             .find(|s| s.rel_path == "config.json")
             .unwrap();
         assert_eq!(cfg.true_size, 2);
-        assert_eq!(cfg.sha256, sha256_hex(b"{}"));
+        assert_eq!(cfg.hash, blake3_hex(b"{}"));
         // Source file is untouched (no padding to a CHUNK multiple).
         assert_eq!(
             std::fs::metadata(dir.path().join("config.json"))
