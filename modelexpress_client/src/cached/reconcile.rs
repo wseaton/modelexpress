@@ -29,6 +29,7 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use anyhow::{Context, anyhow};
+use modelexpress_common::grpc::p2p::SourceStatus;
 use tracing::info;
 
 use super::advertise::{cache_worker, file_cache_identity};
@@ -182,7 +183,7 @@ impl Reconciler {
         fetcher: &dyn Fetcher,
     ) -> anyhow::Result<FetchSource> {
         let identity = file_cache_identity(spec.model.clone(), spec.identity_revision());
-        match discover_blob(&mut self.registry, identity).await? {
+        match discover_blob(&mut self.registry, identity, &self.worker_id).await? {
             Some(holder_md) => {
                 info!(model = %spec.model, "peer holds model; pulling over RDMA");
                 fetcher.peer_pull(spec, holder_md, &self.cache_root).await?;
@@ -210,6 +211,31 @@ impl Reconciler {
             .await?;
         info!(model = %spec.model, source_id = %source_id, "advertised");
         Ok(source_id)
+    }
+
+    /// Best-effort deregister on shutdown: mark every advertised source `STALE`
+    /// so peers stop selecting this node immediately, rather than waiting out
+    /// the reaper's heartbeat timeout. Failures are logged, not propagated, since
+    /// the node is going away regardless and the reaper is the backstop.
+    pub async fn deregister(&mut self, advertised: &Mutex<HashMap<String, String>>) {
+        let source_ids: Vec<String> = match advertised.lock() {
+            Ok(map) => map.values().cloned().collect(),
+            Err(_) => return,
+        };
+        for source_id in source_ids {
+            if let Err(e) = self
+                .registry
+                .update_status(
+                    source_id.clone(),
+                    0,
+                    SourceStatus::Stale,
+                    self.worker_id.clone(),
+                )
+                .await
+            {
+                tracing::warn!(source_id, error = %e, "deregister failed; reaper will reap");
+            }
+        }
     }
 
     fn lock_advertised<'a>(

@@ -127,7 +127,7 @@ async fn file_cache_publish_list_get_discover_roundtrip() {
     }
 
     // discover_blob resolves identity -> the same blob a puller would load.
-    let discovered = discover::discover_blob(&mut reg, identity)
+    let discovered = discover::discover_blob(&mut reg, identity, "probe")
         .await
         .expect("discover");
     assert_eq!(discovered.as_deref(), Some(blob.as_slice()));
@@ -136,6 +136,7 @@ async fn file_cache_publish_list_get_discover_roundtrip() {
     let none = discover::discover_blob(
         &mut reg,
         advertise::file_cache_identity("nobody/holds-this", ""),
+        "probe",
     )
     .await
     .expect("discover none");
@@ -397,6 +398,60 @@ async fn reconcile_origin_fallback_converges_and_advertises() {
     let instances = reg.list_ready(identity).await.expect("list");
     assert_eq!(instances.len(), 1);
     assert_eq!(instances[0].worker_id, "node-c");
+
+    stop_and_join(shutdown, handle).await;
+}
+
+/// On shutdown the daemon marks its advertised sources STALE so peers stop
+/// selecting it at once, instead of waiting out the reaper. After deregister,
+/// `ListSources(READY)` no longer returns the node.
+#[tokio::test]
+async fn reconcile_deregister_marks_sources_stale() {
+    let port = free_port();
+    let (shutdown, handle) = start_server(port);
+    let mut reg = registry_at(port).await;
+
+    // The model is already held-and-complete, so reconcile only advertises it
+    // (no fetch); the fetcher is present but never called.
+    let cache = tempfile::tempdir().expect("cache");
+    write_fixture_model(cache.path());
+    modelexpress_client::cached::reconcile::ensure_complete(cache.path(), MODEL).expect("complete");
+
+    let fetcher = LoopbackFetcher {
+        fabric: Fabric::default(),
+        puller_name: "node-d-agent".to_string(),
+        peer_calls: Arc::new(AtomicUsize::new(0)),
+        origin_calls: Arc::new(AtomicUsize::new(0)),
+    };
+    let reg_d = registry_at(port).await;
+    let mut reconciler = Reconciler::new(
+        reg_d,
+        cache.path().to_path_buf(),
+        b"node-d-agent".to_vec(),
+        "node-d-agent",
+        "",
+        "node-d",
+    );
+    let advertised = Mutex::new(HashMap::new());
+    let desired = vec![ModelSpec::new(MODEL)];
+    reconciler
+        .reconcile_once(&desired, &fetcher, &advertised)
+        .await
+        .expect("reconcile");
+
+    // Advertised and READY.
+    let identity = advertise::file_cache_identity(MODEL, "");
+    assert_eq!(
+        reg.list_ready(identity.clone()).await.expect("list").len(),
+        1
+    );
+
+    // Deregister marks it STALE; it drops out of the READY listing.
+    reconciler.deregister(&advertised).await;
+    assert!(
+        reg.list_ready(identity).await.expect("list").is_empty(),
+        "stale source must not appear as a READY holder"
+    );
 
     stop_and_join(shutdown, handle).await;
 }

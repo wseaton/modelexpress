@@ -293,7 +293,7 @@ async fn run_pull(cli: &Cli) -> anyhow::Result<()> {
 
     let mut registry = Registry::connect(cli.endpoint.clone()).await?;
     let identity = advertise::file_cache_identity(model.clone(), "");
-    let blob = discover::discover_blob(&mut registry, identity)
+    let blob = discover::discover_blob(&mut registry, identity, &cli.name)
         .await?
         .with_context(|| format!("no peer advertises {model}"))?;
 
@@ -428,7 +428,10 @@ async fn run_reconcile(cli: &Cli) -> anyhow::Result<()> {
         }
     }
 
+    // Stop heartbeating before deregistering so the heartbeat can't re-mark a
+    // source READY after we mark it STALE; the serve loop stops last.
     heartbeat_task.abort();
+    reconciler.deregister(&advertised).await;
     stop.store(true, Ordering::Relaxed);
     serve_thread
         .join()
