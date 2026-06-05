@@ -47,6 +47,13 @@ struct Cli {
     #[arg(long = "model")]
     models: Vec<String>,
 
+    /// `--reconcile` only: path to a desired-set file (one `model` or
+    /// `model@revision` per line, `#` comments allowed), re-read every pass so a
+    /// mounted ConfigMap can be edited to reconverge the fleet without a restart.
+    /// Takes precedence over `--model` when set.
+    #[arg(long, env = "MODEL_EXPRESS_CACHED_MODELS_FILE")]
+    models_file: Option<PathBuf>,
+
     /// Seconds between reconcile passes in `--reconcile` mode.
     #[arg(
         long,
@@ -366,14 +373,20 @@ async fn run_reconcile(cli: &Cli) -> anyhow::Result<()> {
     use std::time::Duration;
 
     use modelexpress_client::cached::advertise;
-    use modelexpress_client::cached::desired::{DesiredSet, StaticDesiredSet};
+    use modelexpress_client::cached::desired::{DesiredSet, FileDesiredSet, StaticDesiredSet};
     use modelexpress_client::cached::reconcile::{NixlFetcher, Reconciler};
     use modelexpress_client::cached::registry::Registry;
     use modelexpress_common::grpc::p2p::SourceStatus;
 
-    if cli.models.is_empty() {
-        anyhow::bail!("--reconcile needs at least one --model");
+    if cli.models.is_empty() && cli.models_file.is_none() {
+        anyhow::bail!("--reconcile needs --model or --models-file");
     }
+    // The desired set is re-read every pass, so a mounted ConfigMap (via
+    // --models-file) can be edited to reconverge the fleet without a restart.
+    let desired_set: Box<dyn DesiredSet> = match &cli.models_file {
+        Some(path) => Box::new(FileDesiredSet::new(path.clone())),
+        None => Box::new(StaticDesiredSet::from_models(cli.models.clone())),
+    };
     let cache_root = cache_root(cli)?;
     let stop = Arc::new(AtomicBool::new(false));
     let (serve_thread, md) = start_serve_thread(
@@ -387,7 +400,6 @@ async fn run_reconcile(cli: &Cli) -> anyhow::Result<()> {
     let registry = Registry::connect(cli.endpoint.clone()).await?;
     let worker_id = advertise::worker_id();
     let endpoint = metadata_endpoint(cli.nixl_port);
-    let desired = StaticDesiredSet::from_models(cli.models.clone()).desired();
 
     // The advertised map is shared with the heartbeat task. The reconcile loop
     // is its only writer and locks it only momentarily, so a long pull never
@@ -439,7 +451,6 @@ async fn run_reconcile(cli: &Cli) -> anyhow::Result<()> {
     };
 
     tracing::info!(
-        models = desired.len(),
         interval_secs = cli.reconcile_secs,
         "reconcile loop started; serving and converging"
     );
@@ -450,6 +461,8 @@ async fn run_reconcile(cli: &Cli) -> anyhow::Result<()> {
     loop {
         tokio::select! {
             _ = tick.tick() => {
+                // Re-read the desired set each pass so ConfigMap edits take effect.
+                let desired = desired_set.desired();
                 if let Err(e) = reconciler
                     .reconcile_once(&desired, &fetcher, &advertised)
                     .await

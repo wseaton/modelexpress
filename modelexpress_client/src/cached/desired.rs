@@ -4,9 +4,13 @@
 //! The declared desired set: the models a node is supposed to hold. The
 //! reconciler diffs this against what is actually on local NVMe and pulls the
 //! difference. A [`DesiredSet`] is the only thing that varies between deployment
-//! styles; [`StaticDesiredSet`] is the v1 implementation, built from the CLI /
-//! config model list. A K8s-CRD/label-backed source is a later concern, so the
-//! reconciler depends on the trait, not on where the list comes from.
+//! styles, so the reconciler depends on the trait, not on where the list comes
+//! from. Two sources exist: [`StaticDesiredSet`] (the CLI `--model` list, fixed
+//! for the process's life) and [`FileDesiredSet`] (a file - a mounted K8s
+//! ConfigMap - re-read every pass, so editing the ConfigMap reconverges the
+//! fleet with no restart). A CRD/label-backed source is a later concern.
+
+use std::path::PathBuf;
 
 use modelexpress_common::models::ModelProvider;
 
@@ -31,6 +35,19 @@ impl ModelSpec {
         }
     }
 
+    /// Parse a `model` or `model@revision` spec (the form used on the CLI and in
+    /// the desired-set file). A trailing `@` with no revision is treated as
+    /// unpinned.
+    pub fn parse(spec: &str) -> Self {
+        match spec.split_once('@') {
+            Some((model, revision)) if !revision.is_empty() => Self {
+                model: model.to_string(),
+                revision: Some(revision.to_string()),
+            },
+            _ => Self::new(spec.trim_end_matches('@')),
+        }
+    }
+
     /// The provider this spec resolves through. Fixed to HuggingFace in v1.
     pub fn provider(&self) -> ModelProvider {
         ModelProvider::HuggingFace
@@ -47,6 +64,28 @@ pub trait DesiredSet {
     /// Snapshot the currently-desired models. Called once per reconcile pass, so
     /// a dynamic implementation can return a fresh view each time.
     fn desired(&self) -> Vec<ModelSpec>;
+}
+
+/// Append `spec` unless its model is already present, so a set stays
+/// de-duplicated by model (one revision per model in v1) and order-stable.
+fn push_unique(specs: &mut Vec<ModelSpec>, spec: ModelSpec) {
+    if !specs.iter().any(|existing| existing.model == spec.model) {
+        specs.push(spec);
+    }
+}
+
+/// Parse a desired-set file body: one `model` or `model@revision` per line,
+/// blank lines and `#` comments skipped, de-duplicated by model.
+fn parse_lines(body: &str) -> Vec<ModelSpec> {
+    let mut specs = Vec::new();
+    for line in body.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        push_unique(&mut specs, ModelSpec::parse(line));
+    }
+    specs
 }
 
 /// A fixed desired set, the v1 source: the model list handed in on the CLI (or
@@ -66,10 +105,7 @@ impl StaticDesiredSet {
     {
         let mut specs: Vec<ModelSpec> = Vec::new();
         for model in models {
-            let spec = ModelSpec::new(model);
-            if !specs.iter().any(|existing| existing.model == spec.model) {
-                specs.push(spec);
-            }
+            push_unique(&mut specs, ModelSpec::parse(&model.into()));
         }
         Self { specs }
     }
@@ -82,6 +118,34 @@ impl StaticDesiredSet {
 impl DesiredSet for StaticDesiredSet {
     fn desired(&self) -> Vec<ModelSpec> {
         self.specs.clone()
+    }
+}
+
+/// A desired set read from a file every pass. Backs a mounted K8s ConfigMap:
+/// editing the ConfigMap (one `model` / `model@revision` per line) reconverges
+/// the fleet with no restart. An unreadable file yields an empty set (logged),
+/// not an error, so a not-yet-mounted or transiently-missing file just defers
+/// reconciliation rather than crashing the daemon.
+#[derive(Debug, Clone)]
+pub struct FileDesiredSet {
+    path: PathBuf,
+}
+
+impl FileDesiredSet {
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+}
+
+impl DesiredSet for FileDesiredSet {
+    fn desired(&self) -> Vec<ModelSpec> {
+        match std::fs::read_to_string(&self.path) {
+            Ok(body) => parse_lines(&body),
+            Err(e) => {
+                tracing::warn!(path = %self.path.display(), error = %e, "desired-set file unreadable; treating as empty this pass");
+                Vec::new()
+            }
+        }
     }
 }
 
@@ -114,5 +178,53 @@ mod tests {
         assert_eq!(spec.provider(), ModelProvider::HuggingFace);
         assert_eq!(spec.identity_revision(), "");
         assert!(spec.revision.is_none());
+    }
+
+    #[test]
+    fn parse_handles_pinned_and_unpinned_revisions() {
+        let pinned = ModelSpec::parse("google-t5/t5-small@abc123");
+        assert_eq!(pinned.model, "google-t5/t5-small");
+        assert_eq!(pinned.revision.as_deref(), Some("abc123"));
+        assert_eq!(pinned.identity_revision(), "abc123");
+
+        let unpinned = ModelSpec::parse("Qwen/Qwen2.5-7B");
+        assert_eq!(unpinned.model, "Qwen/Qwen2.5-7B");
+        assert!(unpinned.revision.is_none());
+
+        // A trailing `@` with no revision is unpinned, not a revision named "".
+        let trailing = ModelSpec::parse("org/m@");
+        assert_eq!(trailing.model, "org/m");
+        assert!(trailing.revision.is_none());
+    }
+
+    #[test]
+    fn parse_lines_skips_comments_blanks_and_dedups() {
+        let body = "\
+            # desired models\n\
+            google-t5/t5-small\n\
+            \n\
+            Qwen/Qwen2.5-7B@rev9\n\
+            google-t5/t5-small\n\
+            # trailing comment\n";
+        let specs = parse_lines(body);
+        let models: Vec<&str> = specs.iter().map(|s| s.model.as_str()).collect();
+        assert_eq!(models, vec!["google-t5/t5-small", "Qwen/Qwen2.5-7B"]);
+        assert_eq!(specs[1].revision.as_deref(), Some("rev9"));
+    }
+
+    #[test]
+    fn file_desired_set_reads_live_and_tolerates_missing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("models.txt");
+        // Missing file -> empty, no panic.
+        let set = FileDesiredSet::new(&path);
+        assert!(set.desired().is_empty());
+
+        std::fs::write(&path, "google-t5/t5-small\n").expect("write");
+        assert_eq!(set.desired().len(), 1);
+
+        // Re-reads each call: a ConfigMap edit is picked up without restart.
+        std::fs::write(&path, "google-t5/t5-small\nQwen/Qwen2.5-7B\n").expect("rewrite");
+        assert_eq!(set.desired().len(), 2);
     }
 }
