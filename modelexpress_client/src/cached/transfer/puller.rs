@@ -144,6 +144,15 @@ impl<'a, T: Transport> Puller<'a, T> {
         let mut free_slots: Vec<usize> = (0..self.depth).rev().collect();
         let mut bytes: u64 = 0;
         let pull_start = Instant::now();
+        // Per-leg timing comes from these spans (RUST_LOG=...puller=debug); the
+        // pull span scopes them and reports the total on close.
+        let _pull = tracing::info_span!(
+            "pull",
+            model,
+            files = manifest.shards.len(),
+            depth = self.depth
+        )
+        .entered();
 
         for (idx, shard) in manifest.shards.iter().enumerate() {
             if shard.n_chunks() > self.slot_chunks {
@@ -185,7 +194,10 @@ impl<'a, T: Transport> Puller<'a, T> {
             pull.extend_from_slice(&(slot_base as u64).to_le_bytes());
             let started = Instant::now();
             self.agent.send_notif(&holder, &pull)?;
-            self.await_done(idx)?;
+            {
+                let _recv = tracing::debug_span!("recv", idx).entered();
+                self.await_done(idx)?;
+            }
 
             // Verify from the staging buffer (not a disk readback), before the
             // write is posted, so corrupt data is never written.
@@ -198,7 +210,10 @@ impl<'a, T: Transport> Puller<'a, T> {
                     .as_slice()
                     .get(slot_off..end)
                     .context("received range outside staging buffer")?;
-                let got = cache_layout::sha256_mem(received);
+                let got = {
+                    let _hash = tracing::debug_span!("hash", idx).entered();
+                    cache_layout::sha256_mem(received)
+                };
                 if got != shard.sha256 {
                     bail!("{} sha mismatch: {got} != {}", shard.rel_path, shard.sha256);
                 }
@@ -269,12 +284,16 @@ impl<'a, T: Transport> Puller<'a, T> {
     /// place. The SHA was already checked from DRAM when the shard arrived.
     fn finalize(&mut self, done: InFlight<T::WriteHandle>) -> anyhow::Result<()> {
         if let Some(handle) = done.handle {
+            let _write = tracing::debug_span!("write", idx = done.idx).entered();
             self.agent.wait_write(handle)?;
         }
-        // Drop any O_DIRECT alignment padding so the file ends at its exact size
-        // (a no-op for buffered writes, which wrote exactly `size`).
-        done.file.set_len(done.size)?;
-        done.file.sync_all()?;
+        {
+            // Drop any O_DIRECT alignment padding so the file ends at its exact
+            // size (a no-op for buffered writes, which wrote exactly `size`).
+            let _sync = tracing::debug_span!("sync", idx = done.idx).entered();
+            done.file.set_len(done.size)?;
+            done.file.sync_all()?;
+        }
         drop(done.file);
         cache_layout::finalize_shard(&done.tmp, &done.final_path)?;
         tracing::info!(

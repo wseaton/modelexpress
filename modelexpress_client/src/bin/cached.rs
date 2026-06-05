@@ -95,9 +95,24 @@ struct Cli {
     cache_dir: Option<PathBuf>,
 }
 
+/// Span-aware subscriber: `RUST_LOG` controls levels (default `info`), and span
+/// close events print each span's busy/idle time. The puller wraps its transfer
+/// legs (recv/hash/write/sync) in `debug` spans, so `RUST_LOG=...puller=debug`
+/// surfaces a per-leg timing breakdown without any hand-rolled timers.
+fn init_tracing() {
+    use tracing_subscriber::EnvFilter;
+    use tracing_subscriber::fmt::format::FmtSpan;
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .with_span_events(FmtSpan::CLOSE)
+        .init();
+}
+
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
-    tracing_subscriber::fmt::init();
+    init_tracing();
     let cli = Cli::parse();
     match run(&cli).await {
         Ok(()) => std::process::ExitCode::SUCCESS,
