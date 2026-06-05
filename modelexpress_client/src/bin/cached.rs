@@ -75,6 +75,13 @@ struct Cli {
     #[arg(long, env = "MODEL_EXPRESS_CACHED_BUF_GIB", default_value_t = 4)]
     buf_gib: u32,
 
+    /// Receive pipeline depth: the staging buffer is carved into this many slots
+    /// so a shard's NVMe write overlaps the next shard's RDMA receive. Each slot
+    /// must hold the largest shard, so raising depth needs proportionally more
+    /// `--buf-gib`. 2 is the validated double-buffer.
+    #[arg(long, env = "MODEL_EXPRESS_CACHED_POOL_DEPTH", default_value_t = 2)]
+    pool_depth: usize,
+
     /// Local model cache root. Defaults to the standard ModelExpress cache
     /// discovery (`MODEL_EXPRESS_CACHE_DIRECTORY`, config file, or `~`).
     #[arg(long, env = "MODEL_EXPRESS_CACHE_DIRECTORY")]
@@ -299,11 +306,12 @@ async fn run_pull(cli: &Cli) -> anyhow::Result<()> {
 
     let name = cli.name.clone();
     let buf_gib = cli.buf_gib;
+    let pool_depth = cli.pool_depth;
     let pull_model = model.clone();
     // NixlAgent lives only on the blocking thread, never across an .await.
     let dest = tokio::task::spawn_blocking(move || -> anyhow::Result<PathBuf> {
         let mut agent = NixlAgent::new(&name, 0)?;
-        let mut puller = Puller::new(&mut agent, buf_gib, false)?;
+        let mut puller = Puller::new(&mut agent, buf_gib, pool_depth, false)?;
         let summary = puller.pull(&blob, &pull_model, |rev| {
             resolve_model_path(
                 &cache_root,
@@ -402,6 +410,7 @@ async fn run_reconcile(cli: &Cli) -> anyhow::Result<()> {
     let fetcher = NixlFetcher {
         agent_name: cli.name.clone(),
         buf_gib: cli.buf_gib,
+        pool_depth: cli.pool_depth,
         endpoint: cli.endpoint.clone(),
     };
 

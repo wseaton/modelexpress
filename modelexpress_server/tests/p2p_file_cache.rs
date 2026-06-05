@@ -217,7 +217,7 @@ impl Fetcher for LoopbackFetcher {
         let dest_root = dest_root.to_path_buf();
         tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             let mut agent = Loopback::new(&puller_name, &fabric);
-            let mut puller = Puller::new(&mut agent, 0, false)?;
+            let mut puller = Puller::new(&mut agent, 0, 2, false)?;
             puller.pull(&holder_md, &model, |rev| dest_for(&dest_root, &model, rev))?;
             Ok(())
         })

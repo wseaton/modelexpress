@@ -55,6 +55,16 @@ pub fn open_direct(path: &Path, write: bool, direct: bool) -> std::io::Result<Fi
     opts.open(path)
 }
 
+/// SHA-256 of an in-memory byte slice. The puller hashes the freshly-received
+/// staging-buffer bytes directly instead of reading the file back off disk,
+/// which would compete with the write-bound NVMe path; this verifies the data
+/// that arrived over the wire (the FS/NVMe is trusted for the write itself).
+pub fn sha256_mem(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
+}
+
 /// SHA-256 of the first `n` bytes of `path` (pass the file's size to hash it all).
 pub fn sha256_prefix(path: &Path, n: u64) -> std::io::Result<String> {
     let mut f = File::open(path)?;

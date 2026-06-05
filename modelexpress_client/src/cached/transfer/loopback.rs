@@ -207,7 +207,37 @@ impl Transport for Loopback {
         Ok(())
     }
 
-    fn write_dram_to_file(&self, dram_base: usize, fd: RawFd, size: u64) -> anyhow::Result<()> {
-        pwrite_exact(fd, dram_base as *const u8, leg_len(size)?)
+    type WriteHandle = DeferredWrite;
+
+    fn post_write_dram_to_file(
+        &self,
+        dram_base: usize,
+        fd: RawFd,
+        size: u64,
+    ) -> anyhow::Result<DeferredWrite> {
+        // Defer the actual pwrite to `wait_write`, reading the staging buffer at
+        // wait time. If the puller wrongly reused this slot before waiting, the
+        // bytes would be clobbered and the SHA check would catch it, so this is
+        // an honest test of the double-buffer's slot discipline.
+        Ok(DeferredWrite {
+            dram_base,
+            fd,
+            size,
+        })
     }
+
+    fn wait_write(&self, handle: DeferredWrite) -> anyhow::Result<()> {
+        pwrite_exact(
+            handle.fd,
+            handle.dram_base as *const u8,
+            leg_len(handle.size)?,
+        )
+    }
+}
+
+/// A loopback write leg captured at post time and performed at wait time.
+pub struct DeferredWrite {
+    dram_base: usize,
+    fd: RawFd,
+    size: u64,
 }

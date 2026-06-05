@@ -227,17 +227,36 @@ impl NixlAgent {
         self.run_leg(XferOp::Write, &local, &remote, peer, &self.ucx)
     }
 
-    /// Local storage leg: write exactly `size` bytes of the registered host
-    /// buffer down to a registered file via POSIX.
-    pub fn write_dram_to_file(
+    /// Local storage leg, posted (non-blocking): begin writing `size` bytes of
+    /// the registered host buffer down to a registered file via POSIX. Returns
+    /// the in-flight request to await with [`NixlAgent::wait_write`]; the puller
+    /// posts the next shard's receive while this write drains (the double-buffer).
+    pub fn post_write_dram_to_file(
         &self,
         dram_base: usize,
         fd: RawFd,
         size: u64,
-    ) -> Result<(), NixlError> {
+    ) -> Result<XferRequest, NixlError> {
         let dram = Self::chunk_dlist(MemType::Dram, dram_base, size, 0)?;
         let file = Self::chunk_dlist(MemType::File, 0, size, u64::try_from(fd).unwrap_or(0))?;
-        self.run_leg(XferOp::Write, &dram, &file, &self.name.clone(), &self.posix)
+        let mut opt = OptArgs::new()?;
+        opt.add_backend(&self.posix)?;
+        let req =
+            self.agent
+                .create_xfer_req(XferOp::Write, &dram, &file, &self.name, Some(&opt))?;
+        self.agent.post_xfer_req(&req, Some(&opt))?;
+        Ok(req)
+    }
+
+    /// Block until a write posted by [`NixlAgent::post_write_dram_to_file`]
+    /// completes.
+    pub fn wait_write(&self, req: XferRequest) -> Result<(), NixlError> {
+        loop {
+            if self.agent.get_xfer_status(&req)?.is_success() {
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_micros(50));
+        }
     }
 
     /// Build a transfer descriptor list covering exactly `size` bytes from
@@ -296,6 +315,8 @@ fn ax<T>(r: Result<T, NixlError>) -> anyhow::Result<T> {
 // Each method delegates to the inherent method of the same name (inherent
 // methods take priority in resolution), converting the error.
 impl super::Transport for NixlAgent {
+    type WriteHandle = XferRequest;
+
     fn name(&self) -> &str {
         self.name()
     }
@@ -338,7 +359,16 @@ impl super::Transport for NixlAgent {
         ax(self.write_dram_to_peer(dram_base, peer_base, peer, size))
     }
 
-    fn write_dram_to_file(&self, dram_base: usize, fd: RawFd, size: u64) -> anyhow::Result<()> {
-        ax(self.write_dram_to_file(dram_base, fd, size))
+    fn post_write_dram_to_file(
+        &self,
+        dram_base: usize,
+        fd: RawFd,
+        size: u64,
+    ) -> anyhow::Result<XferRequest> {
+        ax(self.post_write_dram_to_file(dram_base, fd, size))
+    }
+
+    fn wait_write(&self, handle: XferRequest) -> anyhow::Result<()> {
+        ax(self.wait_write(handle))
     }
 }

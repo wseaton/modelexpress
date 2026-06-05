@@ -143,8 +143,16 @@ pub enum Role {
 /// the [`buffer::StagingBuffer`] and the open shard files; the transport only
 /// moves bytes between them. The three legs mirror the active-stager pattern:
 /// `read_file_to_dram` (POSIX) -> `write_dram_to_peer` (UCX/RDMA) on the stager,
-/// then `write_dram_to_file` (POSIX) on the puller.
+/// then the puller's POSIX write leg, which is split into post/wait
+/// (`post_write_dram_to_file` -> `wait_write`) so the puller can overlap one
+/// shard's NVMe write with the next shard's RDMA receive (the double-buffer).
 pub trait Transport {
+    /// A posted-but-not-yet-complete write leg, returned by
+    /// [`Transport::post_write_dram_to_file`] and awaited by
+    /// [`Transport::wait_write`]. Opaque so each transport carries whatever it
+    /// needs (NIXL keeps the in-flight request; the loopback keeps the args).
+    type WriteHandle;
+
     /// This agent's NIXL name.
     fn name(&self) -> &str;
 
@@ -182,9 +190,21 @@ pub trait Transport {
         size: u64,
     ) -> anyhow::Result<()>;
 
-    /// Storage leg: write exactly `size` bytes of the staging buffer down to a
-    /// registered file.
-    fn write_dram_to_file(&self, dram_base: usize, fd: RawFd, size: u64) -> anyhow::Result<()>;
+    /// Storage leg, posted (non-blocking): begin writing exactly `size` bytes of
+    /// the staging buffer at `dram_base` down to a registered file, returning a
+    /// handle to await later. The `dram_base` region MUST stay intact until the
+    /// returned handle is passed to [`Transport::wait_write`]; the puller's slot
+    /// discipline guarantees that.
+    fn post_write_dram_to_file(
+        &self,
+        dram_base: usize,
+        fd: RawFd,
+        size: u64,
+    ) -> anyhow::Result<Self::WriteHandle>;
+
+    /// Block until a write posted by [`Transport::post_write_dram_to_file`]
+    /// completes.
+    fn wait_write(&self, handle: Self::WriteHandle) -> anyhow::Result<()>;
 }
 
 /// Throughput in GB/s (decimal) for moving `bytes` in `dur`. Used for the
