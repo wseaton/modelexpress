@@ -10,9 +10,12 @@
 //! ConfigMap - re-read every pass, so editing the ConfigMap reconverges the
 //! fleet with no restart). A CRD/label-backed source is a later concern.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use modelexpress_common::models::ModelProvider;
+use notify::{RecommendedWatcher, RecursiveMode, Watcher};
+use tokio::sync::Notify;
 
 /// One model the node should hold. The cache daemon is HuggingFace-only in v1
 /// (the [`crate::cache::locator::HfLocator`] resolves the on-disk layout), so
@@ -149,6 +152,36 @@ impl DesiredSet for FileDesiredSet {
     }
 }
 
+/// Watch the desired-set file for changes and signal `on_change` whenever it is
+/// touched, so the reconcile loop can converge immediately instead of waiting
+/// for its next interval tick. Returns the watcher guard; the caller must keep
+/// it alive (dropping it stops the watch).
+///
+/// We watch the file's *parent directory*, not the file itself. A mounted K8s
+/// ConfigMap is not a plain file: the kubelet stages new content in a timestamped
+/// directory and atomically swaps a `..data` symlink
+/// (`models -> ..data/models -> ..2026_.../models`). An inotify watch on the file
+/// inode would go deaf after that swap (the old inode is now orphaned), whereas a
+/// directory watch keeps firing across swaps. Reads through the symlink are always
+/// atomic, so a reconcile triggered by an event sees complete content.
+pub fn watch_desired_file(
+    path: &Path,
+    on_change: Arc<Notify>,
+) -> notify::Result<RecommendedWatcher> {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+        match res {
+            // Any event in the directory may be the ConfigMap swap; let the
+            // reconcile loop re-read and diff. `notify_one` coalesces a burst of
+            // events into a single pass.
+            Ok(_) => on_change.notify_one(),
+            Err(e) => tracing::warn!(error = %e, "desired-set watcher error"),
+        }
+    })?;
+    watcher.watch(dir, RecursiveMode::NonRecursive)?;
+    Ok(watcher)
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
@@ -226,5 +259,23 @@ mod tests {
         // Re-reads each call: a ConfigMap edit is picked up without restart.
         std::fs::write(&path, "google-t5/t5-small\nQwen/Qwen2.5-7B\n").expect("rewrite");
         assert_eq!(set.desired().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn watch_signals_on_file_change() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("models");
+        std::fs::write(&path, "google-t5/t5-small\n").expect("seed");
+
+        let changed = Arc::new(Notify::new());
+        // Keep the guard alive for the duration of the test.
+        let _watcher = watch_desired_file(&path, changed.clone()).expect("watch");
+
+        // Editing the file must wake the waiter. A generous timeout absorbs
+        // filesystem-event latency without flaking on a loaded CI box.
+        std::fs::write(&path, "google-t5/t5-small\nQwen/Qwen2.5-7B\n").expect("edit");
+        tokio::time::timeout(std::time::Duration::from_secs(5), changed.notified())
+            .await
+            .expect("watcher did not fire on file change");
     }
 }

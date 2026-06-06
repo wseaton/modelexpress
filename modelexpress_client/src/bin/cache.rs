@@ -19,6 +19,8 @@
 //! talks to the registry. In `--reconcile` the serve agent and the per-pull
 //! agent are co-resident in one process.
 
+#[cfg(feature = "nixl")]
+use std::ops::ControlFlow;
 use std::path::PathBuf;
 
 use clap::Parser;
@@ -369,10 +371,13 @@ async fn run_reconcile(cli: &Cli) -> anyhow::Result<()> {
     use std::time::Duration;
 
     use modelexpress_client::cache::advertise;
-    use modelexpress_client::cache::desired::{DesiredSet, FileDesiredSet, StaticDesiredSet};
+    use modelexpress_client::cache::desired::{
+        DesiredSet, FileDesiredSet, StaticDesiredSet, watch_desired_file,
+    };
     use modelexpress_client::cache::reconcile::{NixlFetcher, Reconciler};
     use modelexpress_client::cache::registry::Registry;
     use modelexpress_common::grpc::p2p::SourceStatus;
+    use tokio::sync::Notify;
 
     if cli.models.is_empty() && cli.models_file.is_none() {
         anyhow::bail!("--reconcile needs --model or --models-file");
@@ -382,6 +387,25 @@ async fn run_reconcile(cli: &Cli) -> anyhow::Result<()> {
     let desired_set: Box<dyn DesiredSet> = match &cli.models_file {
         Some(path) => Box::new(FileDesiredSet::new(path.clone())),
         None => Box::new(StaticDesiredSet::from_models(cli.models.clone())),
+    };
+
+    // Watch the desired-set file so a ConfigMap edit reconverges in ~1s instead
+    // of waiting up to a full interval. The interval tick stays as the backstop
+    // (peers going STALE, transient pull failures). A failed watch setup is
+    // non-fatal: we just fall back to interval-only reconciliation.
+    let changed = Arc::new(Notify::new());
+    let _watcher = match &cli.models_file {
+        Some(path) => match watch_desired_file(path, changed.clone()) {
+            Ok(w) => {
+                tracing::info!(path = %path.display(), "watching desired-set file for changes");
+                Some(w)
+            }
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "failed to watch desired-set file; interval-only");
+                None
+            }
+        },
+        None => None,
     };
     let cache_root = cache_root(cli)?;
     let stop = Arc::new(AtomicBool::new(false));
@@ -455,18 +479,23 @@ async fn run_reconcile(cli: &Cli) -> anyhow::Result<()> {
     let mut tick = tokio::time::interval(Duration::from_secs(cli.reconcile_secs));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
-        tokio::select! {
+        let flow = tokio::select! {
             _ = tick.tick() => {
-                // Re-read the desired set each pass so ConfigMap edits take effect.
-                let desired = desired_set.desired();
-                if let Err(e) = reconciler
-                    .reconcile_once(&desired, &fetcher, &advertised)
-                    .await
-                {
-                    tracing::warn!(error = %e, "reconcile pass failed; retrying next interval");
-                }
+                reconcile_pass(&mut reconciler, desired_set.as_ref(), &fetcher, &advertised).await;
+                ControlFlow::Continue(())
             }
-            _ = &mut shutdown => break,
+            _ = changed.notified() => {
+                // Coalesce the kubelet's symlink-swap burst (and any rapid edits)
+                // into a single pass before re-reading.
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                tracing::info!("desired-set file changed; reconciling now");
+                reconcile_pass(&mut reconciler, desired_set.as_ref(), &fetcher, &advertised).await;
+                ControlFlow::Continue(())
+            }
+            _ = &mut shutdown => ControlFlow::Break(()),
+        };
+        if flow.is_break() {
+            break;
         }
     }
 
@@ -479,6 +508,25 @@ async fn run_reconcile(cli: &Cli) -> anyhow::Result<()> {
         .join()
         .map_err(|_| anyhow::anyhow!("serve thread panicked"))??;
     Ok(())
+}
+
+/// One reconcile pass: snapshot the (re-read) desired set and converge toward it.
+/// Shared by the interval tick and the file-change trigger so both paths behave
+/// identically. A pass failure is logged, not propagated: the loop retries.
+#[cfg(feature = "nixl")]
+async fn reconcile_pass(
+    reconciler: &mut modelexpress_client::cache::reconcile::Reconciler,
+    desired_set: &dyn modelexpress_client::cache::desired::DesiredSet,
+    fetcher: &modelexpress_client::cache::reconcile::NixlFetcher,
+    advertised: &std::sync::Mutex<std::collections::HashMap<String, String>>,
+) {
+    let desired = desired_set.desired();
+    if let Err(e) = reconciler
+        .reconcile_once(&desired, fetcher, advertised)
+        .await
+    {
+        tracing::warn!(error = %e, "reconcile pass failed; retrying next interval");
+    }
 }
 
 #[cfg(not(feature = "nixl"))]
