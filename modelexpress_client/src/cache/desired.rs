@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use modelexpress_common::models::ModelProvider;
 
 /// One model the node should hold. The cache daemon is HuggingFace-only in v1
-/// (the [`crate::cached::locator::HfLocator`] resolves the on-disk layout), so
+/// (the [`crate::cache::locator::HfLocator`] resolves the on-disk layout), so
 /// the provider is fixed; the type carries it explicitly so widening to other
 /// providers later is a data change, not a control-flow change.
 #[derive(Debug, Clone, PartialEq, Eq)]

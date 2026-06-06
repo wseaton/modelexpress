@@ -46,8 +46,8 @@ name = "modelexpress-cli"
 path = "src/bin/cli.rs"
 
 [[bin]]
-name = "modelexpress-cached"
-path = "src/bin/cached.rs"
+name = "modelexpress-cache"
+path = "src/bin/cache.rs"
 
 [features]
 # Enables the NIXL FFI transport (the stager/puller RDMA transfer legs). Off by

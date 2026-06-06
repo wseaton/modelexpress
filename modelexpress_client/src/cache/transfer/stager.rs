@@ -215,7 +215,7 @@ impl<'a, T: Transport, L: ModelLocator> CacheServer<'a, T, L> {
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::cached::transfer::loopback::{Fabric, Loopback, MapLocator};
+    use crate::cache::transfer::loopback::{Fabric, Loopback, MapLocator};
 
     #[test]
     fn pull_before_manifest_request_errors() {

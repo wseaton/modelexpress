@@ -347,9 +347,9 @@ impl<'a, T: Transport> Puller<'a, T> {
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::cached::transfer::cache_layout;
-    use crate::cached::transfer::loopback::{Fabric, Loopback, MapLocator};
-    use crate::cached::transfer::stager::CacheServer;
+    use crate::cache::transfer::cache_layout;
+    use crate::cache::transfer::loopback::{Fabric, Loopback, MapLocator};
+    use crate::cache::transfer::stager::CacheServer;
     use std::collections::HashMap;
     use std::path::Path;
     use std::sync::atomic::{AtomicBool, Ordering};

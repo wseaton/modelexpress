@@ -32,7 +32,7 @@ fn resolve_worker_id(pod_name: Option<String>, hostname: Option<String>) -> Stri
     pod_name
         .filter(|s| !s.is_empty())
         .or_else(|| hostname.filter(|s| !s.is_empty()))
-        .unwrap_or_else(|| "mx-cached".to_string())
+        .unwrap_or_else(|| "mx-cache".to_string())
 }
 
 fn gethostname() -> Option<String> {
@@ -124,7 +124,7 @@ mod tests {
             "host-1",
             "empty pod name is ignored"
         );
-        assert_eq!(resolve_worker_id(None, None), "mx-cached");
+        assert_eq!(resolve_worker_id(None, None), "mx-cache");
     }
 
     #[test]

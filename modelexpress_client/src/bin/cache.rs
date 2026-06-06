@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! `modelexpress-cached`: the self-healing cache daemon.
+//! `modelexpress-cache`: the self-healing cache daemon.
 //!
 //! Three modes:
 //! - `--serve --model <m>...`: advertise the held models to the P2P registry and
@@ -26,7 +26,7 @@ use clap::Parser;
 /// Self-healing cache daemon: reconciles the local cache toward a desired set by
 /// pulling missing models from peers over RDMA, and serves its own cache out.
 #[derive(Debug, Parser)]
-#[command(name = "modelexpress-cached", version, about)]
+#[command(name = "modelexpress-cache", version, about)]
 struct Cli {
     /// Advertise and serve the named models to peers.
     #[arg(long)]
@@ -51,23 +51,19 @@ struct Cli {
     /// `model@revision` per line, `#` comments allowed), re-read every pass so a
     /// mounted ConfigMap can be edited to reconverge the fleet without a restart.
     /// Takes precedence over `--model` when set.
-    #[arg(long, env = "MODEL_EXPRESS_CACHED_MODELS_FILE")]
+    #[arg(long, env = "MODEL_EXPRESS_CACHE_MODELS_FILE")]
     models_file: Option<PathBuf>,
 
     /// Seconds between reconcile passes in `--reconcile` mode.
-    #[arg(
-        long,
-        env = "MODEL_EXPRESS_CACHED_RECONCILE_SECS",
-        default_value_t = 60
-    )]
+    #[arg(long, env = "MODEL_EXPRESS_CACHE_RECONCILE_SECS", default_value_t = 60)]
     reconcile_secs: u64,
 
     /// NIXL agent name for this process.
-    #[arg(long, default_value = "mx-cached")]
+    #[arg(long, default_value = "mx-cache")]
     name: String,
 
     /// NIXL listen port for the serving agent.
-    #[arg(long, env = "MODEL_EXPRESS_CACHED_NIXL_PORT", default_value_t = 7000)]
+    #[arg(long, env = "MODEL_EXPRESS_CACHE_NIXL_PORT", default_value_t = 7000)]
     nixl_port: u16,
 
     /// P2P registry endpoint (the ModelExpress server).
@@ -79,21 +75,21 @@ struct Cli {
     endpoint: String,
 
     /// Bounded staging-buffer size in GiB (the DRAM cap for a transfer).
-    #[arg(long, env = "MODEL_EXPRESS_CACHED_BUF_GIB", default_value_t = 4)]
+    #[arg(long, env = "MODEL_EXPRESS_CACHE_BUF_GIB", default_value_t = 4)]
     buf_gib: u32,
 
     /// Receive pipeline depth: the staging buffer is carved into this many slots
     /// so a shard's NVMe write overlaps the next shard's RDMA receive. Each slot
     /// must hold the largest shard, so raising depth needs proportionally more
     /// `--buf-gib`. 2 is the validated double-buffer.
-    #[arg(long, env = "MODEL_EXPRESS_CACHED_POOL_DEPTH", default_value_t = 2)]
+    #[arg(long, env = "MODEL_EXPRESS_CACHE_POOL_DEPTH", default_value_t = 2)]
     pool_depth: usize,
 
     /// Write pulled files with `O_DIRECT`, bypassing the page cache. Much faster
     /// for the sustained large writes the puller does (block-aligned, with the
     /// partial tail truncated back). Requires a filesystem that supports
     /// `O_DIRECT` (real NVMe does; tmpfs does not).
-    #[arg(long, env = "MODEL_EXPRESS_CACHED_O_DIRECT")]
+    #[arg(long, env = "MODEL_EXPRESS_CACHE_O_DIRECT")]
     o_direct: bool,
 
     /// Local model cache root. Defaults to the standard ModelExpress cache
@@ -191,8 +187,8 @@ fn start_serve_thread(
     cache_root: PathBuf,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> anyhow::Result<(std::thread::JoinHandle<anyhow::Result<()>>, Vec<u8>)> {
-    use modelexpress_client::cached::locator::HfLocator;
-    use modelexpress_client::cached::transfer::{nixl::NixlAgent, stager::CacheServer};
+    use modelexpress_client::cache::locator::HfLocator;
+    use modelexpress_client::cache::transfer::{nixl::NixlAgent, stager::CacheServer};
 
     let (md_tx, md_rx) = std::sync::mpsc::channel::<anyhow::Result<Vec<u8>>>();
     let serve_thread = std::thread::spawn(move || -> anyhow::Result<()> {
@@ -239,9 +235,9 @@ async fn run_serve(cli: &Cli) -> anyhow::Result<()> {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    use modelexpress_client::cached::advertise;
-    use modelexpress_client::cached::locator::locate_hf;
-    use modelexpress_client::cached::registry::Registry;
+    use modelexpress_client::cache::advertise;
+    use modelexpress_client::cache::locator::locate_hf;
+    use modelexpress_client::cache::registry::Registry;
     use modelexpress_common::grpc::p2p::SourceStatus;
 
     if cli.models.is_empty() {
@@ -311,9 +307,9 @@ async fn run_serve(cli: &Cli) -> anyhow::Result<()> {
 async fn run_pull(cli: &Cli) -> anyhow::Result<()> {
     use anyhow::Context;
 
-    use modelexpress_client::cached::registry::Registry;
-    use modelexpress_client::cached::transfer::{nixl::NixlAgent, puller::Puller};
-    use modelexpress_client::cached::{advertise, discover};
+    use modelexpress_client::cache::registry::Registry;
+    use modelexpress_client::cache::transfer::{nixl::NixlAgent, puller::Puller};
+    use modelexpress_client::cache::{advertise, discover};
     use modelexpress_common::cache::resolve_model_path;
     use modelexpress_common::models::ModelProvider;
 
@@ -372,10 +368,10 @@ async fn run_reconcile(cli: &Cli) -> anyhow::Result<()> {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
-    use modelexpress_client::cached::advertise;
-    use modelexpress_client::cached::desired::{DesiredSet, FileDesiredSet, StaticDesiredSet};
-    use modelexpress_client::cached::reconcile::{NixlFetcher, Reconciler};
-    use modelexpress_client::cached::registry::Registry;
+    use modelexpress_client::cache::advertise;
+    use modelexpress_client::cache::desired::{DesiredSet, FileDesiredSet, StaticDesiredSet};
+    use modelexpress_client::cache::reconcile::{NixlFetcher, Reconciler};
+    use modelexpress_client::cache::registry::Registry;
     use modelexpress_common::grpc::p2p::SourceStatus;
 
     if cli.models.is_empty() && cli.models_file.is_none() {

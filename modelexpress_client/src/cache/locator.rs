@@ -2,11 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Resolve a model name to the on-disk snapshot the node holds, so the
-//! [`crate::cached::transfer::stager::CacheServer`] can serve it.
+//! [`crate::cache::transfer::stager::CacheServer`] can serve it.
 
 use std::path::{Path, PathBuf};
 
-use crate::cached::transfer::stager::ModelLocator;
+use crate::cache::transfer::stager::ModelLocator;
 
 /// Locates HuggingFace models in a ModelExpress cache root, matching the layout
 /// the download path produces (`models--<org>--<name>/snapshots/<rev>/`).

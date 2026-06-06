@@ -3,7 +3,7 @@
 
 //! Peer discovery: turn a model identity into a NIXL metadata blob to pull from,
 //! via the P2P registry. This replaces the hand-passed `HOLDER_MD` of the spike;
-//! the blob feeds straight into [`crate::cached::transfer::puller::Puller::pull`].
+//! the blob feeds straight into [`crate::cache::transfer::puller::Puller::pull`].
 //!
 //! Selection spreads load across the READY holders instead of always taking the
 //! first: each node walks the holder list starting from a deterministic offset

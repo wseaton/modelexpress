@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Dedicated slim image for the modelexpress-cached daemon (self-healing NVMe
+# Dedicated slim image for the modelexpress-cache daemon (self-healing NVMe
 # model-weight cache). GPU-less and Python-free: a CPU-only UCX + NIXL (UCX +
 # POSIX backends) and one Rust binary on a Debian-slim runtime with rdma-core.
 #
@@ -75,7 +75,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 ARG CARGO_FEATURES=""
 WORKDIR /src
 COPY . .
-RUN cargo build --release -p modelexpress-client --bin modelexpress-cached \
+RUN cargo build --release -p modelexpress-client --bin modelexpress-cache \
         $( [ -n "${CARGO_FEATURES}" ] && echo --features "${CARGO_FEATURES}" )
 
 # ---------------------------------------------------------------- runtime ------
@@ -86,10 +86,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=libs /opt/ucx /opt/ucx
 COPY --from=libs /opt/nixl /opt/nixl
-COPY --from=rust /src/target/release/modelexpress-cached /usr/local/bin/modelexpress-cached
+COPY --from=rust /src/target/release/modelexpress-cache /usr/local/bin/modelexpress-cache
 # NIXL installs to the Debian multiarch libdir; UCX (autotools) to plain lib.
 ENV LD_LIBRARY_PATH=/opt/nixl/lib/x86_64-linux-gnu:/opt/ucx/lib \
     UCX_PREFIX=/opt/ucx \
     NIXL_PREFIX=/opt/nixl \
     NIXL_PLUGIN_DIR=/opt/nixl/lib/x86_64-linux-gnu/plugins
-ENTRYPOINT ["/usr/local/bin/modelexpress-cached"]
+ENTRYPOINT ["/usr/local/bin/modelexpress-cache"]

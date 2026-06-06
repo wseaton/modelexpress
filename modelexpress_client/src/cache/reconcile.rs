@@ -277,7 +277,7 @@ impl Fetcher for NixlFetcher {
         holder_md: Vec<u8>,
         dest_root: &Path,
     ) -> anyhow::Result<()> {
-        use crate::cached::transfer::{nixl::NixlAgent, puller::Puller};
+        use crate::cache::transfer::{nixl::NixlAgent, puller::Puller};
         use modelexpress_common::cache::resolve_model_path;
         use modelexpress_common::models::ModelProvider;
 

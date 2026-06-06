@@ -26,14 +26,14 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Once};
 use std::time::Duration;
 
-use modelexpress_client::cached::desired::ModelSpec;
-use modelexpress_client::cached::locator::HfLocator;
-use modelexpress_client::cached::reconcile::{Fetcher, Reconciler};
-use modelexpress_client::cached::registry::Registry;
-use modelexpress_client::cached::transfer::loopback::{Fabric, Loopback};
-use modelexpress_client::cached::transfer::puller::Puller;
-use modelexpress_client::cached::transfer::stager::CacheServer;
-use modelexpress_client::cached::{advertise, discover};
+use modelexpress_client::cache::desired::ModelSpec;
+use modelexpress_client::cache::locator::HfLocator;
+use modelexpress_client::cache::reconcile::{Fetcher, Reconciler};
+use modelexpress_client::cache::registry::Registry;
+use modelexpress_client::cache::transfer::loopback::{Fabric, Loopback};
+use modelexpress_client::cache::transfer::puller::Puller;
+use modelexpress_client::cache::transfer::stager::CacheServer;
+use modelexpress_client::cache::{advertise, discover};
 use modelexpress_common::cache::resolve_model_path;
 use modelexpress_common::grpc::p2p::worker_metadata::BackendMetadata;
 use modelexpress_common::models::ModelProvider;
@@ -415,7 +415,7 @@ async fn reconcile_deregister_marks_sources_stale() {
     // (no fetch); the fetcher is present but never called.
     let cache = tempfile::tempdir().expect("cache");
     write_fixture_model(cache.path());
-    modelexpress_client::cached::reconcile::ensure_complete(cache.path(), MODEL).expect("complete");
+    modelexpress_client::cache::reconcile::ensure_complete(cache.path(), MODEL).expect("complete");
 
     let fetcher = LoopbackFetcher {
         fabric: Fabric::default(),
