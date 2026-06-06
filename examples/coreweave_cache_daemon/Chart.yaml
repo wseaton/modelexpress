@@ -1,0 +1,20 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+apiVersion: v2
+name: modelexpress-cache-daemon
+description: >-
+  CoreWeave DaemonSet running the ModelExpress self-healing NVMe cache
+  reconciler (modelexpress-cache --reconcile) on each node: every node
+  converges its node-local cache toward a ConfigMap-declared model set, pulling
+  missing models from a peer over RDMA (or origin when none holds it) and
+  advertising what it holds so others pull from it.
+type: application
+version: 0.1.0
+appVersion: "0.5.0"
+keywords:
+  - model-cache
+  - daemonset
+  - rdma
+  - coreweave
+home: https://github.com/ai-dynamo/modelexpress/

@@ -1,0 +1,35 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# CoreWeave (Waldorf) overlay. Layer on top of values.yaml:
+#   helm install mx-cache examples/coreweave_cache_daemon \
+#     -f examples/coreweave_cache_daemon/values-coreweave.yaml \
+#     --set image.tag=<built-tag> \
+#     --set-json 'nodeSelector={"kubernetes.io/hostname":"gd91fda"}'
+
+# RDMA is exposed as the rdma/ib device-plugin resource (no Multus).
+rdmaResource: "rdma/ib"
+rdmaCount: 1
+
+# Pods run out-of-mesh: RDMA traffic cannot traverse the istio sidecar.
+istioInject: false
+
+# Node-local NVMe is a RAID0 emptyDir at /scratch (single-stream write ~2 GB/s).
+# Use hostPath for a cache that survives daemon restarts / is shared with
+# co-located consumers.
+cache:
+  mountPath: /scratch
+  subdir: hf/hub
+  hostPath: ""
+
+# Size the buffer for ~4-5 GB safetensors shards (depth 2 -> 6 GiB slots) and the
+# memory limit to hold it.
+reconcile:
+  bufGiB: 12
+  poolDepth: 2
+  oDirect: true
+
+resources:
+  limits:
+    cpu: "8"
+    memory: 32Gi

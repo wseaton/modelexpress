@@ -1,0 +1,65 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Generic, cluster-agnostic defaults for the cache-daemon DaemonSet. The fabric-
+# and site-specific knobs (RDMA resource, out-of-mesh, node sizing) default to
+# neutral values here; a cluster overlay sets them - see values-coreweave.yaml.
+
+image:
+  repository: quay.io/wseaton/modelexpress-cache
+  # Set to a built, date-stamped tag (the floating :dev tag is unsafe on
+  # containerd, which caches by tag). e.g. dev-20260605-165937.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+# The ModelExpress server (P2P registry) the reconcilers publish to and discover
+# peers through. Only the registry needs TCP reachability; the data path is RDMA.
+registryEndpoint: "http://modelexpress-server:8001"
+
+# Desired models, rendered one per line into the mounted ConfigMap. Edit and the
+# fleet reconverges with no restart (the daemon watches the file via inotify and
+# reconverges within ~1s; the interval pass below is a backstop).
+# Entries are `model` or `model@revision`.
+models:
+  - google-t5/t5-small
+
+# Reconciler tuning. bufGiB must hold the largest shard per slot, so at
+# poolDepth 2 each slot is bufGiB/2 GiB; raise it (and `resources.limits.memory`)
+# for models with large safetensors shards. oDirect + the daemon's BLAKE3 hashing
+# reach the single-stream write ceiling on real NVMe.
+reconcile:
+  intervalSeconds: 60
+  bufGiB: 4
+  poolDepth: 2
+  oDirect: true
+  nixlPort: 7000
+  logLevel: "info"
+
+# Node-local cache volume. emptyDir is wiped when the daemon pod restarts (the
+# node then re-pulls everything); set hostPath to a node NVMe path to persist the
+# warm cache across restarts and for co-located consumers.
+cache:
+  mountPath: /scratch
+  subdir: hf/hub
+  hostPath: ""
+
+# RDMA device-plugin resource. Empty = none requested (e.g. clusters that wire
+# RDMA via Multus annotations instead); set it for device-plugin clusters.
+rdmaResource: ""
+rdmaCount: 1
+
+# Emit `sidecar.istio.io/inject` on the pods. RDMA cannot traverse an istio
+# sidecar, so meshed clusters must set this false.
+istioInject: false
+
+# Pin the daemon to the nodes whose NVMe should be warmed.
+nodeSelector: {}
+tolerations: []
+podAnnotations: {}
+
+resources:
+  limits:
+    cpu: "4"
+    memory: 8Gi

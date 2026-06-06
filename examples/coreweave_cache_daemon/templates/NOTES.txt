@@ -1,0 +1,19 @@
+{{ include "cache-daemon.fullname" . }} is rolling out a cache reconciler on each
+selected node.
+
+Desired models ({{ len .Values.models }}):
+{{- range .Values.models }}
+  - {{ . }}
+{{- end }}
+
+Registry: {{ .Values.registryEndpoint }}
+
+Watch the fleet converge:
+  kubectl -n {{ .Release.Namespace }} get pods -l app.kubernetes.io/instance={{ .Release.Name }} -o wide
+  kubectl -n {{ .Release.Namespace }} logs -l app.kubernetes.io/instance={{ .Release.Name }} --tail=20 -f
+
+Each node should log "model converged into local cache" (source=Peer once a peer
+holds it, else source=Origin) then "advertised". Edit the model set live:
+  kubectl -n {{ .Release.Namespace }} edit configmap {{ include "cache-daemon.fullname" . }}-models
+The daemon watches the mounted file (inotify) and reconverges within ~1s of the
+edit; no restart needed. The {{ .Values.reconcile.intervalSeconds }}s pass is a backstop.

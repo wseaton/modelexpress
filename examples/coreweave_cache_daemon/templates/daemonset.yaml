@@ -1,0 +1,102 @@
+{{/*
+SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+*/}}
+{{- if not .Values.image.tag }}
+{{- fail "image.tag is required: set it to a built, date-stamped tag (the :dev floating tag is unsafe on containerd)." }}
+{{- end }}
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "cache-daemon.fullname" . }}
+  labels:
+    {{- include "cache-daemon.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "cache-daemon.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "cache-daemon.selectorLabels" . | nindent 8 }}
+      annotations:
+        sidecar.istio.io/inject: {{ .Values.istioInject | quote }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: reconcile
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - "--reconcile"
+            - "--models-file"
+            - "/etc/mx-cache/models"
+            # $(POD_NAME) is unique per node, so each node's NIXL agent name is
+            # distinct (peers key RDMA metadata by agent name).
+            - "--name"
+            - "$(POD_NAME)"
+            - "--cache-dir"
+            - "{{ .Values.cache.mountPath }}/{{ .Values.cache.subdir }}"
+            - "--nixl-port"
+            - "{{ .Values.reconcile.nixlPort }}"
+            - "--buf-gib"
+            - "{{ .Values.reconcile.bufGiB }}"
+            - "--pool-depth"
+            - "{{ .Values.reconcile.poolDepth }}"
+            - "--reconcile-secs"
+            - "{{ .Values.reconcile.intervalSeconds }}"
+            {{- if .Values.reconcile.oDirect }}
+            - "--o-direct"
+            {{- end }}
+          env:
+            - name: MODEL_EXPRESS_ENDPOINT
+              value: {{ .Values.registryEndpoint | quote }}
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: RUST_LOG
+              value: {{ .Values.reconcile.logLevel | quote }}
+          resources:
+            limits:
+              cpu: {{ .Values.resources.limits.cpu | quote }}
+              memory: {{ .Values.resources.limits.memory | quote }}
+              {{- if .Values.rdmaResource }}
+              {{ .Values.rdmaResource | quote }}: {{ .Values.rdmaCount }}
+              {{- end }}
+          volumeMounts:
+            - name: models
+              mountPath: /etc/mx-cache
+              readOnly: true
+            - name: cache
+              mountPath: {{ .Values.cache.mountPath | quote }}
+      volumes:
+        - name: models
+          configMap:
+            name: {{ include "cache-daemon.fullname" . }}-models
+        - name: cache
+          {{- if .Values.cache.hostPath }}
+          hostPath:
+            path: {{ .Values.cache.hostPath | quote }}
+            type: DirectoryOrCreate
+          {{- else }}
+          emptyDir: {}
+          {{- end }}

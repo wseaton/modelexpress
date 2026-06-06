@@ -1,0 +1,17 @@
+{{/*
+SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "cache-daemon.fullname" . }}-models
+  labels:
+    {{- include "cache-daemon.labels" . | nindent 4 }}
+data:
+  # One model per line; the daemon re-reads this every reconcile pass, so editing
+  # it (kubectl edit configmap / helm upgrade) reconverges the fleet, no restart.
+  models: |
+    {{- range .Values.models }}
+    {{ . }}
+    {{- end }}
