@@ -24,9 +24,10 @@
 //! [`ensure_complete`] stamps it after a successful fetch, unifying the
 //! completeness contract across both paths.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, anyhow};
 use modelexpress_common::grpc::p2p::SourceStatus;
@@ -38,6 +39,7 @@ use super::discover::discover_blob;
 use super::locator::{list_cached_models, locate_hf};
 use super::registry::Registry;
 use super::transfer::cache_layout;
+use super::usage::{AtimeUsage, UsageSignal};
 
 /// Where a model came from on a given reconcile pass. Returned so the daemon and
 /// tests can assert the path taken without parsing logs.
@@ -98,6 +100,15 @@ pub fn ensure_complete(cache_root: &Path, model: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Reclaim a model's disk: drop the completion sentinel first so it is instantly
+/// treated as absent and never served mid-delete, then remove the whole repo
+/// directory (`models--<org>--<name>`), not just the snapshot.
+fn evict_model(snapshot: &Path) -> std::io::Result<()> {
+    let _ = std::fs::remove_file(snapshot.join(cache_layout::COMPLETE_SENTINEL));
+    let repo = snapshot.parent().and_then(Path::parent).unwrap_or(snapshot);
+    std::fs::remove_dir_all(repo)
+}
+
 /// Drives the local cache toward a desired set against one P2P registry. Holds
 /// the static facts a pass needs (the cache root, the blob and identity to
 /// advertise under); the mutable `advertised` map lives with the caller so the
@@ -115,6 +126,18 @@ pub struct Reconciler {
     /// an externally-downloaded model is advertised only once it stops changing
     /// (see [`Reconciler::observe_local`]). Empty until auto-expand observes.
     observed: HashMap<String, (u64, u64)>,
+    /// Bounded (auto-expand) mode: gate advertising on demand and run GC. When
+    /// false the reconciler keeps Phase A behaviour (advertise everything
+    /// desired, never evict).
+    bounded: bool,
+    /// Local use signal feeding the demand TTL (bounded mode).
+    usage: Arc<dyn UsageSignal>,
+    /// A model not pinned and unused for this long stops being advertised, so it
+    /// decays out of the registry and other nodes stop wanting it.
+    demand_ttl: Duration,
+    /// A model touched within this window is never GC'd, a best-effort guard
+    /// against deleting something just pulled or in use.
+    gc_grace: Duration,
 }
 
 impl Reconciler {
@@ -134,6 +157,63 @@ impl Reconciler {
             metadata_endpoint: metadata_endpoint.into(),
             worker_id: worker_id.into(),
             observed: HashMap::new(),
+            bounded: false,
+            usage: Arc::new(AtimeUsage),
+            demand_ttl: Duration::MAX,
+            gc_grace: Duration::ZERO,
+        }
+    }
+
+    /// Turn on bounded (auto-expand) mode: advertise only pinned-or-recently-used
+    /// models so unused ones decay out of the fleet, and enable [`Reconciler::gc`].
+    pub fn with_bounding(
+        mut self,
+        usage: Arc<dyn UsageSignal>,
+        demand_ttl: Duration,
+        gc_grace: Duration,
+    ) -> Self {
+        self.bounded = true;
+        self.usage = usage;
+        self.demand_ttl = demand_ttl;
+        self.gc_grace = gc_grace;
+        self
+    }
+
+    /// Whether this node should keep `model` advertised: pinned in the base set,
+    /// or used locally within `demand_ttl`. A model present but neither pinned nor
+    /// recently used is held silently (no advertise) until it leaves the desired
+    /// set, then [`Reconciler::gc`] reclaims it.
+    fn is_wanted(&self, model: &str, pinned: &HashSet<String>) -> bool {
+        if pinned.contains(model) {
+            return true;
+        }
+        let Some((snapshot, _)) = locate_hf(&self.cache_root, model) else {
+            return false;
+        };
+        match self.usage.last_used(&snapshot) {
+            // A future timestamp (clock skew) reads as fresh, not stale.
+            Some(t) => SystemTime::now()
+                .duration_since(t)
+                .map(|age| age <= self.demand_ttl)
+                .unwrap_or(true),
+            None => false,
+        }
+    }
+
+    /// Mark one advertised source `STALE` so peers stop selecting it before the
+    /// reaper's timeout. Used when a model's demand decays or it is evicted.
+    async fn deregister_one(&mut self, source_id: &str) {
+        if let Err(e) = self
+            .registry
+            .update_status(
+                source_id.to_string(),
+                0,
+                SourceStatus::Stale,
+                self.worker_id.clone(),
+            )
+            .await
+        {
+            tracing::warn!(source_id, error = %e, "deregister failed; reaper will reap");
         }
     }
 
@@ -147,9 +227,13 @@ impl Reconciler {
         desired: &[ModelSpec],
         fetcher: &dyn Fetcher,
         advertised: &Mutex<HashMap<String, String>>,
+        pinned: &HashSet<String>,
     ) -> anyhow::Result<()> {
         for spec in desired {
-            if let Err(e) = self.reconcile_model(spec, fetcher, advertised).await {
+            if let Err(e) = self
+                .reconcile_model(spec, fetcher, advertised, pinned)
+                .await
+            {
                 tracing::warn!(model = %spec.model, error = %e, "reconcile failed; will retry next pass");
             }
         }
@@ -161,12 +245,10 @@ impl Reconciler {
         spec: &ModelSpec,
         fetcher: &dyn Fetcher,
         advertised: &Mutex<HashMap<String, String>>,
+        pinned: &HashSet<String>,
     ) -> anyhow::Result<()> {
         let already_advertised = self.lock_advertised(advertised)?.contains_key(&spec.model);
         let present = is_present(&self.cache_root, &spec.model);
-        if present && already_advertised {
-            return Ok(());
-        }
 
         if !present {
             let source = self.fetch(spec, fetcher).await?;
@@ -174,10 +256,78 @@ impl Reconciler {
             info!(model = %spec.model, source = ?source, "model converged into local cache");
         }
 
-        let source_id = self.advertise(spec).await?;
-        self.lock_advertised(advertised)?
-            .insert(spec.model.clone(), source_id);
+        // Advertise only models this node keeps alive fleet-wide: when bounded,
+        // pinned-or-recently-used; otherwise everything desired (Phase A). A model
+        // whose demand has decayed is deregistered but kept on disk until it
+        // leaves the desired set, when `gc` reclaims it.
+        let want = !self.bounded || self.is_wanted(&spec.model, pinned);
+        match (want, already_advertised) {
+            (true, false) => {
+                let source_id = self.advertise(spec).await?;
+                self.lock_advertised(advertised)?
+                    .insert(spec.model.clone(), source_id);
+            }
+            (false, true) => {
+                let source_id = self.lock_advertised(advertised)?.remove(&spec.model);
+                if let Some(source_id) = source_id {
+                    self.deregister_one(&source_id).await;
+                    info!(model = %spec.model, "demand decayed; stopped advertising");
+                }
+            }
+            _ => {}
+        }
         Ok(())
+    }
+
+    /// Evict locally-held models the fleet no longer wants (bounded mode only). A
+    /// model is reclaimed when it is complete, not pinned, absent from the desired
+    /// set (so it has decayed out of the registry, no peer still advertises it),
+    /// and untouched within the grace window. Stops advertising it, drops the
+    /// completion sentinel so it is instantly unservable, then deletes the repo.
+    pub async fn gc(
+        &mut self,
+        desired: &[ModelSpec],
+        pinned: &HashSet<String>,
+        advertised: &Mutex<HashMap<String, String>>,
+    ) {
+        if !self.bounded {
+            return;
+        }
+        let desired_models: HashSet<&str> = desired.iter().map(|s| s.model.as_str()).collect();
+        for model in list_cached_models(&self.cache_root) {
+            if pinned.contains(&model) || desired_models.contains(model.as_str()) {
+                continue;
+            }
+            let Some((snapshot, _)) = locate_hf(&self.cache_root, &model) else {
+                continue;
+            };
+            // A mid-pull directory has no sentinel; leave it to the fetch path.
+            if !cache_layout::is_complete(&snapshot) {
+                continue;
+            }
+            // Grace: anything touched recently (just pulled or in use) is kept.
+            if let Some(t) = self.usage.last_used(&snapshot)
+                && SystemTime::now()
+                    .duration_since(t)
+                    .map(|age| age < self.gc_grace)
+                    .unwrap_or(true)
+            {
+                continue;
+            }
+            let source_id = advertised
+                .lock()
+                .ok()
+                .and_then(|mut map| map.remove(&model));
+            if let Some(source_id) = source_id {
+                self.deregister_one(&source_id).await;
+            }
+            match evict_model(&snapshot) {
+                Ok(()) => info!(model = %model, "evicted (demand decayed, no longer desired)"),
+                Err(e) => {
+                    tracing::warn!(model = %model, error = %e, "evict failed; will retry next pass")
+                }
+            }
+        }
     }
 
     /// Capture half of auto-expand: advertise models that appeared in the local
@@ -196,6 +346,7 @@ impl Reconciler {
     pub async fn observe_local(
         &mut self,
         advertised: &Mutex<HashMap<String, String>>,
+        pinned: &HashSet<String>,
     ) -> anyhow::Result<()> {
         for model in list_cached_models(&self.cache_root) {
             if self.lock_advertised(advertised)?.contains_key(&model) {
@@ -216,8 +367,14 @@ impl Reconciler {
                 cache_layout::mark_complete(&snapshot)?;
             }
             self.observed.remove(&model);
-            let source_id = self.advertise(&ModelSpec::new(model.clone())).await?;
-            self.lock_advertised(advertised)?.insert(model, source_id);
+            // A captured model is advertised only if wanted; a freshly-settled
+            // download is recently-touched, so under bounded mode it passes. A
+            // stale leftover that happens to settle is held silently, not
+            // advertised, and `gc` reclaims it once it leaves the desired set.
+            if !self.bounded || self.is_wanted(&model, pinned) {
+                let source_id = self.advertise(&ModelSpec::new(model.clone())).await?;
+                self.lock_advertised(advertised)?.insert(model, source_id);
+            }
         }
         Ok(())
     }

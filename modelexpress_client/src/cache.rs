@@ -38,3 +38,4 @@ pub mod locator;
 pub mod reconcile;
 pub mod registry;
 pub mod transfer;
+pub mod usage;

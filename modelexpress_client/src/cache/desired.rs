@@ -170,12 +170,12 @@ impl DesiredSet for FileDesiredSet {
 /// A registry query failure degrades to the base set for that pass (logged),
 /// not an error, so a transient server blip can't wipe the desired set.
 pub struct RegistryDesiredSet {
-    base: Box<dyn DesiredSet>,
+    base: Arc<dyn DesiredSet>,
     registry: crate::cache::registry::Registry,
 }
 
 impl RegistryDesiredSet {
-    pub fn new(base: Box<dyn DesiredSet>, registry: crate::cache::registry::Registry) -> Self {
+    pub fn new(base: Arc<dyn DesiredSet>, registry: crate::cache::registry::Registry) -> Self {
         Self { base, registry }
     }
 }

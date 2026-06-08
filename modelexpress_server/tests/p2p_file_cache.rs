@@ -165,7 +165,7 @@ async fn registry_desired_set_unions_base_with_advertised_models() {
     }
 
     // Base pins two models, one of which a peer also advertises (t5-small).
-    let base = Box::new(StaticDesiredSet::from_models([
+    let base = std::sync::Arc::new(StaticDesiredSet::from_models([
         "google-t5/t5-small",
         "org/base-only",
     ]));
@@ -230,7 +230,10 @@ async fn observe_local_advertises_settled_external_models() {
     let advertised = Mutex::new(HashMap::new());
 
     // First sight records a fingerprint but advertises nothing (not yet stable).
-    reconciler.observe_local(&advertised).await.expect("pass 1");
+    reconciler
+        .observe_local(&advertised, &std::collections::HashSet::new())
+        .await
+        .expect("pass 1");
     assert!(
         advertised.lock().expect("lock").is_empty(),
         "nothing advertised on first sight"
@@ -238,7 +241,10 @@ async fn observe_local_advertises_settled_external_models() {
 
     // Second pass: A is unchanged -> settled -> advertised + sentinel stamped.
     // B still has an .incomplete blob, so it stays out.
-    reconciler.observe_local(&advertised).await.expect("pass 2");
+    reconciler
+        .observe_local(&advertised, &std::collections::HashSet::new())
+        .await
+        .expect("pass 2");
     {
         let map = advertised.lock().expect("lock");
         assert!(
@@ -261,6 +267,149 @@ async fn observe_local_advertises_settled_external_models() {
     let models = reg2.list_ready_models().await.expect("list models");
     assert!(models.contains(&model_a.to_string()));
     assert!(!models.contains(&model_b.to_string()));
+
+    stop_and_join(shutdown, handle).await;
+}
+
+/// A [`Fetcher`] that must never be called: used by bounded-mode tests where the
+/// model is already present, so reconcile only exercises advertise/decay, not IO.
+struct NoFetch;
+
+#[tonic::async_trait]
+impl Fetcher for NoFetch {
+    async fn peer_pull(&self, _: &ModelSpec, _: Vec<u8>, _: &Path) -> anyhow::Result<()> {
+        anyhow::bail!("fetch must not run: model is present")
+    }
+    async fn origin(&self, _: &ModelSpec, _: &Path) -> anyhow::Result<()> {
+        anyhow::bail!("fetch must not run: model is present")
+    }
+}
+
+/// Lay down a complete model snapshot (HF layout + completion sentinel).
+fn write_complete_model(cache_root: &Path, model: &str) {
+    let snap = cache_root
+        .join(format!("models--{}", model.replace('/', "--")))
+        .join("snapshots")
+        .join("r1");
+    std::fs::create_dir_all(&snap).expect("mkdir");
+    std::fs::write(snap.join("config.json"), b"{}").expect("write");
+    modelexpress_client::cache::transfer::cache_layout::mark_complete(&snap).expect("sentinel");
+}
+
+/// Bounded mode demand decay: a model that is neither pinned nor recently used
+/// stops being advertised (deregistered out of READY), while a pinned one stays.
+#[tokio::test]
+async fn bounded_unused_model_stops_being_advertised() {
+    use modelexpress_client::cache::reconcile::{Reconciler, is_present};
+    use modelexpress_client::cache::usage::AtimeUsage;
+    use std::collections::HashSet;
+
+    let port = free_port();
+    let (shutdown, handle) = start_server(port);
+    let reg = registry_at(port).await;
+    let cache = tempfile::tempdir().expect("tempdir");
+
+    let model = "org/decays";
+    write_complete_model(cache.path(), model);
+
+    // demand_ttl = 0: nothing reads as recently used, so only pinning keeps it.
+    let mut reconciler = Reconciler::new(
+        reg.clone(),
+        cache.path().to_path_buf(),
+        vec![1, 2, 3],
+        "agent",
+        "10.0.0.1:7000",
+        "node-d",
+    )
+    .with_bounding(
+        std::sync::Arc::new(AtimeUsage),
+        Duration::from_secs(0),
+        Duration::from_secs(3600),
+    );
+    let advertised = Mutex::new(HashMap::new());
+    let desired = vec![ModelSpec::new(model)];
+
+    // Pinned -> advertised.
+    let pinned: HashSet<String> = [model.to_string()].into_iter().collect();
+    reconciler
+        .reconcile_once(&desired, &NoFetch, &advertised, &pinned)
+        .await
+        .expect("pass pinned");
+    assert!(
+        advertised.lock().expect("lock").contains_key(model),
+        "pinned model is advertised"
+    );
+
+    // Unpinned + unused -> deregistered; drops out of READY, but stays on disk.
+    reconciler
+        .reconcile_once(&desired, &NoFetch, &advertised, &HashSet::new())
+        .await
+        .expect("pass unpinned");
+    assert!(
+        !advertised.lock().expect("lock").contains_key(model),
+        "unused model stops being advertised"
+    );
+    assert!(
+        is_present(cache.path(), model),
+        "held silently, not evicted here"
+    );
+    let mut r = reg.clone();
+    let ready = r
+        .list_ready(advertise::file_cache_identity(model, ""))
+        .await
+        .expect("list");
+    assert!(ready.is_empty(), "deregistered source is not READY");
+
+    stop_and_join(shutdown, handle).await;
+}
+
+/// Bounded mode GC: a complete model that is not pinned and not in the desired
+/// set (it has decayed out of the registry) is evicted from disk; pinned and
+/// still-desired models are kept.
+#[tokio::test]
+async fn bounded_gc_evicts_decayed_models() {
+    use modelexpress_client::cache::reconcile::{Reconciler, is_present};
+    use modelexpress_client::cache::usage::AtimeUsage;
+    use std::collections::HashSet;
+
+    let port = free_port();
+    let (shutdown, handle) = start_server(port);
+    let reg = registry_at(port).await;
+    let cache = tempfile::tempdir().expect("tempdir");
+
+    for m in ["org/x-decayed", "org/p-pinned", "org/d-desired"] {
+        write_complete_model(cache.path(), m);
+    }
+
+    // grace = 0 so freshly-written fixtures are immediately eligible.
+    let mut reconciler = Reconciler::new(
+        reg.clone(),
+        cache.path().to_path_buf(),
+        vec![1, 2, 3],
+        "agent",
+        "10.0.0.1:7000",
+        "node-g",
+    )
+    .with_bounding(
+        std::sync::Arc::new(AtimeUsage),
+        Duration::from_secs(0),
+        Duration::from_secs(0),
+    );
+    let advertised = Mutex::new(HashMap::new());
+    let desired = vec![ModelSpec::new("org/d-desired")];
+    let pinned: HashSet<String> = ["org/p-pinned".to_string()].into_iter().collect();
+
+    reconciler.gc(&desired, &pinned, &advertised).await;
+
+    assert!(
+        !is_present(cache.path(), "org/x-decayed"),
+        "decayed + not desired -> evicted"
+    );
+    assert!(is_present(cache.path(), "org/p-pinned"), "pinned -> kept");
+    assert!(
+        is_present(cache.path(), "org/d-desired"),
+        "still desired -> kept"
+    );
 
     stop_and_join(shutdown, handle).await;
 }
@@ -436,7 +585,12 @@ async fn reconcile_peer_pull_self_heals_and_re_advertises() {
     let advertised = Mutex::new(HashMap::new());
     let desired = vec![ModelSpec::new(MODEL)];
     reconciler
-        .reconcile_once(&desired, &fetcher, &advertised)
+        .reconcile_once(
+            &desired,
+            &fetcher,
+            &advertised,
+            &std::collections::HashSet::new(),
+        )
         .await
         .expect("reconcile");
 
@@ -496,7 +650,12 @@ async fn reconcile_origin_fallback_converges_and_advertises() {
     let advertised = Mutex::new(HashMap::new());
     let desired = vec![ModelSpec::new(MODEL)];
     reconciler
-        .reconcile_once(&desired, &fetcher, &advertised)
+        .reconcile_once(
+            &desired,
+            &fetcher,
+            &advertised,
+            &std::collections::HashSet::new(),
+        )
         .await
         .expect("reconcile");
 
@@ -555,7 +714,12 @@ async fn reconcile_deregister_marks_sources_stale() {
     let advertised = Mutex::new(HashMap::new());
     let desired = vec![ModelSpec::new(MODEL)];
     reconciler
-        .reconcile_once(&desired, &fetcher, &advertised)
+        .reconcile_once(
+            &desired,
+            &fetcher,
+            &advertised,
+            &std::collections::HashSet::new(),
+        )
         .await
         .expect("reconcile");
 

@@ -67,6 +67,25 @@ struct Cli {
     #[arg(long, env = "MODEL_EXPRESS_CACHE_AUTO_EXPAND")]
     auto_expand: bool,
 
+    /// `--auto-expand` only: a model that is not pinned (in the base set) and has
+    /// not been used locally for this many seconds stops being advertised, decays
+    /// out of the registry, and is then evicted. Default 7 days.
+    #[arg(
+        long,
+        env = "MODEL_EXPRESS_CACHE_DEMAND_TTL_SECS",
+        default_value_t = 7 * 24 * 3600
+    )]
+    demand_ttl_secs: u64,
+
+    /// `--auto-expand` only: a model touched within this many seconds is never
+    /// evicted, a guard against deleting one just pulled or in use. Default 6h.
+    #[arg(
+        long,
+        env = "MODEL_EXPRESS_CACHE_GC_GRACE_SECS",
+        default_value_t = 6 * 3600
+    )]
+    gc_grace_secs: u64,
+
     /// NIXL agent name for this process.
     #[arg(long, default_value = "mx-cache")]
     name: String,
@@ -392,9 +411,9 @@ async fn run_reconcile(cli: &Cli) -> anyhow::Result<()> {
     }
     // The base desired set is re-read every pass, so a mounted ConfigMap (via
     // --models-file) can be edited to reconverge the fleet without a restart.
-    let base_desired: Box<dyn DesiredSet> = match &cli.models_file {
-        Some(path) => Box::new(FileDesiredSet::new(path.clone())),
-        None => Box::new(StaticDesiredSet::from_models(cli.models.clone())),
+    let base_desired: Arc<dyn DesiredSet> = match &cli.models_file {
+        Some(path) => Arc::new(FileDesiredSet::new(path.clone())),
+        None => Arc::new(StaticDesiredSet::from_models(cli.models.clone())),
     };
 
     // Watch the desired-set file so a ConfigMap edit reconverges in ~1s instead
@@ -454,11 +473,17 @@ async fn run_reconcile(cli: &Cli) -> anyhow::Result<()> {
 
     // With --auto-expand, union the base set with every model the registry
     // reports a peer holding, so usage anywhere grows the whole fleet's cache.
-    let desired_set: Box<dyn DesiredSet> = if cli.auto_expand {
-        tracing::info!("auto-expand on: desired set = base + every model any peer advertises");
-        Box::new(RegistryDesiredSet::new(base_desired, registry.clone()))
+    let desired_set: Arc<dyn DesiredSet> = if cli.auto_expand {
+        tracing::info!(
+            demand_ttl_secs = cli.demand_ttl_secs,
+            "auto-expand on: desired set = base + every model any peer advertises; unused models decay + evict"
+        );
+        Arc::new(RegistryDesiredSet::new(
+            base_desired.clone(),
+            registry.clone(),
+        ))
     } else {
-        base_desired
+        base_desired.clone()
     };
 
     // The advertised map is shared with the heartbeat task. The reconcile loop
@@ -502,6 +527,14 @@ async fn run_reconcile(cli: &Cli) -> anyhow::Result<()> {
         endpoint,
         worker_id,
     );
+    if cli.auto_expand {
+        use modelexpress_client::cache::usage::AtimeUsage;
+        reconciler = reconciler.with_bounding(
+            std::sync::Arc::new(AtimeUsage),
+            Duration::from_secs(cli.demand_ttl_secs),
+            Duration::from_secs(cli.gc_grace_secs),
+        );
+    }
     let fetcher = NixlFetcher {
         agent_name: cli.name.clone(),
         buf_gib: cli.buf_gib,
@@ -525,7 +558,7 @@ async fn run_reconcile(cli: &Cli) -> anyhow::Result<()> {
     loop {
         let flow = tokio::select! {
             _ = tick.tick() => {
-                reconcile_pass(&mut reconciler, desired_set.as_ref(), &fetcher, &advertised, cli.auto_expand).await;
+                reconcile_pass(&mut reconciler, desired_set.as_ref(), base_desired.as_ref(), &fetcher, &advertised, cli.auto_expand).await;
                 ControlFlow::Continue(())
             }
             _ = changed.notified() => {
@@ -533,7 +566,7 @@ async fn run_reconcile(cli: &Cli) -> anyhow::Result<()> {
                 // into a single pass before re-reading.
                 tokio::time::sleep(Duration::from_millis(500)).await;
                 tracing::info!("desired-set file changed; reconciling now");
-                reconcile_pass(&mut reconciler, desired_set.as_ref(), &fetcher, &advertised, cli.auto_expand).await;
+                reconcile_pass(&mut reconciler, desired_set.as_ref(), base_desired.as_ref(), &fetcher, &advertised, cli.auto_expand).await;
                 ControlFlow::Continue(())
             }
             _ = cache_changed.notified(), if cli.auto_expand => {
@@ -541,9 +574,9 @@ async fn run_reconcile(cli: &Cli) -> anyhow::Result<()> {
                 // burst, then observe twice across the settle window so a model
                 // still downloading isn't advertised until its fingerprint holds.
                 tokio::time::sleep(cache_settle).await;
-                observe_pass(&mut reconciler, &advertised).await;
+                observe_pass(&mut reconciler, base_desired.as_ref(), &advertised).await;
                 tokio::time::sleep(cache_settle).await;
-                observe_pass(&mut reconciler, &advertised).await;
+                observe_pass(&mut reconciler, base_desired.as_ref(), &advertised).await;
                 ControlFlow::Continue(())
             }
             _ = &mut shutdown => ControlFlow::Break(()),
@@ -571,22 +604,33 @@ async fn run_reconcile(cli: &Cli) -> anyhow::Result<()> {
 async fn reconcile_pass(
     reconciler: &mut modelexpress_client::cache::reconcile::Reconciler,
     desired_set: &dyn modelexpress_client::cache::desired::DesiredSet,
+    base: &dyn modelexpress_client::cache::desired::DesiredSet,
     fetcher: &modelexpress_client::cache::reconcile::NixlFetcher,
     advertised: &std::sync::Mutex<std::collections::HashMap<String, String>>,
     auto_expand: bool,
 ) {
+    // Pinned = the base set (always advertised, never evicted). Only needed in
+    // bounded mode; skip the extra read otherwise.
+    let pinned = if auto_expand {
+        pinned_models(base).await
+    } else {
+        std::collections::HashSet::new()
+    };
     let desired = desired_set.desired().await;
     if let Err(e) = reconciler
-        .reconcile_once(&desired, fetcher, advertised)
+        .reconcile_once(&desired, fetcher, advertised, &pinned)
         .await
     {
         tracing::warn!(error = %e, "reconcile pass failed; retrying next interval");
     }
     // With auto-expand, also advertise models that appeared locally outside the
-    // fetch path (e.g. a co-located vLLM downloaded into the shared cache), so
-    // they replicate fleet-wide.
-    if auto_expand && let Err(e) = reconciler.observe_local(advertised).await {
-        tracing::warn!(error = %e, "local cache observe failed; retrying next interval");
+    // fetch path (e.g. a co-located vLLM downloaded into the shared cache), then
+    // reclaim models the fleet no longer wants.
+    if auto_expand {
+        if let Err(e) = reconciler.observe_local(advertised, &pinned).await {
+            tracing::warn!(error = %e, "local cache observe failed; retrying next interval");
+        }
+        reconciler.gc(&desired, &pinned, advertised).await;
     }
 }
 
@@ -596,11 +640,26 @@ async fn reconcile_pass(
 #[cfg(feature = "nixl")]
 async fn observe_pass(
     reconciler: &mut modelexpress_client::cache::reconcile::Reconciler,
+    base: &dyn modelexpress_client::cache::desired::DesiredSet,
     advertised: &std::sync::Mutex<std::collections::HashMap<String, String>>,
 ) {
-    if let Err(e) = reconciler.observe_local(advertised).await {
+    let pinned = pinned_models(base).await;
+    if let Err(e) = reconciler.observe_local(advertised, &pinned).await {
         tracing::warn!(error = %e, "local cache observe failed; retrying next interval");
     }
+}
+
+/// The base (pinned) models, the floor that is always advertised and never
+/// evicted, regardless of use.
+#[cfg(feature = "nixl")]
+async fn pinned_models(
+    base: &dyn modelexpress_client::cache::desired::DesiredSet,
+) -> std::collections::HashSet<String> {
+    base.desired()
+        .await
+        .into_iter()
+        .map(|spec| spec.model)
+        .collect()
 }
 
 #[cfg(not(feature = "nixl"))]
