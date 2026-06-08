@@ -387,6 +387,11 @@ impl Reconciler {
     /// quiescence backstop only covers a sharded model whose index has not landed
     /// yet, where a lone shard would otherwise look like a complete single file.
     fn capturable(&self, snapshot: &Path) -> bool {
+        // TODO: residual gap. The index check is deterministic for sharded models
+        // and the quiescence backstop covers the common case, but a non-indexed
+        // model whose files arrive in bursts more than capture_quiescence apart
+        // could still be captured mid-set. The airtight fix is a consumer-driven
+        // completion signal (the reported-usage path in usage.rs), not a heuristic.
         let Some(repo) = snapshot.parent().and_then(Path::parent) else {
             return false;
         };
