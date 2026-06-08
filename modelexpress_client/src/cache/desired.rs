@@ -63,10 +63,16 @@ impl ModelSpec {
 }
 
 /// The set of models a node should converge its local cache toward.
-pub trait DesiredSet {
+///
+/// `Send + Sync` because the reconcile loop holds it as a `Box<dyn DesiredSet>`
+/// across `.await` points. `desired()` is async because a dynamic source can do
+/// I/O (the registry-backed set queries the P2P server); the static and file
+/// sources just return ready.
+#[tonic::async_trait]
+pub trait DesiredSet: Send + Sync {
     /// Snapshot the currently-desired models. Called once per reconcile pass, so
     /// a dynamic implementation can return a fresh view each time.
-    fn desired(&self) -> Vec<ModelSpec>;
+    async fn desired(&self) -> Vec<ModelSpec>;
 }
 
 /// Append `spec` unless its model is already present, so a set stays
@@ -118,8 +124,9 @@ impl StaticDesiredSet {
     }
 }
 
+#[tonic::async_trait]
 impl DesiredSet for StaticDesiredSet {
-    fn desired(&self) -> Vec<ModelSpec> {
+    async fn desired(&self) -> Vec<ModelSpec> {
         self.specs.clone()
     }
 }
@@ -140,8 +147,9 @@ impl FileDesiredSet {
     }
 }
 
+#[tonic::async_trait]
 impl DesiredSet for FileDesiredSet {
-    fn desired(&self) -> Vec<ModelSpec> {
+    async fn desired(&self) -> Vec<ModelSpec> {
         match std::fs::read_to_string(&self.path) {
             Ok(body) => parse_lines(&body),
             Err(e) => {
@@ -149,6 +157,49 @@ impl DesiredSet for FileDesiredSet {
                 Vec::new()
             }
         }
+    }
+}
+
+/// A desired set that unions a base set with every model the P2P registry
+/// reports any peer holding. This is the auto-expanding cache: a model used on
+/// any node gets advertised, lands in the registry, and so enters every node's
+/// desired set, which makes the whole fleet converge to hold it. The base set
+/// (a ConfigMap or `--model` list) stays pinned as the always-present floor;
+/// the registry union is the part that grows with usage.
+///
+/// A registry query failure degrades to the base set for that pass (logged),
+/// not an error, so a transient server blip can't wipe the desired set.
+pub struct RegistryDesiredSet {
+    base: Box<dyn DesiredSet>,
+    registry: crate::cache::registry::Registry,
+}
+
+impl RegistryDesiredSet {
+    pub fn new(base: Box<dyn DesiredSet>, registry: crate::cache::registry::Registry) -> Self {
+        Self { base, registry }
+    }
+}
+
+#[tonic::async_trait]
+impl DesiredSet for RegistryDesiredSet {
+    async fn desired(&self) -> Vec<ModelSpec> {
+        // Base first so a pinned-revision base entry wins over the registry's
+        // unpinned one (push_unique keeps the first per model).
+        let mut specs = self.base.desired().await;
+        // Registry handle is cheap to clone (shares the channel); cloning keeps
+        // desired() on &self despite the gRPC call needing &mut.
+        let mut registry = self.registry.clone();
+        match registry.list_ready_models().await {
+            Ok(models) => {
+                for model in models {
+                    push_unique(&mut specs, ModelSpec::new(model));
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "registry model list failed; using base desired set this pass");
+            }
+        }
+        specs
     }
 }
 
@@ -182,19 +233,38 @@ pub fn watch_desired_file(
     Ok(watcher)
 }
 
+/// Watch a cache root *recursively* and signal `on_change` on any change beneath
+/// it, so auto-expand capture can react within seconds of a co-located process
+/// (e.g. a vLLM) downloading a model into the shared cache, instead of waiting
+/// for the next interval tick. Recursive because downloads land files deep in
+/// the `models--*/blobs` and `snapshots/` tree, not at the root. A multi-file
+/// download fires a burst of events; `notify_one` coalesces them into a single
+/// pending wake, and the loop debounces and re-checks settledness before
+/// advertising, so an in-progress download is never published early. Returns the
+/// watcher guard; the caller keeps it alive (dropping it stops the watch).
+pub fn watch_cache_dir(dir: &Path, on_change: Arc<Notify>) -> notify::Result<RecommendedWatcher> {
+    let mut watcher =
+        notify::recommended_watcher(move |res: notify::Result<notify::Event>| match res {
+            Ok(_) => on_change.notify_one(),
+            Err(e) => tracing::warn!(error = %e, "cache-dir watcher error"),
+        })?;
+    watcher.watch(dir, RecursiveMode::Recursive)?;
+    Ok(watcher)
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn static_set_dedups_and_preserves_order() {
+    #[tokio::test]
+    async fn static_set_dedups_and_preserves_order() {
         let set = StaticDesiredSet::from_models([
             "google-t5/t5-small",
             "Qwen/Qwen2.5-7B",
             "google-t5/t5-small",
         ]);
-        let desired = set.desired();
+        let desired = set.desired().await;
         let models: Vec<&str> = desired.iter().map(|s| s.model.as_str()).collect();
         assert_eq!(models, vec!["google-t5/t5-small", "Qwen/Qwen2.5-7B"]);
     }
@@ -245,20 +315,20 @@ mod tests {
         assert_eq!(specs[1].revision.as_deref(), Some("rev9"));
     }
 
-    #[test]
-    fn file_desired_set_reads_live_and_tolerates_missing() {
+    #[tokio::test]
+    async fn file_desired_set_reads_live_and_tolerates_missing() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("models.txt");
         // Missing file -> empty, no panic.
         let set = FileDesiredSet::new(&path);
-        assert!(set.desired().is_empty());
+        assert!(set.desired().await.is_empty());
 
         std::fs::write(&path, "google-t5/t5-small\n").expect("write");
-        assert_eq!(set.desired().len(), 1);
+        assert_eq!(set.desired().await.len(), 1);
 
         // Re-reads each call: a ConfigMap edit is picked up without restart.
         std::fs::write(&path, "google-t5/t5-small\nQwen/Qwen2.5-7B\n").expect("rewrite");
-        assert_eq!(set.desired().len(), 2);
+        assert_eq!(set.desired().await.len(), 2);
     }
 
     #[tokio::test]
@@ -277,5 +347,21 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(5), changed.notified())
             .await
             .expect("watcher did not fire on file change");
+    }
+
+    #[tokio::test]
+    async fn cache_watch_signals_on_nested_write() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let changed = Arc::new(Notify::new());
+        let _watcher = watch_cache_dir(root.path(), changed.clone()).expect("watch");
+
+        // A download writes deep in the tree (models--*/blobs/...); the recursive
+        // watch must fire, not just on top-level changes.
+        let nested = root.path().join("models--org--m").join("blobs");
+        std::fs::create_dir_all(&nested).expect("mkdir");
+        std::fs::write(nested.join("abc123"), b"weights").expect("write");
+        tokio::time::timeout(std::time::Duration::from_secs(5), changed.notified())
+            .await
+            .expect("cache watcher did not fire on nested write");
     }
 }

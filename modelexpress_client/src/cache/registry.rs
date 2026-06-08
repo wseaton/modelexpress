@@ -108,6 +108,30 @@ impl Registry {
         Ok(resp.instances)
     }
 
+    /// Distinct model names across all READY sources, regardless of identity
+    /// (an unset identity filter means "every source" per the proto). Backs the
+    /// auto-expanding desired set: every model any peer holds becomes a model
+    /// this node should hold too, so usage on one node replicates fleet-wide.
+    pub async fn list_ready_models(&mut self) -> anyhow::Result<Vec<String>> {
+        let resp = self
+            .client
+            .list_sources(ListSourcesRequest {
+                identity: None,
+                status_filter: Some(SourceStatus::Ready as i32),
+            })
+            .await?
+            .into_inner();
+        let mut models: Vec<String> = resp
+            .instances
+            .into_iter()
+            .map(|instance| instance.model_name)
+            .filter(|model| !model.is_empty())
+            .collect();
+        models.sort();
+        models.dedup();
+        Ok(models)
+    }
+
     /// Fetch one worker's full metadata; `None` if the server has no such worker.
     pub async fn get_worker(
         &mut self,

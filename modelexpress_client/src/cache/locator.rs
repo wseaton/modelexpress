@@ -42,6 +42,28 @@ pub fn locate_hf(cache_root: &Path, model: &str) -> Option<(PathBuf, String)> {
     None
 }
 
+/// Every HuggingFace model present under `cache_root`, recovered from the
+/// `models--<org>--<name>` repo directory names (the inverse of the
+/// `/`-to-`--` encoding the download path applies). Backs auto-expand capture:
+/// the daemon advertises models that appeared locally without going through its
+/// own fetch path. Unreadable cache root yields an empty list, not an error.
+pub fn list_cached_models(cache_root: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(cache_root) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter(|entry| entry.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .filter_map(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.strip_prefix("models--"))
+                .map(|rest| rest.replace("--", "/"))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
@@ -63,5 +85,24 @@ mod tests {
         assert_eq!(rev, "abc123");
         // Absent model -> None.
         assert!(locate_hf(cache.path(), "nobody/here").is_none());
+    }
+
+    #[test]
+    fn lists_cached_models_decoding_repo_names() {
+        let cache = tempfile::tempdir().expect("tempdir");
+        for repo in ["models--google-t5--t5-small", "models--Qwen--Qwen3-0.6B"] {
+            std::fs::create_dir_all(cache.path().join(repo).join("snapshots")).expect("mkdir");
+        }
+        // A non-model directory and a file are ignored.
+        std::fs::create_dir_all(cache.path().join("version.txt.lock")).expect("mkdir");
+        std::fs::write(cache.path().join("not-a-repo"), b"x").expect("write");
+
+        let mut models = list_cached_models(cache.path());
+        models.sort();
+        // `--` decodes back to `/`; single dashes in org/name are preserved.
+        assert_eq!(models, vec!["Qwen/Qwen3-0.6B", "google-t5/t5-small"]);
+
+        // Empty / missing cache root is not an error.
+        assert!(list_cached_models(&cache.path().join("nope")).is_empty());
     }
 }

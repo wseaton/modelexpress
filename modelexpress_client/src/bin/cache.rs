@@ -60,6 +60,13 @@ struct Cli {
     #[arg(long, env = "MODEL_EXPRESS_CACHE_RECONCILE_SECS", default_value_t = 60)]
     reconcile_secs: u64,
 
+    /// `--reconcile` only: grow the desired set to include every model any peer
+    /// advertises to the registry, on top of the `--model`/`--models-file` base.
+    /// A model used on any node then replicates fleet-wide automatically. Off by
+    /// default; the cache only grows while it is set (no eviction yet).
+    #[arg(long, env = "MODEL_EXPRESS_CACHE_AUTO_EXPAND")]
+    auto_expand: bool,
+
     /// NIXL agent name for this process.
     #[arg(long, default_value = "mx-cache")]
     name: String,
@@ -372,7 +379,8 @@ async fn run_reconcile(cli: &Cli) -> anyhow::Result<()> {
 
     use modelexpress_client::cache::advertise;
     use modelexpress_client::cache::desired::{
-        DesiredSet, FileDesiredSet, StaticDesiredSet, watch_desired_file,
+        DesiredSet, FileDesiredSet, RegistryDesiredSet, StaticDesiredSet, watch_cache_dir,
+        watch_desired_file,
     };
     use modelexpress_client::cache::reconcile::{NixlFetcher, Reconciler};
     use modelexpress_client::cache::registry::Registry;
@@ -382,9 +390,9 @@ async fn run_reconcile(cli: &Cli) -> anyhow::Result<()> {
     if cli.models.is_empty() && cli.models_file.is_none() {
         anyhow::bail!("--reconcile needs --model or --models-file");
     }
-    // The desired set is re-read every pass, so a mounted ConfigMap (via
+    // The base desired set is re-read every pass, so a mounted ConfigMap (via
     // --models-file) can be edited to reconverge the fleet without a restart.
-    let desired_set: Box<dyn DesiredSet> = match &cli.models_file {
+    let base_desired: Box<dyn DesiredSet> = match &cli.models_file {
         Some(path) => Box::new(FileDesiredSet::new(path.clone())),
         None => Box::new(StaticDesiredSet::from_models(cli.models.clone())),
     };
@@ -417,9 +425,41 @@ async fn run_reconcile(cli: &Cli) -> anyhow::Result<()> {
         stop.clone(),
     )?;
 
+    // With --auto-expand, watch the cache root so a model a co-located process
+    // (e.g. vLLM) downloads into it is captured within seconds rather than at the
+    // next interval tick. The recursive watch needs the root to exist, so create
+    // it first; a failed setup degrades to interval-only capture, not an error.
+    let cache_changed = Arc::new(Notify::new());
+    let _cache_watcher = if cli.auto_expand {
+        if let Err(e) = std::fs::create_dir_all(&cache_root) {
+            tracing::warn!(path = %cache_root.display(), error = %e, "could not create cache root to watch");
+        }
+        match watch_cache_dir(&cache_root, cache_changed.clone()) {
+            Ok(w) => {
+                tracing::info!(path = %cache_root.display(), "watching cache root for new models");
+                Some(w)
+            }
+            Err(e) => {
+                tracing::warn!(path = %cache_root.display(), error = %e, "failed to watch cache root; capture is interval-only");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let registry = Registry::connect(cli.endpoint.clone()).await?;
     let worker_id = advertise::worker_id();
     let endpoint = metadata_endpoint(cli.nixl_port);
+
+    // With --auto-expand, union the base set with every model the registry
+    // reports a peer holding, so usage anywhere grows the whole fleet's cache.
+    let desired_set: Box<dyn DesiredSet> = if cli.auto_expand {
+        tracing::info!("auto-expand on: desired set = base + every model any peer advertises");
+        Box::new(RegistryDesiredSet::new(base_desired, registry.clone()))
+    } else {
+        base_desired
+    };
 
     // The advertised map is shared with the heartbeat task. The reconcile loop
     // is its only writer and locks it only momentarily, so a long pull never
@@ -474,6 +514,10 @@ async fn run_reconcile(cli: &Cli) -> anyhow::Result<()> {
         interval_secs = cli.reconcile_secs,
         "reconcile loop started; serving and converging"
     );
+    // A co-located download settles before its on-disk fingerprint stops
+    // changing; observe twice spaced by this window so the stability check can
+    // confirm completion before advertising.
+    let cache_settle = Duration::from_secs(2);
     let shutdown = wait_for_shutdown();
     tokio::pin!(shutdown);
     let mut tick = tokio::time::interval(Duration::from_secs(cli.reconcile_secs));
@@ -481,7 +525,7 @@ async fn run_reconcile(cli: &Cli) -> anyhow::Result<()> {
     loop {
         let flow = tokio::select! {
             _ = tick.tick() => {
-                reconcile_pass(&mut reconciler, desired_set.as_ref(), &fetcher, &advertised).await;
+                reconcile_pass(&mut reconciler, desired_set.as_ref(), &fetcher, &advertised, cli.auto_expand).await;
                 ControlFlow::Continue(())
             }
             _ = changed.notified() => {
@@ -489,7 +533,17 @@ async fn run_reconcile(cli: &Cli) -> anyhow::Result<()> {
                 // into a single pass before re-reading.
                 tokio::time::sleep(Duration::from_millis(500)).await;
                 tracing::info!("desired-set file changed; reconciling now");
-                reconcile_pass(&mut reconciler, desired_set.as_ref(), &fetcher, &advertised).await;
+                reconcile_pass(&mut reconciler, desired_set.as_ref(), &fetcher, &advertised, cli.auto_expand).await;
+                ControlFlow::Continue(())
+            }
+            _ = cache_changed.notified(), if cli.auto_expand => {
+                // A co-located process touched the cache. Debounce the event
+                // burst, then observe twice across the settle window so a model
+                // still downloading isn't advertised until its fingerprint holds.
+                tokio::time::sleep(cache_settle).await;
+                observe_pass(&mut reconciler, &advertised).await;
+                tokio::time::sleep(cache_settle).await;
+                observe_pass(&mut reconciler, &advertised).await;
                 ControlFlow::Continue(())
             }
             _ = &mut shutdown => ControlFlow::Break(()),
@@ -519,13 +573,33 @@ async fn reconcile_pass(
     desired_set: &dyn modelexpress_client::cache::desired::DesiredSet,
     fetcher: &modelexpress_client::cache::reconcile::NixlFetcher,
     advertised: &std::sync::Mutex<std::collections::HashMap<String, String>>,
+    auto_expand: bool,
 ) {
-    let desired = desired_set.desired();
+    let desired = desired_set.desired().await;
     if let Err(e) = reconciler
         .reconcile_once(&desired, fetcher, advertised)
         .await
     {
         tracing::warn!(error = %e, "reconcile pass failed; retrying next interval");
+    }
+    // With auto-expand, also advertise models that appeared locally outside the
+    // fetch path (e.g. a co-located vLLM downloaded into the shared cache), so
+    // they replicate fleet-wide.
+    if auto_expand && let Err(e) = reconciler.observe_local(advertised).await {
+        tracing::warn!(error = %e, "local cache observe failed; retrying next interval");
+    }
+}
+
+/// One capture-only pass: advertise any newly-settled local models. Used by the
+/// cache-watch trigger, which needs the cheap observe without re-running the full
+/// desired-set convergence the interval/file-change passes do.
+#[cfg(feature = "nixl")]
+async fn observe_pass(
+    reconciler: &mut modelexpress_client::cache::reconcile::Reconciler,
+    advertised: &std::sync::Mutex<std::collections::HashMap<String, String>>,
+) {
+    if let Err(e) = reconciler.observe_local(advertised).await {
+        tracing::warn!(error = %e, "local cache observe failed; retrying next interval");
     }
 }
 

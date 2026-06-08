@@ -145,6 +145,126 @@ async fn file_cache_publish_list_get_discover_roundtrip() {
     stop_and_join(shutdown, handle).await;
 }
 
+/// The auto-expand desired set: `RegistryDesiredSet` unions a pinned base with
+/// every model peers advertise, de-duplicated. Driven against a real server so
+/// `list_ready_models` and the union are exercised end-to-end, no mocks.
+#[tokio::test]
+async fn registry_desired_set_unions_base_with_advertised_models() {
+    use modelexpress_client::cache::desired::{DesiredSet, RegistryDesiredSet, StaticDesiredSet};
+
+    let port = free_port();
+    let (shutdown, handle) = start_server(port);
+    let mut reg = registry_at(port).await;
+
+    // Two peers advertise two models; one overlaps the base set below.
+    for (model, node) in [("org/alpha", "node-a"), ("google-t5/t5-small", "node-b")] {
+        let worker = advertise::cache_worker(vec![1, 2, 3], "agent", "10.0.0.1:7000");
+        reg.publish(advertise::file_cache_identity(model, ""), worker, node)
+            .await
+            .expect("publish");
+    }
+
+    // Base pins two models, one of which a peer also advertises (t5-small).
+    let base = Box::new(StaticDesiredSet::from_models([
+        "google-t5/t5-small",
+        "org/base-only",
+    ]));
+    let set = RegistryDesiredSet::new(base, reg.clone());
+
+    let mut models: Vec<String> = set.desired().await.into_iter().map(|s| s.model).collect();
+    models.sort();
+    // Union, de-duplicated: base's two plus the peer-only alpha; t5-small once.
+    assert_eq!(
+        models,
+        vec!["google-t5/t5-small", "org/alpha", "org/base-only"]
+    );
+
+    stop_and_join(shutdown, handle).await;
+}
+
+/// Auto-expand capture: `observe_local` advertises a model that appeared in the
+/// cache outside the fetch path (a co-located vLLM downloading straight in), but
+/// only once it has settled, never while an `*.incomplete` blob shows a download
+/// in flight. Driven against a real server; the registry visibility is what other
+/// nodes' auto-expand desired sets then pick up.
+#[tokio::test]
+async fn observe_local_advertises_settled_external_models() {
+    use modelexpress_client::cache::reconcile::{Reconciler, is_present};
+
+    let port = free_port();
+    let (shutdown, handle) = start_server(port);
+    let reg = registry_at(port).await;
+    let cache = tempfile::tempdir().expect("tempdir");
+
+    // Model A: fully landed in HF layout, no completion sentinel (external).
+    let model_a = "org/externally-downloaded";
+    let snap_a = cache
+        .path()
+        .join("models--org--externally-downloaded")
+        .join("snapshots")
+        .join("rev-a");
+    std::fs::create_dir_all(&snap_a).expect("mkdir");
+    std::fs::write(snap_a.join("config.json"), b"{\"n\":1}").expect("write");
+    std::fs::write(snap_a.join("model.safetensors"), b"weights").expect("write");
+
+    // Model B: still downloading, a blob is .incomplete.
+    let model_b = "org/still-downloading";
+    let repo_b = cache.path().join("models--org--still-downloading");
+    std::fs::create_dir_all(repo_b.join("snapshots").join("rev-b")).expect("mkdir");
+    std::fs::write(
+        repo_b.join("snapshots").join("rev-b").join("config.json"),
+        b"{}",
+    )
+    .expect("write");
+    std::fs::create_dir_all(repo_b.join("blobs")).expect("mkdir");
+    std::fs::write(repo_b.join("blobs").join("e.incomplete"), b"partial").expect("write");
+
+    let mut reconciler = Reconciler::new(
+        reg.clone(),
+        cache.path().to_path_buf(),
+        vec![1, 2, 3],
+        "agent-obs",
+        "10.0.0.9:7000",
+        "node-obs",
+    );
+    let advertised = Mutex::new(HashMap::new());
+
+    // First sight records a fingerprint but advertises nothing (not yet stable).
+    reconciler.observe_local(&advertised).await.expect("pass 1");
+    assert!(
+        advertised.lock().expect("lock").is_empty(),
+        "nothing advertised on first sight"
+    );
+
+    // Second pass: A is unchanged -> settled -> advertised + sentinel stamped.
+    // B still has an .incomplete blob, so it stays out.
+    reconciler.observe_local(&advertised).await.expect("pass 2");
+    {
+        let map = advertised.lock().expect("lock");
+        assert!(
+            map.contains_key(model_a),
+            "settled external model advertised"
+        );
+        assert!(
+            !map.contains_key(model_b),
+            "in-flight download not advertised"
+        );
+        assert_eq!(map.len(), 1);
+    }
+    assert!(
+        is_present(cache.path(), model_a),
+        "completion sentinel stamped"
+    );
+
+    // The registry lists A, so a peer's auto-expand desired set picks it up.
+    let mut reg2 = reg.clone();
+    let models = reg2.list_ready_models().await.expect("list models");
+    assert!(models.contains(&model_a.to_string()));
+    assert!(!models.contains(&model_b.to_string()));
+
+    stop_and_join(shutdown, handle).await;
+}
+
 const MODEL: &str = "google-t5/t5-small";
 const REVISION: &str = "rev1";
 

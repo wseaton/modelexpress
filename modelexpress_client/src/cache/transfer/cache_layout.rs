@@ -188,6 +188,61 @@ pub fn is_complete(dir: &Path) -> bool {
     dir.join(COMPLETE_SENTINEL).exists()
 }
 
+/// Whether `repo_dir` has an in-progress HuggingFace download: `huggingface_hub`
+/// writes a blob to `blobs/<etag>.incomplete` and only renames it into place when
+/// the download finishes, so any `*.incomplete` means a file is still landing and
+/// the snapshot must not be advertised yet. A missing `blobs/` means none.
+pub fn has_incomplete_blobs(repo_dir: &Path) -> bool {
+    match std::fs::read_dir(repo_dir.join("blobs")) {
+        Ok(entries) => entries.flatten().any(|e| {
+            e.file_name()
+                .to_str()
+                .is_some_and(|name| name.ends_with(".incomplete"))
+        }),
+        Err(_) => false,
+    }
+}
+
+/// A cheap (file count, total bytes) fingerprint of a snapshot, following the
+/// symlinks an HF snapshot uses and skipping our own scratch/sentinel files.
+/// Used to detect that an externally-downloaded snapshot has stopped changing
+/// between reconcile passes before advertising it; far cheaper than re-hashing
+/// (that happens once, at serve time). A dangling symlink (a blob mid-rename) is
+/// skipped, so an in-flight download reads as a different, smaller fingerprint.
+pub fn snapshot_fingerprint(snapshot_dir: &Path) -> (u64, u64) {
+    let mut count = 0u64;
+    let mut bytes = 0u64;
+    fingerprint_walk(snapshot_dir, snapshot_dir, &mut count, &mut bytes);
+    (count, bytes)
+}
+
+fn fingerprint_walk(root: &Path, dir: &Path, count: &mut u64, bytes: &mut u64) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        // Follows symlinks (HF snapshot entries point into blobs/); a dangling
+        // link errors and is skipped.
+        let Ok(meta) = std::fs::metadata(&path) else {
+            continue;
+        };
+        if meta.is_dir() {
+            fingerprint_walk(root, &path, count, bytes);
+            continue;
+        }
+        if !meta.is_file() {
+            continue;
+        }
+        let rel = path.strip_prefix(root).unwrap_or(&path);
+        if rel.to_str().is_some_and(is_mx_internal) {
+            continue;
+        }
+        *count = count.saturating_add(1);
+        *bytes = bytes.saturating_add(meta.len());
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
@@ -259,6 +314,43 @@ mod tests {
         assert_eq!(align_up((16 << 20) + 100, 4096), (16 << 20) + 4096);
         // Degenerate alignment is a no-op.
         assert_eq!(align_up(12345, 0), 12345);
+    }
+
+    #[test]
+    fn incomplete_blobs_gate_settling() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        // No blobs/ dir at all -> nothing in progress.
+        assert!(!has_incomplete_blobs(repo));
+        let blobs = repo.join("blobs");
+        std::fs::create_dir_all(&blobs).expect("mkdir");
+        write_file(&blobs.join("abc123"), b"finished");
+        assert!(
+            !has_incomplete_blobs(repo),
+            "a finished blob is not in progress"
+        );
+        write_file(&blobs.join("def456.incomplete"), b"partial");
+        assert!(
+            has_incomplete_blobs(repo),
+            "an .incomplete blob is detected"
+        );
+    }
+
+    #[test]
+    fn fingerprint_counts_files_and_bytes_skipping_internal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let snap = dir.path();
+        write_file(&snap.join("config.json"), b"{}"); // 2 bytes
+        write_file(&snap.join("nested/tok.json"), b"tok"); // 3 bytes
+        assert_eq!(snapshot_fingerprint(snap), (2, 5));
+        // Our scratch and sentinel files are not part of the model.
+        write_file(&snap.join("model.safetensors.mxtmp"), b"partial");
+        mark_complete(snap).expect("sentinel");
+        assert_eq!(
+            snapshot_fingerprint(snap),
+            (2, 5),
+            "internal files do not change the fingerprint"
+        );
     }
 
     #[test]

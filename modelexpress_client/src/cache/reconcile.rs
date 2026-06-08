@@ -35,7 +35,7 @@ use tracing::info;
 use super::advertise::{cache_worker, file_cache_identity};
 use super::desired::ModelSpec;
 use super::discover::discover_blob;
-use super::locator::locate_hf;
+use super::locator::{list_cached_models, locate_hf};
 use super::registry::Registry;
 use super::transfer::cache_layout;
 
@@ -111,6 +111,10 @@ pub struct Reconciler {
     agent_name: String,
     metadata_endpoint: String,
     worker_id: String,
+    /// Per-model on-disk fingerprint from the previous `observe_local` pass, so
+    /// an externally-downloaded model is advertised only once it stops changing
+    /// (see [`Reconciler::observe_local`]). Empty until auto-expand observes.
+    observed: HashMap<String, (u64, u64)>,
 }
 
 impl Reconciler {
@@ -129,6 +133,7 @@ impl Reconciler {
             agent_name: agent_name.into(),
             metadata_endpoint: metadata_endpoint.into(),
             worker_id: worker_id.into(),
+            observed: HashMap::new(),
         }
     }
 
@@ -173,6 +178,66 @@ impl Reconciler {
         self.lock_advertised(advertised)?
             .insert(spec.model.clone(), source_id);
         Ok(())
+    }
+
+    /// Capture half of auto-expand: advertise models that appeared in the local
+    /// cache without going through the reconcile fetch path, e.g. a co-located
+    /// vLLM that downloaded straight into the shared cache dir. The serve agent
+    /// already streams any locally-held model on request, so advertising is all
+    /// it takes for peers to pull and replicate it fleet-wide.
+    ///
+    /// A model that already carries our completion sentinel (we pulled it, or it
+    /// persisted across a restart) is advertised at once. An externally-written
+    /// one is advertised only once it has *settled*: no in-progress
+    /// `*.incomplete` blob, and an unchanged (count, bytes) fingerprint since the
+    /// previous pass. That two-pass wait is what stops us advertising a
+    /// half-downloaded model a peer would then pull as garbage; we can't know an
+    /// external downloader's intended file list, so quiescence is the signal.
+    pub async fn observe_local(
+        &mut self,
+        advertised: &Mutex<HashMap<String, String>>,
+    ) -> anyhow::Result<()> {
+        for model in list_cached_models(&self.cache_root) {
+            if self.lock_advertised(advertised)?.contains_key(&model) {
+                continue;
+            }
+            let Some((snapshot, _revision)) = locate_hf(&self.cache_root, &model) else {
+                continue;
+            };
+            let ready = cache_layout::is_complete(&snapshot)
+                || match snapshot.parent().and_then(|p| p.parent()) {
+                    Some(repo) => self.settled_and_stable(&model, repo, &snapshot),
+                    None => false,
+                };
+            if !ready {
+                continue;
+            }
+            if !cache_layout::is_complete(&snapshot) {
+                cache_layout::mark_complete(&snapshot)?;
+            }
+            self.observed.remove(&model);
+            let source_id = self.advertise(&ModelSpec::new(model.clone())).await?;
+            self.lock_advertised(advertised)?.insert(model, source_id);
+        }
+        Ok(())
+    }
+
+    /// Whether an externally-downloaded snapshot is settled (no in-progress blob)
+    /// and unchanged since the previous pass. Records the current fingerprint for
+    /// the next pass either way; a still-downloading model resets the clock so a
+    /// later quiet pair of passes is needed before it advertises.
+    fn settled_and_stable(&mut self, model: &str, repo: &Path, snapshot: &Path) -> bool {
+        if cache_layout::has_incomplete_blobs(repo) {
+            self.observed.remove(model);
+            return false;
+        }
+        let fingerprint = cache_layout::snapshot_fingerprint(snapshot);
+        if fingerprint.0 == 0 {
+            self.observed.remove(model);
+            return false;
+        }
+        // insert returns the previous fingerprint; stable iff it matches.
+        self.observed.insert(model.to_string(), fingerprint) == Some(fingerprint)
     }
 
     /// Fetch a missing model: peer-pull when the registry knows a holder,
