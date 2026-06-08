@@ -62,6 +62,9 @@ spec:
             {{- if .Values.reconcile.oDirect }}
             - "--o-direct"
             {{- end }}
+            {{- if .Values.reconcile.autoExpand }}
+            - "--auto-expand"
+            {{- end }}
           env:
             - name: MODEL_EXPRESS_ENDPOINT
               value: {{ .Values.registryEndpoint | quote }}
