@@ -64,6 +64,10 @@ spec:
             {{- end }}
             {{- if .Values.reconcile.autoExpand }}
             - "--auto-expand"
+            - "--demand-ttl-secs"
+            - "{{ .Values.reconcile.demandTtlSeconds | default 604800 }}"
+            - "--gc-grace-secs"
+            - "{{ .Values.reconcile.gcGraceSeconds | default 21600 }}"
             {{- end }}
           env:
             - name: MODEL_EXPRESS_ENDPOINT

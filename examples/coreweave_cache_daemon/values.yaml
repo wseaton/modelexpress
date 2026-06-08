@@ -39,9 +39,16 @@ reconcile:
   # Auto-expanding cache: grow the desired set to every model any peer
   # advertises, and advertise models that appear in the local cache (e.g. a
   # co-located vLLM downloaded one). A model used on any node then replicates
-  # fleet-wide. Off by default: the cache only grows, there is no eviction yet,
-  # so do not enable on a fleet without a capacity headroom plan.
+  # fleet-wide, and one unused fleet-wide for demandTtlSeconds decays out and is
+  # evicted. Off by default.
   autoExpand: false
+  # (autoExpand only) A model that is not pinned (in the model list) and unused
+  # locally for this long stops being advertised, decays out of the registry,
+  # and is then evicted. Generous vs relatime's coarse atime. 7 days.
+  demandTtlSeconds: 604800
+  # (autoExpand only) A model touched within this window is never evicted, a
+  # guard against deleting one just pulled or in use. 6 hours.
+  gcGraceSeconds: 21600
 
 # Node-local cache volume. emptyDir is wiped when the daemon pod restarts (the
 # node then re-pulls everything); set hostPath to a node NVMe path to persist the
