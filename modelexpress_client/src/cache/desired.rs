@@ -215,6 +215,17 @@ impl DesiredSet for RegistryDesiredSet {
 /// inode would go deaf after that swap (the old inode is now orphaned), whereas a
 /// directory watch keeps firing across swaps. Reads through the symlink are always
 /// atomic, so a reconcile triggered by an event sees complete content.
+/// Content fingerprint of the desired-set file, used to suppress redundant
+/// reconciles. The kubelet resyncs a mounted ConfigMap on its own cadence,
+/// swapping the `..data` symlink each time even when the body is unchanged, so
+/// the directory watch fires on resyncs that carry no real edit. Comparing this
+/// fingerprint across watch events drops those no-ops. `None` when the file
+/// can't be read, which the caller treats as "changed" so a genuine edit is
+/// never missed.
+pub fn desired_file_fingerprint(path: &Path) -> Option<blake3::Hash> {
+    std::fs::read(path).ok().map(|bytes| blake3::hash(&bytes))
+}
+
 pub fn watch_desired_file(
     path: &Path,
     on_change: Arc<Notify>,
@@ -329,6 +340,27 @@ mod tests {
         // Re-reads each call: a ConfigMap edit is picked up without restart.
         std::fs::write(&path, "google-t5/t5-small\nQwen/Qwen2.5-7B\n").expect("rewrite");
         assert_eq!(set.desired().await.len(), 2);
+    }
+
+    #[test]
+    fn fingerprint_tracks_content_not_mtime() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("models");
+
+        // Missing file -> None, so the caller treats it as "changed".
+        assert!(desired_file_fingerprint(&path).is_none());
+
+        std::fs::write(&path, "google-t5/t5-small\n").expect("write");
+        let first = desired_file_fingerprint(&path).expect("fingerprint");
+
+        // Rewriting identical bytes (the kubelet-resync case) is the same
+        // fingerprint, even though mtime moved.
+        std::fs::write(&path, "google-t5/t5-small\n").expect("rewrite-same");
+        assert_eq!(desired_file_fingerprint(&path), Some(first));
+
+        // A real edit changes it.
+        std::fs::write(&path, "google-t5/t5-small\nQwen/Qwen2.5-7B\n").expect("edit");
+        assert_ne!(desired_file_fingerprint(&path), Some(first));
     }
 
     #[tokio::test]

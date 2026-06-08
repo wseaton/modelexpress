@@ -409,8 +409,8 @@ async fn run_reconcile(cli: &Cli) -> anyhow::Result<()> {
 
     use modelexpress_client::cache::advertise;
     use modelexpress_client::cache::desired::{
-        DesiredSet, FileDesiredSet, RegistryDesiredSet, StaticDesiredSet, watch_cache_dir,
-        watch_desired_file,
+        DesiredSet, FileDesiredSet, RegistryDesiredSet, StaticDesiredSet, desired_file_fingerprint,
+        watch_cache_dir, watch_desired_file,
     };
     use modelexpress_client::cache::reconcile::{NixlFetcher, Reconciler};
     use modelexpress_client::cache::registry::Registry;
@@ -564,6 +564,15 @@ async fn run_reconcile(cli: &Cli) -> anyhow::Result<()> {
     // changing; observe twice spaced by this window so the stability check can
     // confirm completion before advertising.
     let cache_settle = Duration::from_secs(2);
+    // Fingerprint of the desired-set file as last reconciled, so a kubelet
+    // ConfigMap resync that re-fires the watch without changing the body is a
+    // no-op instead of a full pass. Seeded with the current content: startup
+    // convergence is driven by the immediate interval tick below, so the watch
+    // only acts on genuine post-startup edits.
+    let mut desired_fp = cli
+        .models_file
+        .as_deref()
+        .and_then(desired_file_fingerprint);
     let shutdown = wait_for_shutdown();
     tokio::pin!(shutdown);
     let mut tick = tokio::time::interval(Duration::from_secs(cli.reconcile_secs));
@@ -578,9 +587,17 @@ async fn run_reconcile(cli: &Cli) -> anyhow::Result<()> {
                 // Coalesce the kubelet's symlink-swap burst (and any rapid edits)
                 // into a single pass before re-reading.
                 tokio::time::sleep(Duration::from_millis(500)).await;
-                tracing::info!("desired-set file changed; reconciling now");
-                reconcile_pass(&mut reconciler, desired_set.as_ref(), base_desired.as_ref(), &fetcher, &advertised, cli.auto_expand).await;
-                ControlFlow::Continue(())
+                let fp = cli.models_file.as_deref().and_then(desired_file_fingerprint);
+                if fp == desired_fp {
+                    // A resync that swapped the symlink without touching the body;
+                    // the interval tick already covers periodic reconciliation.
+                    ControlFlow::Continue(())
+                } else {
+                    desired_fp = fp;
+                    tracing::info!("desired-set file changed; reconciling now");
+                    reconcile_pass(&mut reconciler, desired_set.as_ref(), base_desired.as_ref(), &fetcher, &advertised, cli.auto_expand).await;
+                    ControlFlow::Continue(())
+                }
             }
             _ = cache_changed.notified(), if cli.auto_expand => {
                 // A co-located process touched the cache. Debounce the event
