@@ -203,43 +203,140 @@ pub fn has_incomplete_blobs(repo_dir: &Path) -> bool {
     }
 }
 
-/// A cheap (file count, total bytes) fingerprint of a snapshot, following the
-/// symlinks an HF snapshot uses and skipping our own scratch/sentinel files.
-/// Used to detect that an externally-downloaded snapshot has stopped changing
-/// between reconcile passes before advertising it; far cheaper than re-hashing
-/// (that happens once, at serve time). A dangling symlink (a blob mid-rename) is
-/// skipped, so an in-flight download reads as a different, smaller fingerprint.
-pub fn snapshot_fingerprint(snapshot_dir: &Path) -> (u64, u64) {
-    let mut count = 0u64;
-    let mut bytes = 0u64;
-    fingerprint_walk(snapshot_dir, snapshot_dir, &mut count, &mut bytes);
-    (count, bytes)
+/// File extensions that mark a real model weights file. A snapshot with only
+/// config/tokenizer files is never a complete model.
+const WEIGHT_EXTS: &[&str] = &["safetensors", "bin", "gguf", "pt", "pth"];
+
+/// Whether a download into `repo_dir` is in progress right now: a `*.incomplete`
+/// blob (the standard `hf_hub_download` staging file), or a currently-held
+/// HuggingFace lock under `<cache>/.locks/<repo>/`. Either means a file is being
+/// written, so the snapshot must not be advertised.
+pub fn download_in_progress(repo_dir: &Path) -> bool {
+    has_incomplete_blobs(repo_dir) || has_held_lock(repo_dir)
 }
 
-fn fingerprint_walk(root: &Path, dir: &Path, count: &mut u64, bytes: &mut u64) {
+fn has_held_lock(repo_dir: &Path) -> bool {
+    let (Some(parent), Some(name)) = (repo_dir.parent(), repo_dir.file_name()) else {
+        return false;
+    };
+    match std::fs::read_dir(parent.join(".locks").join(name)) {
+        Ok(entries) => entries.flatten().any(|e| {
+            let path = e.path();
+            path.extension().and_then(|x| x.to_str()) == Some("lock") && lock_is_held(&path)
+        }),
+        Err(_) => false,
+    }
+}
+
+/// Non-blocking test of whether another process holds `path`'s `flock`. The
+/// `filelock` library HuggingFace uses leaves the lock file on disk after release,
+/// so existence is meaningless; only a held OS lock means a live download. We grab
+/// the lock non-blocking and immediately release it: success means nobody held it.
+fn lock_is_held(path: &Path) -> bool {
+    use std::os::unix::io::AsRawFd;
+    let Ok(file) = File::open(path) else {
+        return false;
+    };
+    // SAFETY: `file` owns a valid fd for the duration of these calls; we only
+    // test the lock and release it, never hold it past this function.
+    let fd = file.as_raw_fd();
+    if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        unsafe { libc::flock(fd, libc::LOCK_UN) };
+        return false;
+    }
+    // Only a would-block means held; any other errno is treated as not held so a
+    // stray unreadable lock can't wedge capture forever.
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EWOULDBLOCK)
+}
+
+/// Whether a snapshot's weights are fully present. If a shard index
+/// (`*.index.json`) is present, every distinct file in its `weight_map` must
+/// exist and resolve; otherwise a single weights file must be present. A
+/// config/tokenizer-only snapshot (a download not yet at the weights), a sharded
+/// model missing shards, and an unparseable (still-downloading) index all return
+/// false. This is the deterministic completeness signal, not a time guess.
+pub fn weights_complete(snapshot_dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(snapshot_dir) else {
+        return false;
+    };
+    let mut index_file = None;
+    let mut has_single_weight = false;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if name.ends_with(".index.json") {
+            index_file = Some(path);
+        } else if path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|ext| WEIGHT_EXTS.contains(&ext))
+        {
+            has_single_weight = true;
+        }
+    }
+    match index_file {
+        Some(index) => index_shards_present(&index, snapshot_dir),
+        None => has_single_weight,
+    }
+}
+
+fn index_shards_present(index: &Path, snapshot_dir: &Path) -> bool {
+    let Ok(bytes) = std::fs::read(index) else {
+        return false;
+    };
+    let Ok(json) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return false;
+    };
+    let Some(map) = json.get("weight_map").and_then(|m| m.as_object()) else {
+        return false;
+    };
+    let shards: std::collections::HashSet<&str> = map.values().filter_map(|v| v.as_str()).collect();
+    !shards.is_empty()
+        && shards
+            .iter()
+            .all(|shard| std::fs::metadata(snapshot_dir.join(shard)).is_ok())
+}
+
+/// The newest mtime across a snapshot's files (following symlinks, skipping our
+/// internals). A short quiescence backstop against this covers the residual gap
+/// where a sharded model's index has not landed yet, so a lone shard would look
+/// like a complete single-file model.
+pub fn newest_mtime(snapshot_dir: &Path) -> Option<std::time::SystemTime> {
+    let mut newest = None;
+    newest_walk(snapshot_dir, &mut newest);
+    newest
+}
+
+fn newest_walk(dir: &Path, newest: &mut Option<std::time::SystemTime>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        // Follows symlinks (HF snapshot entries point into blobs/); a dangling
-        // link errors and is skipped.
         let Ok(meta) = std::fs::metadata(&path) else {
             continue;
         };
         if meta.is_dir() {
-            fingerprint_walk(root, &path, count, bytes);
+            newest_walk(&path, newest);
             continue;
         }
         if !meta.is_file() {
             continue;
         }
-        let rel = path.strip_prefix(root).unwrap_or(&path);
-        if rel.to_str().is_some_and(is_mx_internal) {
+        if path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(is_mx_internal)
+        {
             continue;
         }
-        *count = count.saturating_add(1);
-        *bytes = bytes.saturating_add(meta.len());
+        if let Ok(mtime) = meta.modified()
+            && newest.is_none_or(|cur| mtime > cur)
+        {
+            *newest = Some(mtime);
+        }
     }
 }
 
@@ -337,20 +434,44 @@ mod tests {
     }
 
     #[test]
-    fn fingerprint_counts_files_and_bytes_skipping_internal() {
+    fn weights_complete_single_file_needs_a_weights_file() {
         let dir = tempfile::tempdir().expect("tempdir");
         let snap = dir.path();
-        write_file(&snap.join("config.json"), b"{}"); // 2 bytes
-        write_file(&snap.join("nested/tok.json"), b"tok"); // 3 bytes
-        assert_eq!(snapshot_fingerprint(snap), (2, 5));
-        // Our scratch and sentinel files are not part of the model.
-        write_file(&snap.join("model.safetensors.mxtmp"), b"partial");
-        mark_complete(snap).expect("sentinel");
-        assert_eq!(
-            snapshot_fingerprint(snap),
-            (2, 5),
-            "internal files do not change the fingerprint"
-        );
+        // Config/tokenizer only: not yet a complete model.
+        write_file(&snap.join("config.json"), b"{}");
+        write_file(&snap.join("tokenizer.json"), b"tok");
+        assert!(!weights_complete(snap), "no weights file yet");
+        // A weights file makes it complete.
+        write_file(&snap.join("model.safetensors"), b"weights");
+        assert!(weights_complete(snap), "single safetensors is complete");
+    }
+
+    #[test]
+    fn weights_complete_sharded_needs_all_shards() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let snap = dir.path();
+        let index = br#"{"weight_map":{"a":"model-00001-of-00002.safetensors","b":"model-00002-of-00002.safetensors"}}"#;
+        write_file(&snap.join("model.safetensors.index.json"), index);
+        write_file(&snap.join("model-00001-of-00002.safetensors"), b"shard1");
+        // Index present, one shard missing -> not complete (the bug we hit).
+        assert!(!weights_complete(snap), "missing shard is not complete");
+        write_file(&snap.join("model-00002-of-00002.safetensors"), b"shard2");
+        assert!(weights_complete(snap), "all shards present is complete");
+    }
+
+    #[test]
+    fn newest_mtime_and_incomplete_blobs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let snap = dir.path().join("snapshots").join("r1");
+        write_file(&snap.join("model.safetensors"), b"weights");
+        assert!(newest_mtime(&snap).is_some());
+        assert!(newest_mtime(&dir.path().join("nope")).is_none());
+
+        // A repo with an .incomplete blob is in progress.
+        let repo = dir.path();
+        let blobs = repo.join("blobs");
+        write_file(&blobs.join("abc.incomplete"), b"partial");
+        assert!(download_in_progress(repo), "in-progress download detected");
     }
 
     #[test]

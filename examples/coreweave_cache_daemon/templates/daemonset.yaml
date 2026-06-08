@@ -68,6 +68,8 @@ spec:
             - "{{ .Values.reconcile.demandTtlSeconds | default 604800 }}"
             - "--gc-grace-secs"
             - "{{ .Values.reconcile.gcGraceSeconds | default 21600 }}"
+            - "--capture-quiescence-secs"
+            - "{{ .Values.reconcile.captureQuiescenceSeconds | default 15 }}"
             {{- end }}
           env:
             - name: MODEL_EXPRESS_ENDPOINT

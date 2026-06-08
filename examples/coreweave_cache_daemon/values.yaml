@@ -49,6 +49,10 @@ reconcile:
   # (autoExpand only) A model touched within this window is never evicted, a
   # guard against deleting one just pulled or in use. 6 hours.
   gcGraceSeconds: 21600
+  # (autoExpand only) When capturing a model another process downloaded into the
+  # cache, wait until its newest file is this old (a backstop behind the
+  # weights-index completeness check). 15 seconds.
+  captureQuiescenceSeconds: 15
 
 # Node-local cache volume. emptyDir is wiped when the daemon pod restarts (the
 # node then re-pulls everything); set hostPath to a node NVMe path to persist the

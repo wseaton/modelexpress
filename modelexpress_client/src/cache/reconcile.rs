@@ -122,10 +122,6 @@ pub struct Reconciler {
     agent_name: String,
     metadata_endpoint: String,
     worker_id: String,
-    /// Per-model on-disk fingerprint from the previous `observe_local` pass, so
-    /// an externally-downloaded model is advertised only once it stops changing
-    /// (see [`Reconciler::observe_local`]). Empty until auto-expand observes.
-    observed: HashMap<String, (u64, u64)>,
     /// Bounded (auto-expand) mode: gate advertising on demand and run GC. When
     /// false the reconciler keeps Phase A behaviour (advertise everything
     /// desired, never evict).
@@ -138,6 +134,10 @@ pub struct Reconciler {
     /// A model touched within this window is never GC'd, a best-effort guard
     /// against deleting something just pulled or in use.
     gc_grace: Duration,
+    /// An externally-downloaded snapshot is only captured once its newest file is
+    /// at least this old: the quiescence window that proves a multi-stage download
+    /// (small files, then weights) has finished, not just paused between files.
+    capture_quiescence: Duration,
 }
 
 impl Reconciler {
@@ -156,11 +156,11 @@ impl Reconciler {
             agent_name: agent_name.into(),
             metadata_endpoint: metadata_endpoint.into(),
             worker_id: worker_id.into(),
-            observed: HashMap::new(),
             bounded: false,
             usage: Arc::new(AtimeUsage),
             demand_ttl: Duration::MAX,
             gc_grace: Duration::ZERO,
+            capture_quiescence: Duration::from_secs(15),
         }
     }
 
@@ -176,6 +176,14 @@ impl Reconciler {
         self.usage = usage;
         self.demand_ttl = demand_ttl;
         self.gc_grace = gc_grace;
+        self
+    }
+
+    /// Override the capture quiescence window (default 60s). A snapshot's newest
+    /// file must be older than this before it is captured, so a paused-but-unfinished
+    /// download is not advertised. Tests set it to zero to capture immediately.
+    pub fn with_capture_quiescence(mut self, quiescence: Duration) -> Self {
+        self.capture_quiescence = quiescence;
         self
     }
 
@@ -338,11 +346,10 @@ impl Reconciler {
     ///
     /// A model that already carries our completion sentinel (we pulled it, or it
     /// persisted across a restart) is advertised at once. An externally-written
-    /// one is advertised only once it has *settled*: no in-progress
-    /// `*.incomplete` blob, and an unchanged (count, bytes) fingerprint since the
-    /// previous pass. That two-pass wait is what stops us advertising a
-    /// half-downloaded model a peer would then pull as garbage; we can't know an
-    /// external downloader's intended file list, so quiescence is the signal.
+    /// one is advertised only once [`Reconciler::capturable`] holds: no download
+    /// in progress, weights fully present (index-verified when sharded), and
+    /// quiescent for the backstop window. That is what stops us advertising a
+    /// half-downloaded model a peer would then pull as garbage.
     pub async fn observe_local(
         &mut self,
         advertised: &Mutex<HashMap<String, String>>,
@@ -355,22 +362,16 @@ impl Reconciler {
             let Some((snapshot, _revision)) = locate_hf(&self.cache_root, &model) else {
                 continue;
             };
-            let ready = cache_layout::is_complete(&snapshot)
-                || match snapshot.parent().and_then(|p| p.parent()) {
-                    Some(repo) => self.settled_and_stable(&model, repo, &snapshot),
-                    None => false,
-                };
-            if !ready {
-                continue;
-            }
             if !cache_layout::is_complete(&snapshot) {
+                if !self.capturable(&snapshot) {
+                    continue;
+                }
                 cache_layout::mark_complete(&snapshot)?;
             }
-            self.observed.remove(&model);
-            // A captured model is advertised only if wanted; a freshly-settled
-            // download is recently-touched, so under bounded mode it passes. A
-            // stale leftover that happens to settle is held silently, not
-            // advertised, and `gc` reclaims it once it leaves the desired set.
+            // A captured model is advertised only if wanted; a fresh download is
+            // recently-touched, so under bounded mode it passes. A stale leftover
+            // is held silently, not advertised, and `gc` reclaims it once it
+            // leaves the desired set.
             if !self.bounded || self.is_wanted(&model, pinned) {
                 let source_id = self.advertise(&ModelSpec::new(model.clone())).await?;
                 self.lock_advertised(advertised)?.insert(model, source_id);
@@ -379,22 +380,29 @@ impl Reconciler {
         Ok(())
     }
 
-    /// Whether an externally-downloaded snapshot is settled (no in-progress blob)
-    /// and unchanged since the previous pass. Records the current fingerprint for
-    /// the next pass either way; a still-downloading model resets the clock so a
-    /// later quiet pair of passes is needed before it advertises.
-    fn settled_and_stable(&mut self, model: &str, repo: &Path, snapshot: &Path) -> bool {
-        if cache_layout::has_incomplete_blobs(repo) {
-            self.observed.remove(model);
+    /// Whether an externally-downloaded snapshot is safe to advertise: no download
+    /// in progress (`*.incomplete` blob or held HF lock), weights fully present
+    /// (every shard of a `*.index.json`, or a single weights file), and quiescent
+    /// for the backstop window. The weights index is the deterministic signal; the
+    /// quiescence backstop only covers a sharded model whose index has not landed
+    /// yet, where a lone shard would otherwise look like a complete single file.
+    fn capturable(&self, snapshot: &Path) -> bool {
+        let Some(repo) = snapshot.parent().and_then(Path::parent) else {
+            return false;
+        };
+        if cache_layout::download_in_progress(repo) {
             return false;
         }
-        let fingerprint = cache_layout::snapshot_fingerprint(snapshot);
-        if fingerprint.0 == 0 {
-            self.observed.remove(model);
+        if !cache_layout::weights_complete(snapshot) {
             return false;
         }
-        // insert returns the previous fingerprint; stable iff it matches.
-        self.observed.insert(model.to_string(), fingerprint) == Some(fingerprint)
+        match cache_layout::newest_mtime(snapshot) {
+            Some(t) => SystemTime::now()
+                .duration_since(t)
+                .map(|age| age >= self.capture_quiescence)
+                .unwrap_or(false),
+            None => false,
+        }
     }
 
     /// Fetch a missing model: peer-pull when the registry knows a holder,

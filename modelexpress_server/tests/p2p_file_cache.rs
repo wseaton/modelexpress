@@ -183,41 +183,50 @@ async fn registry_desired_set_unions_base_with_advertised_models() {
 }
 
 /// Auto-expand capture: `observe_local` advertises a model that appeared in the
-/// cache outside the fetch path (a co-located vLLM downloading straight in), but
-/// only once it has settled, never while an `*.incomplete` blob shows a download
-/// in flight. Driven against a real server; the registry visibility is what other
-/// nodes' auto-expand desired sets then pick up.
+/// cache outside the fetch path (a co-located vLLM downloading straight in) only
+/// once its weights are fully present, never a config-only partial and never
+/// while an `*.incomplete` blob shows a download in flight. Quiescence is set to
+/// zero here so the deterministic weights check is what gates. Driven against a
+/// real server; the registry visibility is what other nodes pick up.
 #[tokio::test]
-async fn observe_local_advertises_settled_external_models() {
+async fn observe_local_advertises_only_weight_complete_models() {
     use modelexpress_client::cache::reconcile::{Reconciler, is_present};
+    use std::collections::HashSet;
+    use std::time::Duration;
 
     let port = free_port();
     let (shutdown, handle) = start_server(port);
     let reg = registry_at(port).await;
     let cache = tempfile::tempdir().expect("tempdir");
 
-    // Model A: fully landed in HF layout, no completion sentinel (external).
-    let model_a = "org/externally-downloaded";
-    let snap_a = cache
-        .path()
-        .join("models--org--externally-downloaded")
-        .join("snapshots")
-        .join("rev-a");
-    std::fs::create_dir_all(&snap_a).expect("mkdir");
-    std::fs::write(snap_a.join("config.json"), b"{\"n\":1}").expect("write");
-    std::fs::write(snap_a.join("model.safetensors"), b"weights").expect("write");
+    let snap = |model: &str, rev: &str| {
+        cache
+            .path()
+            .join(format!("models--{}", model.replace('/', "--")))
+            .join("snapshots")
+            .join(rev)
+    };
 
-    // Model B: still downloading, a blob is .incomplete.
-    let model_b = "org/still-downloading";
-    let repo_b = cache.path().join("models--org--still-downloading");
-    std::fs::create_dir_all(repo_b.join("snapshots").join("rev-b")).expect("mkdir");
-    std::fs::write(
-        repo_b.join("snapshots").join("rev-b").join("config.json"),
-        b"{}",
-    )
-    .expect("write");
-    std::fs::create_dir_all(repo_b.join("blobs")).expect("mkdir");
-    std::fs::write(repo_b.join("blobs").join("e.incomplete"), b"partial").expect("write");
+    // A: weights fully present (no sentinel) -> capturable.
+    let model_a = "org/complete";
+    std::fs::create_dir_all(snap(model_a, "r")).expect("mkdir");
+    std::fs::write(snap(model_a, "r").join("config.json"), b"{}").expect("write");
+    std::fs::write(snap(model_a, "r").join("model.safetensors"), b"weights").expect("write");
+
+    // B: config/tokenizer only, weights not downloaded yet -> NOT capturable
+    // (this is the bug the vLLM test exposed: a partial advertised as complete).
+    let model_b = "org/config-only";
+    std::fs::create_dir_all(snap(model_b, "r")).expect("mkdir");
+    std::fs::write(snap(model_b, "r").join("config.json"), b"{}").expect("write");
+    std::fs::write(snap(model_b, "r").join("tokenizer_config.json"), b"{}").expect("write");
+
+    // C: a blob mid-download -> NOT capturable.
+    let model_c = "org/downloading";
+    std::fs::create_dir_all(snap(model_c, "r")).expect("mkdir");
+    std::fs::write(snap(model_c, "r").join("model.safetensors"), b"partial").expect("write");
+    let repo_c = cache.path().join("models--org--downloading");
+    std::fs::create_dir_all(repo_c.join("blobs")).expect("mkdir");
+    std::fs::write(repo_c.join("blobs").join("e.incomplete"), b"x").expect("write");
 
     let mut reconciler = Reconciler::new(
         reg.clone(),
@@ -226,47 +235,38 @@ async fn observe_local_advertises_settled_external_models() {
         "agent-obs",
         "10.0.0.9:7000",
         "node-obs",
-    );
+    )
+    .with_capture_quiescence(Duration::ZERO);
     let advertised = Mutex::new(HashMap::new());
 
-    // First sight records a fingerprint but advertises nothing (not yet stable).
     reconciler
-        .observe_local(&advertised, &std::collections::HashSet::new())
+        .observe_local(&advertised, &HashSet::new())
         .await
-        .expect("pass 1");
-    assert!(
-        advertised.lock().expect("lock").is_empty(),
-        "nothing advertised on first sight"
-    );
-
-    // Second pass: A is unchanged -> settled -> advertised + sentinel stamped.
-    // B still has an .incomplete blob, so it stays out.
-    reconciler
-        .observe_local(&advertised, &std::collections::HashSet::new())
-        .await
-        .expect("pass 2");
+        .expect("observe");
     {
         let map = advertised.lock().expect("lock");
         assert!(
             map.contains_key(model_a),
-            "settled external model advertised"
+            "weight-complete model advertised"
         );
         assert!(
             !map.contains_key(model_b),
+            "config-only model not advertised"
+        );
+        assert!(
+            !map.contains_key(model_c),
             "in-flight download not advertised"
         );
         assert_eq!(map.len(), 1);
     }
-    assert!(
-        is_present(cache.path(), model_a),
-        "completion sentinel stamped"
-    );
+    assert!(is_present(cache.path(), model_a), "sentinel stamped on A");
+    assert!(!is_present(cache.path(), model_b), "B left unstamped");
 
-    // The registry lists A, so a peer's auto-expand desired set picks it up.
     let mut reg2 = reg.clone();
     let models = reg2.list_ready_models().await.expect("list models");
     assert!(models.contains(&model_a.to_string()));
     assert!(!models.contains(&model_b.to_string()));
+    assert!(!models.contains(&model_c.to_string()));
 
     stop_and_join(shutdown, handle).await;
 }

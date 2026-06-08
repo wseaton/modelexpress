@@ -86,6 +86,17 @@ struct Cli {
     )]
     gc_grace_secs: u64,
 
+    /// `--auto-expand` only: when capturing a model downloaded into the cache by
+    /// another process, wait until its newest file is this many seconds old (a
+    /// backstop behind the weights-index check) so a paused-but-unfinished
+    /// download is not advertised. Default 15s.
+    #[arg(
+        long,
+        env = "MODEL_EXPRESS_CACHE_CAPTURE_QUIESCENCE_SECS",
+        default_value_t = 15
+    )]
+    capture_quiescence_secs: u64,
+
     /// NIXL agent name for this process.
     #[arg(long, default_value = "mx-cache")]
     name: String,
@@ -529,11 +540,13 @@ async fn run_reconcile(cli: &Cli) -> anyhow::Result<()> {
     );
     if cli.auto_expand {
         use modelexpress_client::cache::usage::AtimeUsage;
-        reconciler = reconciler.with_bounding(
-            std::sync::Arc::new(AtimeUsage),
-            Duration::from_secs(cli.demand_ttl_secs),
-            Duration::from_secs(cli.gc_grace_secs),
-        );
+        reconciler = reconciler
+            .with_bounding(
+                std::sync::Arc::new(AtimeUsage),
+                Duration::from_secs(cli.demand_ttl_secs),
+                Duration::from_secs(cli.gc_grace_secs),
+            )
+            .with_capture_quiescence(Duration::from_secs(cli.capture_quiescence_secs));
     }
     let fetcher = NixlFetcher {
         agent_name: cli.name.clone(),

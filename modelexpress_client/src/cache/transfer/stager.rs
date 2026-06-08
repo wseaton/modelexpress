@@ -62,9 +62,12 @@ pub struct CacheServer<'a, T: Transport, L: ModelLocator> {
     buf: StagingBuffer,
     locator: L,
     direct: bool,
-    /// Scanned-once manifests per model name (scanning re-hashes the whole
-    /// model, so it is cached).
-    held: HashMap<String, (PathBuf, Manifest)>,
+    /// Manifests per model, cached by the snapshot's newest mtime. Scanning
+    /// re-hashes the whole model so it is cached, but the cache is invalidated
+    /// when the snapshot changes on disk, so a model that grew after a first
+    /// partial scan (e.g. a download that finished later) is re-scanned rather
+    /// than served stale.
+    held: HashMap<String, (Option<std::time::SystemTime>, PathBuf, Manifest)>,
     /// Live sessions keyed by puller agent name.
     sessions: HashMap<String, Session>,
 }
@@ -138,15 +141,17 @@ impl<'a, T: Transport, L: ModelLocator> CacheServer<'a, T, L> {
     /// `MANIFEST` + JSON for `model`, scanning and caching the manifest the first
     /// time. Errors if the node does not hold the model.
     fn manifest_reply(&mut self, model: &str) -> anyhow::Result<Vec<u8>> {
-        if !self.held.contains_key(model) {
-            let (dir, revision) = self
-                .locator
-                .locate(model)
-                .with_context(|| format!("model not held: {model}"))?;
+        let (dir, revision) = self
+            .locator
+            .locate(model)
+            .with_context(|| format!("model not held: {model}"))?;
+        let mtime = cache_layout::newest_mtime(&dir);
+        let cached_fresh = matches!(self.held.get(model), Some((m, _, _)) if *m == mtime);
+        if !cached_fresh {
             let manifest = cache_layout::scan_manifest(&dir, &revision)?;
-            self.held.insert(model.to_string(), (dir, manifest));
+            self.held.insert(model.to_string(), (mtime, dir, manifest));
         }
-        let (_, manifest) = self.held.get(model).context("manifest vanished")?;
+        let (_, _, manifest) = self.held.get(model).context("manifest vanished")?;
         let mut reply = notif::MANIFEST.to_vec();
         reply.extend_from_slice(&serde_json::to_vec(manifest)?);
         Ok(reply)
@@ -163,7 +168,7 @@ impl<'a, T: Transport, L: ModelLocator> CacheServer<'a, T, L> {
             .clone();
         // Clone the small bits so no map borrow is held across the transfer.
         let (dir, shard) = {
-            let (dir, manifest) = self.held.get(&model).context("held model vanished")?;
+            let (_, dir, manifest) = self.held.get(&model).context("held model vanished")?;
             let shard = manifest
                 .shards
                 .get(idx)
