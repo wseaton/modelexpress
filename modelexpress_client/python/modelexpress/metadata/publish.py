@@ -73,25 +73,10 @@ def build_source_identity(
     parallel = vllm_config.parallel_config
     tp_size = getattr(parallel, "tensor_parallel_size", 1)
     pp_size = getattr(parallel, "pipeline_parallel_size", 1)
-    dp_size = getattr(parallel, "data_parallel_size", 1)
-    if model_shards_experts(model_config):
-        ep = expert_parallel_rank_and_world()
-        ep_size = ep[1] if ep is not None else dp_size * tp_size
-    else:
-        ep_size = 0
 
     # torch.dtype.__str__ returns e.g. "torch.bfloat16"; strip the prefix
     dtype = str(model_config.dtype).replace("torch.", "")
     quantization = model_config.quantization or ""
-
-    extra_parameters: dict[str, str] = {}
-    if ep_size:
-        extra_parameters["expert_placement_strategy"] = str(
-            getattr(parallel, "expert_placement_strategy", "") or ""
-        )
-        extra_parameters["enable_eplb"] = (
-            "true" if getattr(parallel, "enable_eplb", False) else "false"
-        )
 
     return p2p_pb2.SourceIdentity(
         mx_version=mx_version,
@@ -100,10 +85,8 @@ def build_source_identity(
         backend_framework=p2p_pb2.BACKEND_FRAMEWORK_VLLM,
         tensor_parallel_size=tp_size,
         pipeline_parallel_size=pp_size,
-        expert_parallel_size=ep_size,
         dtype=dtype,
         quantization=quantization,
-        extra_parameters=extra_parameters,
         revision=_resolve_model_revision(model_config),
     )
 

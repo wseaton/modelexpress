@@ -21,6 +21,8 @@ from .base import (
     register_tensors,
 )
 from .context import LoadResult
+from ..expert_gather import GatherCtx
+from ..metadata.publish import expert_parallel_rank_and_world, model_shards_experts
 from ..nixl_transfer import is_nixl_available
 from ..transfer_safety import check_transfer_allowed
 from ..types import TensorDescriptor
@@ -29,6 +31,36 @@ from .. import p2p_pb2
 logger = logging.getLogger("modelexpress.strategy_rdma")
 
 MAX_SOURCE_RETRIES = 3
+
+
+def _build_gather_ctx(ctx: LoadContext, source_ep_rank: int) -> GatherCtx | None:
+    """Cross-topology expert-gather context, or None for dense/unknown models."""
+    if not model_shards_experts(ctx.model_config):
+        return None
+    ep = expert_parallel_rank_and_world()
+    if ep is None:
+        return None
+    target_ep_rank, target_ep_size = ep
+    try:
+        global_num_experts = int(ctx.model_config.get_num_experts())
+    except Exception:
+        return None
+    if not global_num_experts:
+        return None
+    placement = "linear"
+    vllm_config = getattr(ctx.adapter, "vllm_config", None)
+    if vllm_config is not None:
+        placement = str(
+            getattr(vllm_config.parallel_config, "expert_placement_strategy", "linear")
+            or "linear"
+        )
+    return GatherCtx(
+        target_ep_size=target_ep_size,
+        target_ep_rank=target_ep_rank,
+        source_ep_rank=source_ep_rank,
+        global_num_experts=global_num_experts,
+        placement=placement,
+    )
 
 
 class RdmaStrategy(LoadStrategy):
@@ -159,10 +191,14 @@ class RdmaStrategy(LoadStrategy):
                 f"available_source_ranks="
                 f"{sorted(i.worker_rank for i in list_resp.instances)}"
             )
-            candidates = [
+            # Prefer a same-rank (matched-topology) donor for a whole-tensor
+            # copy; fall back to any ready worker so a full-holder source can
+            # seed a differently-sharded target via per-expert gather.
+            exact = [
                 inst for inst in list_resp.instances
                 if inst.worker_rank == ctx.worker_rank
             ]
+            candidates = exact if exact else list(list_resp.instances)
             random.shuffle(candidates)
             logger.info(
                 f"[Worker {ctx.global_rank}] Found {len(candidates)} ready source worker(s)"
@@ -295,6 +331,8 @@ class RdmaStrategy(LoadStrategy):
             f"{' (P2P)' if is_p2p else ''}"
         )
 
+        gather = _build_gather_ctx(ctx, source_worker.worker_rank)
+
         transfer_start = time.perf_counter()
         try:
             bytes_transferred, tensor_count, _ = ctx.nixl_manager.receive_from_source(
@@ -302,6 +340,7 @@ class RdmaStrategy(LoadStrategy):
                 source_tensors=source_tensors,
                 timeout_seconds=300.0,
                 remote_agent_name=remote_agent_name_override,
+                gather=gather,
             )
         except Exception as e:
             raise SourceTransferError(f"RDMA receive failed: {e}") from e

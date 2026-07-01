@@ -89,26 +89,16 @@ def _identity_model_config(*, is_moe):
     )
 
 
-def test_identity_dense_has_no_ep_or_placement():
-    config = _vllm_config(tp_size=2, dp_size=4, is_moe=False)
-    identity = build_source_identity(config, _identity_model_config(is_moe=False))
-    assert identity.expert_parallel_size == 0
-    assert "expert_placement_strategy" not in identity.extra_parameters
-    assert "enable_eplb" not in identity.extra_parameters
-
-
-def test_identity_moe_sets_ep_size_and_placement():
-    config = _vllm_config(tp_size=1, dp_size=2, is_moe=True)
-    config.parallel_config.expert_placement_strategy = "linear"
-    config.parallel_config.enable_eplb = False
-    with patch(
-        "modelexpress.metadata.publish.expert_parallel_rank_and_world",
-        return_value=(0, 2),
-    ):
-        identity = build_source_identity(config, _identity_model_config(is_moe=True))
-    assert identity.expert_parallel_size == 2
-    assert identity.extra_parameters["expert_placement_strategy"] == "linear"
-    assert identity.extra_parameters["enable_eplb"] == "false"
+def test_identity_is_topology_agnostic():
+    # Identity is content-only: expert-parallel layout is NOT hashed, so
+    # sources of the same model under different EP topologies share an
+    # mx_source_id and can discover each other for cross-topology gather.
+    dense = build_source_identity(_vllm_config(is_moe=False), _identity_model_config(is_moe=False))
+    moe = build_source_identity(_vllm_config(dp_size=2, is_moe=True), _identity_model_config(is_moe=True))
+    for identity in (dense, moe):
+        assert identity.expert_parallel_size == 0
+        assert "expert_placement_strategy" not in identity.extra_parameters
+        assert "enable_eplb" not in identity.extra_parameters
 
 
 def test_vllm_device_id_uses_current_platform_device(monkeypatch):

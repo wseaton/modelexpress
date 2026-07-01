@@ -21,6 +21,13 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from . import ucx_utils
+from .expert_gather import (
+    GatherCtx,
+    LocalTensor,
+    SourceTensor,
+    is_expert_tensor,
+    plan_gather,
+)
 from .types import ManifestMismatchError, TensorDescriptor
 
 if TYPE_CHECKING:
@@ -444,6 +451,7 @@ class NixlTransferManager:
         source_tensors: list[TensorDescriptor],
         timeout_seconds: float | None = None,
         remote_agent_name: str | None = None,
+        gather: "GatherCtx | None" = None,
     ) -> tuple[int, int, float]:
         """
         Receive weights from a remote source via NIXL RDMA.
@@ -491,33 +499,53 @@ class NixlTransferManager:
         local_descs: list[tuple[int, int, int]] = []
         total_bytes = 0
 
+        gathered_experts = 0
         for src_tensor in source_tensors:
             local_tensor = self._tensors.get(src_tensor.name)
             if local_tensor is None:
                 continue
-            local_size = local_tensor.numel() * local_tensor.element_size()
-            if local_size != src_tensor.size:
-                raise ManifestMismatchError(
-                    f"Tensor '{src_tensor.name}' size mismatch: "
-                    f"source={src_tensor.size} bytes, local={local_size} bytes"
-                )
             local_dtype = str(local_tensor.dtype)
             if local_dtype != src_tensor.dtype:
                 raise ManifestMismatchError(
                     f"Tensor '{src_tensor.name}' dtype mismatch: "
                     f"source={src_tensor.dtype!r}, local={local_dtype!r}"
                 )
-            remote_descs.append(
-                (src_tensor.addr, src_tensor.size, src_tensor.device_id)
-            )
-            local_descs.append(
-                (
-                    local_tensor.data_ptr(),
-                    local_size,
-                    self._device_id,
+            local_size = local_tensor.numel() * local_tensor.element_size()
+            if local_size == src_tensor.size:
+                remote_descs.append(
+                    (src_tensor.addr, src_tensor.size, src_tensor.device_id)
                 )
-            )
-            total_bytes += src_tensor.size
+                local_descs.append((local_tensor.data_ptr(), local_size, self._device_id))
+                total_bytes += src_tensor.size
+            elif gather is not None and is_expert_tensor(src_tensor.name) and local_tensor.dim() >= 1:
+                num_local = int(local_tensor.shape[0])
+                stride = local_size // num_local
+                source_held = src_tensor.size // stride if stride else 0
+                if source_held == 0 or gather.global_num_experts % source_held != 0:
+                    raise ManifestMismatchError(
+                        f"Tensor '{src_tensor.name}' cannot expert-gather: "
+                        f"local={local_size} source={src_tensor.size} stride={stride}"
+                    )
+                source_ep_size = gather.global_num_experts // source_held
+                subs = plan_gather(
+                    src_tensor.name,
+                    LocalTensor(local_tensor.data_ptr(), local_size, self._device_id, num_local),
+                    [SourceTensor(src_tensor.addr, src_tensor.size, src_tensor.device_id, gather.source_ep_rank)],
+                    gather.target_ep_size, gather.target_ep_rank, source_ep_size,
+                    gather.global_num_experts, gather.placement, require_complete=True,
+                )
+                for st in subs:
+                    remote_descs.append(st.remote)
+                    local_descs.append(st.local)
+                    total_bytes += st.remote[1]
+                gathered_experts += len(subs)
+            else:
+                raise ManifestMismatchError(
+                    f"Tensor '{src_tensor.name}' size mismatch: "
+                    f"source={src_tensor.size} bytes, local={local_size} bytes"
+                )
+        if gathered_experts:
+            logger.info(f"Expert-gather: {gathered_experts} per-expert reads planned")
 
         matched_tensors = len(remote_descs)
         match_time = time.perf_counter() - match_start
