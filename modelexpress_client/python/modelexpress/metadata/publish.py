@@ -35,6 +35,19 @@ _heartbeat_threads: dict[int, HeartbeatThread] = {}
 _worker_servers: dict[int, "WorkerGrpcServer"] = {}  # P2P mode only
 
 
+def model_shards_experts(model_config) -> bool:
+    """True when the model's experts are sharded across the dp*tp ranks."""
+    try:
+        if getattr(model_config, "is_moe", False):
+            return True
+    except Exception:
+        pass
+    try:
+        return int(model_config.get_num_experts()) > 1
+    except Exception:
+        return False
+
+
 def build_source_identity(
     vllm_config, model_config,
 ) -> p2p_pb2.SourceIdentity:
@@ -49,11 +62,21 @@ def build_source_identity(
     parallel = vllm_config.parallel_config
     tp_size = getattr(parallel, "tensor_parallel_size", 1)
     pp_size = getattr(parallel, "pipeline_parallel_size", 1)
-    ep_size = getattr(parallel, "expert_parallel_size", 0)
+    dp_size = getattr(parallel, "data_parallel_size", 1)
+    ep_size = dp_size * tp_size if model_shards_experts(model_config) else 0
 
     # torch.dtype.__str__ returns e.g. "torch.bfloat16"; strip the prefix
     dtype = str(model_config.dtype).replace("torch.", "")
     quantization = model_config.quantization or ""
+
+    extra_parameters: dict[str, str] = {}
+    if ep_size:
+        extra_parameters["expert_placement_strategy"] = str(
+            getattr(parallel, "expert_placement_strategy", "") or ""
+        )
+        extra_parameters["enable_eplb"] = (
+            "true" if getattr(parallel, "enable_eplb", False) else "false"
+        )
 
     return p2p_pb2.SourceIdentity(
         mx_version=mx_version,
@@ -65,6 +88,7 @@ def build_source_identity(
         expert_parallel_size=ep_size,
         dtype=dtype,
         quantization=quantization,
+        extra_parameters=extra_parameters,
         revision=_resolve_model_revision(model_config),
     )
 

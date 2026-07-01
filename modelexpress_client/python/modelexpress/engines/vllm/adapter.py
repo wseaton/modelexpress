@@ -16,7 +16,7 @@ import torch
 from ...adapter import EngineAdapter
 from ...load_strategy.context import LoadContext, LoadResult
 from ...metadata.client_factory import create_metadata_client
-from ...metadata.publish import build_source_identity
+from ...metadata.publish import build_source_identity, model_shards_experts
 from ...rank_utils import get_global_rank
 from ...tensor_utils import adopt_hidden_tensors, capture_tensor_attrs, collect_module_tensors
 
@@ -39,7 +39,7 @@ class VllmAdapter(EngineAdapter):
         return build_source_identity(self.vllm_config, self.model_config)
 
     def get_worker_rank(self) -> int:
-        return _get_vllm_worker_rank(self.vllm_config, self.target_device)
+        return _get_vllm_worker_rank(self.vllm_config, self.model_config)
 
     def get_global_rank(self) -> int:
         return get_global_rank(self.target_device)
@@ -199,20 +199,38 @@ def _set_load_config_extra_config(load_config, extra_config: dict) -> None:
         object.__setattr__(load_config, "model_loader_extra_config", extra_config)
 
 
-def _get_vllm_worker_rank(
-    vllm_config: VllmConfig, target_device: torch.device
-) -> int:
-    """Return the vLLM model-shard key (torch.distributed world rank).
+def _get_tp_rank() -> int:
+    try:
+        from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
 
-    Falls back to vllm_config.parallel_config.rank when torch.distributed is
-    not initialised and the target device has no index (pre-init / bare-cuda
-    test paths), so workers in the same DP still get distinct keys.
-    """
-    worker_rank = get_global_rank(target_device)
-    if worker_rank == 0 and target_device.index is None:
-        worker_rank = int(vllm_config.parallel_config.rank)
-    logger.debug("vLLM worker rank: %d", worker_rank)
-    return worker_rank
+        return int(get_tensor_model_parallel_rank())
+    except Exception:
+        return 0
+
+
+def _get_pp_rank() -> int:
+    try:
+        from vllm.distributed.parallel_state import get_pp_group
+
+        return int(get_pp_group().rank_in_group)
+    except Exception:
+        return 0
+
+
+def _get_vllm_worker_rank(vllm_config: VllmConfig, model_config) -> int:
+    """Return the weight-shard key; workers sharing it hold identical weights."""
+    parallel = vllm_config.parallel_config
+    tp_size = getattr(parallel, "tensor_parallel_size", 1)
+    tp_rank = _get_tp_rank()
+    pp_rank = _get_pp_rank()
+    if model_shards_experts(model_config):
+        dp_size = getattr(parallel, "data_parallel_size", 1)
+        dp_rank = getattr(parallel, "data_parallel_rank", 0)
+        shard_rank = pp_rank * (dp_size * tp_size) + dp_rank * tp_size + tp_rank
+    else:
+        shard_rank = pp_rank * tp_size + tp_rank
+    logger.debug("vLLM shard rank: %d", shard_rank)
+    return shard_rank
 
 
 def _get_vllm_device_id(target_device: torch.device) -> int:

@@ -15,55 +15,91 @@ from modelexpress.engines.vllm.adapter import (
     _get_vllm_worker_rank,
     build_vllm_load_context,
 )
+from modelexpress.metadata.publish import build_source_identity
 
 
-def _vllm_config(*, rank: int, tp_size: int, pp_size: int):
+def _vllm_config(*, tp_size=1, pp_size=1, dp_size=1, dp_rank=0, is_moe=False):
     return SimpleNamespace(
         parallel_config=SimpleNamespace(
-            rank=rank,
+            rank=0,
             tensor_parallel_size=tp_size,
             pipeline_parallel_size=pp_size,
-        )
+            data_parallel_size=dp_size,
+            data_parallel_rank=dp_rank,
+        ),
+        model_config=SimpleNamespace(is_moe=is_moe),
     )
 
 
-def test_worker_rank_uses_torch_distributed_global_rank():
-    config = _vllm_config(rank=2, tp_size=4, pp_size=2)
-    device = torch.device("cuda", 0)
-
-    with patch("torch.distributed.is_initialized", return_value=True), patch(
-        "torch.distributed.get_rank", return_value=6,
-    ):
-        assert _get_vllm_worker_rank(config, device) == 6
+def _cfg(**kw):
+    c = _vllm_config(**kw)
+    return c, c.model_config
 
 
-def test_worker_rank_distinguishes_dp_replicas():
-    config = _vllm_config(rank=0, tp_size=4, pp_size=2)
-    device = torch.device("cuda", 0)
-
-    with patch("torch.distributed.is_initialized", return_value=True), patch(
-        "torch.distributed.get_rank", return_value=5,
-    ):
-        dp0_rank = _get_vllm_worker_rank(config, device)
-
-    with patch("torch.distributed.is_initialized", return_value=True), patch(
-        "torch.distributed.get_rank", return_value=13,
-    ):
-        dp1_rank = _get_vllm_worker_rank(config, device)
-
-    assert dp0_rank == 5
-    assert dp1_rank == 13
+def _patch_ranks(tp_rank, pp_rank):
+    return (
+        patch("modelexpress.engines.vllm.adapter._get_tp_rank", return_value=tp_rank),
+        patch("modelexpress.engines.vllm.adapter._get_pp_rank", return_value=pp_rank),
+    )
 
 
-def test_worker_rank_falls_back_to_parallel_config_rank_pre_init():
-    # Pre-init / bare-cuda path: torch.distributed not initialised AND device
-    # has no index. Falls back to parallel_config.rank so workers in the same
-    # DP still get distinct keys.
-    config = _vllm_config(rank=3, tp_size=4, pp_size=2)
-    bare_device = torch.device("cuda")
+def test_shard_key_dense_excludes_dp_rank():
+    config = _vllm_config(tp_size=4, pp_size=2, dp_size=8, dp_rank=5, is_moe=False)
+    tp, pp = _patch_ranks(2, 1)
+    with tp, pp:
+        assert _get_vllm_worker_rank(config, config.model_config) == 1 * 4 + 2
 
-    with patch("torch.distributed.is_initialized", return_value=False):
-        assert _get_vllm_worker_rank(config, bare_device) == 3
+
+def test_shard_key_dense_dp_replicas_share_key():
+    tp, pp = _patch_ranks(0, 0)
+    with tp, pp:
+        r0 = _get_vllm_worker_rank(*_cfg(dp_size=2, dp_rank=0, is_moe=False))
+        r1 = _get_vllm_worker_rank(*_cfg(dp_size=2, dp_rank=1, is_moe=False))
+    assert r0 == r1 == 0
+
+
+def test_shard_key_moe_includes_dp_rank():
+    config = _vllm_config(tp_size=4, pp_size=2, dp_size=8, dp_rank=3, is_moe=True)
+    tp, pp = _patch_ranks(2, 1)
+    with tp, pp:
+        assert _get_vllm_worker_rank(config, config.model_config) == 1 * (8 * 4) + 3 * 4 + 2
+
+
+def test_shard_key_moe_tp1_equals_dp_rank():
+    tp, pp = _patch_ranks(0, 0)
+    with tp, pp:
+        r0 = _get_vllm_worker_rank(*_cfg(dp_size=2, dp_rank=0, is_moe=True))
+        r1 = _get_vllm_worker_rank(*_cfg(dp_size=2, dp_rank=1, is_moe=True))
+    assert r0 == 0
+    assert r1 == 1
+
+
+def _identity_model_config(*, is_moe):
+    return SimpleNamespace(
+        dtype=torch.bfloat16,
+        model="test-model",
+        quantization=None,
+        revision=None,
+        is_moe=is_moe,
+    )
+
+
+def test_identity_dense_has_no_ep_or_placement():
+    config = _vllm_config(tp_size=2, dp_size=4, is_moe=False)
+    identity = build_source_identity(config, _identity_model_config(is_moe=False))
+    assert identity.expert_parallel_size == 0
+    assert "expert_placement_strategy" not in identity.extra_parameters
+    assert "enable_eplb" not in identity.extra_parameters
+
+
+def test_identity_moe_sets_ep_size_and_placement():
+    config = _vllm_config(tp_size=1, dp_size=2, is_moe=True)
+    config.parallel_config.expert_placement_strategy = "linear"
+    config.parallel_config.enable_eplb = False
+    identity = build_source_identity(config, _identity_model_config(is_moe=True))
+    assert identity.expert_parallel_size == 2
+    assert identity.extra_parameters["expert_placement_strategy"] == "linear"
+    assert identity.extra_parameters["enable_eplb"] == "false"
 
 
 def test_vllm_device_id_uses_current_platform_device(monkeypatch):

@@ -76,6 +76,13 @@ class RdmaStrategy(LoadStrategy):
             )
             return False
 
+        if ctx.identity.extra_parameters.get("enable_eplb", "").lower() == "true":
+            logger.info(
+                f"[Worker {ctx.global_rank}] Dynamic expert placement (EPLB) active; "
+                f"RDMA weight transfer unsupported, using disk"
+            )
+            return False
+
         return True
 
     def load(self, result: LoadResult, ctx: LoadContext) -> LoadResult:
@@ -146,6 +153,12 @@ class RdmaStrategy(LoadStrategy):
                 logger.debug(f"[Worker {ctx.global_rank}] No ready source instances found")
                 return []
 
+            logger.info(
+                f"[Worker {ctx.global_rank}] rank-match: my worker_rank={ctx.worker_rank} "
+                f"tp={ctx.identity.tensor_parallel_size} ep={ctx.identity.expert_parallel_size} "
+                f"available_source_ranks="
+                f"{sorted(i.worker_rank for i in list_resp.instances)}"
+            )
             candidates = [
                 inst for inst in list_resp.instances
                 if inst.worker_rank == ctx.worker_rank
