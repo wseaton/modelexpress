@@ -58,20 +58,25 @@ def test_shard_key_dense_dp_replicas_share_key():
     assert r0 == r1 == 0
 
 
-def test_shard_key_moe_includes_dp_rank():
+def _patch_ep(value):
+    return patch(
+        "modelexpress.engines.vllm.adapter.expert_parallel_rank_and_world",
+        return_value=value,
+    )
+
+
+def test_shard_key_moe_delegates_to_ep_group():
+    config = _vllm_config(pp_size=2, is_moe=True)
+    tp, pp = _patch_ranks(0, 1)
+    with tp, pp, _patch_ep((3, 32)):
+        assert _get_vllm_worker_rank(config, config.model_config) == 1 * 32 + 3
+
+
+def test_shard_key_moe_falls_back_to_coordinates_without_ep_group():
     config = _vllm_config(tp_size=4, pp_size=2, dp_size=8, dp_rank=3, is_moe=True)
     tp, pp = _patch_ranks(2, 1)
-    with tp, pp:
+    with tp, pp, _patch_ep(None):
         assert _get_vllm_worker_rank(config, config.model_config) == 1 * (8 * 4) + 3 * 4 + 2
-
-
-def test_shard_key_moe_tp1_equals_dp_rank():
-    tp, pp = _patch_ranks(0, 0)
-    with tp, pp:
-        r0 = _get_vllm_worker_rank(*_cfg(dp_size=2, dp_rank=0, is_moe=True))
-        r1 = _get_vllm_worker_rank(*_cfg(dp_size=2, dp_rank=1, is_moe=True))
-    assert r0 == 0
-    assert r1 == 1
 
 
 def _identity_model_config(*, is_moe):
@@ -96,7 +101,11 @@ def test_identity_moe_sets_ep_size_and_placement():
     config = _vllm_config(tp_size=1, dp_size=2, is_moe=True)
     config.parallel_config.expert_placement_strategy = "linear"
     config.parallel_config.enable_eplb = False
-    identity = build_source_identity(config, _identity_model_config(is_moe=True))
+    with patch(
+        "modelexpress.metadata.publish.expert_parallel_rank_and_world",
+        return_value=(0, 2),
+    ):
+        identity = build_source_identity(config, _identity_model_config(is_moe=True))
     assert identity.expert_parallel_size == 2
     assert identity.extra_parameters["expert_placement_strategy"] == "linear"
     assert identity.extra_parameters["enable_eplb"] == "false"

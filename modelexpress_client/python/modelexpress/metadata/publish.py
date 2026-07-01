@@ -48,6 +48,17 @@ def model_shards_experts(model_config) -> bool:
         return False
 
 
+def expert_parallel_rank_and_world() -> tuple[int, int] | None:
+    """Return vLLM's expert-parallel (rank_in_group, world_size), or None."""
+    try:
+        from vllm.distributed.parallel_state import get_ep_group
+
+        ep = get_ep_group()
+        return int(ep.rank_in_group), int(ep.world_size)
+    except Exception:
+        return None
+
+
 def build_source_identity(
     vllm_config, model_config,
 ) -> p2p_pb2.SourceIdentity:
@@ -63,7 +74,11 @@ def build_source_identity(
     tp_size = getattr(parallel, "tensor_parallel_size", 1)
     pp_size = getattr(parallel, "pipeline_parallel_size", 1)
     dp_size = getattr(parallel, "data_parallel_size", 1)
-    ep_size = dp_size * tp_size if model_shards_experts(model_config) else 0
+    if model_shards_experts(model_config):
+        ep = expert_parallel_rank_and_world()
+        ep_size = ep[1] if ep is not None else dp_size * tp_size
+    else:
+        ep_size = 0
 
     # torch.dtype.__str__ returns e.g. "torch.bfloat16"; strip the prefix
     dtype = str(model_config.dtype).replace("torch.", "")

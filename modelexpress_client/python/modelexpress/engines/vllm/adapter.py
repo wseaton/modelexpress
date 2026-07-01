@@ -16,7 +16,11 @@ import torch
 from ...adapter import EngineAdapter
 from ...load_strategy.context import LoadContext, LoadResult
 from ...metadata.client_factory import create_metadata_client
-from ...metadata.publish import build_source_identity, model_shards_experts
+from ...metadata.publish import (
+    build_source_identity,
+    expert_parallel_rank_and_world,
+    model_shards_experts,
+)
 from ...rank_utils import get_global_rank
 from ...tensor_utils import adopt_hidden_tensors, capture_tensor_attrs, collect_module_tensors
 
@@ -224,9 +228,14 @@ def _get_vllm_worker_rank(vllm_config: VllmConfig, model_config) -> int:
     tp_rank = _get_tp_rank()
     pp_rank = _get_pp_rank()
     if model_shards_experts(model_config):
-        dp_size = getattr(parallel, "data_parallel_size", 1)
-        dp_rank = getattr(parallel, "data_parallel_rank", 0)
-        shard_rank = pp_rank * (dp_size * tp_size) + dp_rank * tp_size + tp_rank
+        ep = expert_parallel_rank_and_world()
+        if ep is not None:
+            ep_rank, ep_world = ep
+            shard_rank = pp_rank * ep_world + ep_rank
+        else:
+            dp_size = getattr(parallel, "data_parallel_size", 1)
+            dp_rank = getattr(parallel, "data_parallel_rank", 0)
+            shard_rank = pp_rank * (dp_size * tp_size) + dp_rank * tp_size + tp_rank
     else:
         shard_rank = pp_rank * tp_size + tp_rank
     logger.debug("vLLM shard rank: %d", shard_rank)
