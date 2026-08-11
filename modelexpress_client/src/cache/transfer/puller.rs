@@ -231,12 +231,20 @@ impl<'a, T: Transport> Puller<'a, T> {
             let final_path = dest.join(&shard.rel_path);
             cache_layout::ensure_parent(&final_path)?;
             let tmp = cache_layout::temp_path(&final_path);
-            let file = cache_layout::open_direct(&tmp, true, self.direct)?;
-            file.set_len(write_size)?;
+            let file = {
+                let _prep = tracing::debug_span!("prep", idx).entered();
+                let file = cache_layout::open_direct(&tmp, true, self.direct)?;
+                file.set_len(write_size)?;
+                file
+            };
 
             let handle = if size > 0 {
                 let fd = file.as_raw_fd();
-                self.agent.register_file(fd, usize::try_from(write_size)?)?;
+                {
+                    let _reg = tracing::debug_span!("reg", idx).entered();
+                    self.agent.register_file(fd, usize::try_from(write_size)?)?;
+                }
+                let _post = tracing::debug_span!("post", idx).entered();
                 Some(
                     self.agent
                         .post_write_dram_to_file(slot_base, fd, write_size)?,
