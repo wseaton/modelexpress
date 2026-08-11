@@ -12,7 +12,9 @@ use modelexpress_common::{
     },
 };
 use modelexpress_server::p2p::backend::WorkerRecord;
-use modelexpress_server::p2p::k8s_types::{ArtifactSourceStatus, ModelMetadataSpec, WorkerStatus};
+use modelexpress_server::p2p::k8s_types::{
+    ArtifactSourceStatus, WorkerStatus, source_type_name_from_proto,
+};
 use std::fs;
 
 fn base_identity() -> SourceIdentity {
@@ -177,27 +179,27 @@ fn tensor_payload_also_populates_legacy_tensors_for_old_readers() {
 #[test]
 fn k8s_metadata_contract_carries_artifact_source_type_and_summary() {
     assert_eq!(
-        ModelMetadataSpec::source_type_name_from_proto(MxSourceType::TorchCompileCache as i32),
+        source_type_name_from_proto(MxSourceType::TorchCompileCache as i32),
         "torch_compile_cache"
     );
     assert_eq!(
-        ModelMetadataSpec::source_type_name_from_proto(MxSourceType::DeepGemmCache as i32),
+        source_type_name_from_proto(MxSourceType::DeepGemmCache as i32),
         "deep_gemm_cache"
     );
     assert_eq!(
-        ModelMetadataSpec::source_type_name_from_proto(MxSourceType::TilelangCache as i32),
+        source_type_name_from_proto(MxSourceType::TilelangCache as i32),
         "tilelang_cache"
     );
     assert_eq!(
-        ModelMetadataSpec::source_type_name_from_proto(MxSourceType::CuteDslCache as i32),
+        source_type_name_from_proto(MxSourceType::CuteDslCache as i32),
         "cute_dsl_cache"
     );
     assert_eq!(
-        ModelMetadataSpec::source_type_name_from_proto(MxSourceType::FlashinferCache as i32),
+        source_type_name_from_proto(MxSourceType::FlashinferCache as i32),
         "flashinfer_cache"
     );
     assert_eq!(
-        ModelMetadataSpec::source_type_name_from_proto(MxSourceType::TvmFfiCache as i32),
+        source_type_name_from_proto(MxSourceType::TvmFfiCache as i32),
         "tvm_ffi_cache"
     );
 

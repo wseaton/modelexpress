@@ -254,7 +254,7 @@ impl MetadataBackend for KubernetesBackend {
                 },
                 spec: ModelMetadataSpec {
                     model_name: model_name.to_string(),
-                    source_type: ModelMetadataSpec::source_type_name_from_proto(
+                    source_type: crate::p2p::k8s_types::source_type_name_from_proto(
                         identity.mx_source_type,
                     ),
                 },

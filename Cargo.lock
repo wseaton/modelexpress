@@ -2442,6 +2442,7 @@ dependencies = [
  "hf-hub",
  "jiff",
  "mockall 0.13.1",
+ "modelexpress-types",
  "prost 0.13.5",
  "reqwest 0.12.23",
  "rustls",
@@ -2478,6 +2479,7 @@ dependencies = [
  "mockall 0.14.0",
  "modelexpress-client",
  "modelexpress-common",
+ "modelexpress-types",
  "moka",
  "once_cell",
  "prost 0.13.5",
@@ -2501,6 +2503,18 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "modelexpress-types"
+version = "0.5.0"
+dependencies = [
+ "chrono",
+ "k8s-openapi",
+ "kube",
+ "schemars 1.2.1",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

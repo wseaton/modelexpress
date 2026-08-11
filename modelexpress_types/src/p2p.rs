@@ -1,0 +1,487 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+//! Kubernetes CRD types for ModelMetadata.
+//!
+//! These types define the ModelMetadata CustomResourceDefinition used as an
+//! alternative to Redis for storing P2P metadata.
+
+use kube::CustomResource;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+
+/// ModelMetadata spec - the desired state
+#[derive(CustomResource, Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[kube(
+    group = "modelexpress.nvidia.com",
+    version = "v1alpha1",
+    kind = "ModelMetadata",
+    plural = "modelmetadatas",
+    shortname = "mxmeta",
+    namespaced,
+    status = "ModelMetadataStatus"
+)]
+pub struct ModelMetadataSpec {
+    /// Full model name (e.g., deepseek-ai/DeepSeek-V3)
+    #[serde(rename = "modelName")]
+    pub model_name: String,
+
+    /// Source type from SourceIdentity (e.g., weights, torch_compile_cache).
+    #[serde(rename = "sourceType", default = "default_source_type")]
+    pub source_type: String,
+}
+
+fn default_source_type() -> String {
+    "unknown".to_string()
+}
+
+/// ModelMetadata status - the observed state
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema)]
+pub struct ModelMetadataStatus {
+    /// Single worker NIXL metadata and readiness state (one CR per worker)
+    #[serde(default)]
+    pub worker: Option<WorkerStatus>,
+
+    /// Conditions for ModelMetadata lifecycle
+    #[serde(default)]
+    pub conditions: Vec<Condition>,
+
+    /// Generation observed by the controller
+    #[serde(rename = "observedGeneration", default)]
+    pub observed_generation: i64,
+
+    /// Timestamp when first worker published
+    #[serde(rename = "publishedAt", default)]
+    pub published_at: Option<String>,
+}
+
+/// Per-worker status
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema)]
+pub struct WorkerStatus {
+    /// Worker rank (0-indexed)
+    #[serde(rename = "workerRank")]
+    pub worker_rank: i32,
+
+    /// Backend type discriminator ("nixl", "transfer_engine", "none")
+    #[serde(rename = "backendType", default)]
+    pub backend_type: Option<String>,
+
+    /// Base64-encoded NIXL agent metadata blob
+    #[serde(rename = "nixlMetadata", default)]
+    pub nixl_metadata: String,
+
+    /// Mooncake TransferEngine session ID
+    #[serde(rename = "transferEngineSessionId", default)]
+    pub transfer_engine_session_id: Option<String>,
+
+    /// Number of tensors registered by this worker
+    #[serde(rename = "tensorCount", default)]
+    pub tensor_count: i32,
+
+    /// Name of ConfigMap containing tensor descriptors
+    #[serde(rename = "tensorConfigMap", default)]
+    pub tensor_config_map: Option<String>,
+
+    /// Worker lifecycle status (Initializing, Ready, Stale)
+    #[serde(default)]
+    pub status: String,
+
+    /// Timestamp of last status update (RFC3339)
+    #[serde(rename = "updatedAt", default)]
+    pub updated_at: Option<String>,
+
+    /// P2P: NIXL listen thread endpoint (host:port)
+    #[serde(rename = "metadataEndpoint", default)]
+    pub metadata_endpoint: String,
+
+    /// P2P: NIXL agent name
+    #[serde(rename = "agentName", default)]
+    pub agent_name: String,
+
+    /// P2P: Worker gRPC endpoint for tensor manifest (host:port)
+    #[serde(rename = "workerGrpcEndpoint", default)]
+    pub worker_grpc_endpoint: String,
+
+    /// Runtime accelerator family for compatibility filtering.
+    #[serde(default)]
+    pub accelerator: String,
+
+    /// Small discovery summary for file-backed artifact sources.
+    #[serde(rename = "artifactSource", default)]
+    pub artifact_source: Option<ArtifactSourceStatus>,
+}
+
+/// Bounded artifact discovery summary stored in ModelMetadata status.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq)]
+pub struct ArtifactSourceStatus {
+    /// Digest of the canonical sealed artifact manifest.
+    #[serde(rename = "artifactId")]
+    pub artifact_id: String,
+
+    /// Total artifact bytes across all manifest files. Kubernetes OpenAPI
+    /// exposes this as int64; the backend converts to/from the proto uint64.
+    #[serde(rename = "totalSize")]
+    pub total_size: i64,
+
+    /// Number of files in the sealed artifact manifest.
+    #[serde(rename = "fileCount")]
+    pub file_count: u32,
+
+    /// Number of transfer chunks in the sealed artifact manifest.
+    #[serde(rename = "chunkCount")]
+    pub chunk_count: u32,
+
+    /// Distributed node rank that owns this node-scoped artifact.
+    #[serde(rename = "nodeRank", default)]
+    pub node_rank: u32,
+}
+
+impl WorkerStatus {
+    /// Convert a `SourceStatus` proto enum value (i32) to the CRD status string.
+    pub fn status_name_from_proto(status: i32) -> String {
+        match status {
+            0 => "Unknown",
+            1 => "Initializing",
+            2 => "Ready",
+            3 => "Stale",
+            _ => "Unknown",
+        }
+        .to_string()
+    }
+
+    /// Convert a CRD status string back to the `SourceStatus` proto enum value (i32).
+    pub fn status_proto_from_name(name: &str) -> i32 {
+        match name {
+            "Initializing" => 1,
+            "Ready" => 2,
+            "Stale" => 3,
+            _ => 0,
+        }
+    }
+}
+
+/// Standard Kubernetes condition
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema)]
+pub struct Condition {
+    /// Condition type
+    #[serde(rename = "type")]
+    pub type_: String,
+
+    /// Status: True, False, Unknown
+    pub status: String,
+
+    /// Machine-readable reason for condition
+    #[serde(default)]
+    pub reason: Option<String>,
+
+    /// Human-readable message
+    #[serde(default)]
+    pub message: Option<String>,
+
+    /// Timestamp of last transition
+    #[serde(rename = "lastTransitionTime", default)]
+    pub last_transition_time: Option<String>,
+}
+
+impl ModelMetadataStatus {
+    /// Insert or update a condition by type. If a condition with the same type
+    /// already exists, it is updated in place; `lastTransitionTime` is only
+    /// changed when `status` actually transitions.
+    pub fn set_condition(&mut self, type_: &str, status: &str, reason: &str, message: &str) {
+        let now = chrono::Utc::now().to_rfc3339();
+        if let Some(existing) = self.conditions.iter_mut().find(|c| c.type_ == type_) {
+            if existing.status != status {
+                existing.last_transition_time = Some(now);
+            }
+            existing.status = status.to_string();
+            existing.reason = Some(reason.to_string());
+            existing.message = Some(message.to_string());
+        } else {
+            self.conditions.push(Condition {
+                type_: type_.to_string(),
+                status: status.to_string(),
+                reason: Some(reason.to_string()),
+                message: Some(message.to_string()),
+                last_transition_time: Some(now),
+            });
+        }
+    }
+
+    /// Update the `Ready` condition based on the worker's proto status value.
+    /// Ready=True only when the worker status is `SOURCE_STATUS_READY` (2).
+    pub fn update_ready_condition(&mut self, worker_proto_status: i32) {
+        let is_ready = worker_proto_status == 2; // SOURCE_STATUS_READY
+        if is_ready {
+            self.set_condition("Ready", "True", "WorkerReady", "Worker is ready");
+        } else {
+            let status_name = WorkerStatus::status_name_from_proto(worker_proto_status);
+            self.set_condition(
+                "Ready",
+                "False",
+                &format!("Worker{}", status_name),
+                "Worker is not ready",
+            );
+        }
+    }
+}
+
+/// Tensor descriptor stored in ConfigMap
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct TensorDescriptorJson {
+    pub name: String,
+    /// Serialized as string to avoid precision loss
+    pub addr: String,
+    /// Serialized as string to avoid precision loss
+    pub size: String,
+    pub device_id: u32,
+    pub dtype: String,
+}
+
+/// Sanitize model name to be a valid Kubernetes resource name
+/// e.g., "deepseek-ai/DeepSeek-V3" -> "deepseek-ai-deepseek-v3"
+pub fn sanitize_model_name(model_name: &str) -> String {
+    model_name
+        .to_lowercase()
+        .replace(['/', '_'], "-")
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '.')
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string()
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_model_metadata_spec_defaults_missing_source_type() {
+        let spec: ModelMetadataSpec =
+            serde_json::from_str(r#"{"modelName":"Qwen/Qwen2.5-0.5B-Instruct"}"#)
+                .expect("spec should deserialize without sourceType");
+
+        assert_eq!(spec.model_name, "Qwen/Qwen2.5-0.5B-Instruct");
+        assert_eq!(spec.source_type, "unknown");
+    }
+
+    #[test]
+    fn test_status_roundtrip() {
+        for (proto, name) in [
+            (0, "Unknown"),
+            (1, "Initializing"),
+            (2, "Ready"),
+            (3, "Stale"),
+        ] {
+            assert_eq!(WorkerStatus::status_name_from_proto(proto), name);
+            assert_eq!(WorkerStatus::status_proto_from_name(name), proto);
+        }
+    }
+
+    /// Regression test: proto status 0 (SOURCE_STATUS_UNKNOWN) must survive a
+    /// write-to-CRD -> read-from-CRD roundtrip. Before the fix, status_proto_from_name
+    /// returned None for "Unknown", causing get_metadata to hard-error on any worker
+    /// that hadn't received an explicit UpdateStatus call after PublishMetadata.
+    #[test]
+    fn test_status_unknown_roundtrip() {
+        let written = WorkerStatus::status_name_from_proto(0);
+        assert_eq!(written, "Unknown");
+        let read_back = WorkerStatus::status_proto_from_name(&written);
+        assert_eq!(
+            read_back, 0,
+            "Unknown status must roundtrip to proto value 0"
+        );
+    }
+
+    #[test]
+    fn test_status_name_from_proto_unknown() {
+        assert_eq!(WorkerStatus::status_name_from_proto(99), "Unknown");
+        assert_eq!(WorkerStatus::status_name_from_proto(4), "Unknown");
+    }
+
+    #[test]
+    fn test_status_proto_from_name_unknown() {
+        assert_eq!(WorkerStatus::status_proto_from_name("Unknown"), 0);
+        assert_eq!(WorkerStatus::status_proto_from_name(""), 0);
+        assert_eq!(WorkerStatus::status_proto_from_name("ready"), 0);
+    }
+
+    #[test]
+    fn test_sanitize_model_name() {
+        assert_eq!(
+            sanitize_model_name("deepseek-ai/DeepSeek-V3"),
+            "deepseek-ai-deepseek-v3"
+        );
+        assert_eq!(
+            sanitize_model_name("meta-llama/Llama-3.1-70B"),
+            "meta-llama-llama-3.1-70b"
+        );
+        assert_eq!(sanitize_model_name("simple-model"), "simple-model");
+    }
+
+    #[test]
+    fn test_sanitize_model_name_special_chars() {
+        assert_eq!(sanitize_model_name("Llama@3.1+8B"), "llama3.18b");
+        assert_eq!(sanitize_model_name("model with spaces"), "modelwithspaces");
+        assert_eq!(
+            sanitize_model_name("org_name/model_v2"),
+            "org-name-model-v2"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_model_name_edge_cases() {
+        assert_eq!(sanitize_model_name(""), "");
+        assert_eq!(sanitize_model_name("///"), "");
+        assert_eq!(sanitize_model_name("---"), "");
+        assert_eq!(sanitize_model_name("-model-"), "model");
+    }
+
+    #[test]
+    fn test_tensor_descriptor_json_roundtrip() {
+        let original = TensorDescriptorJson {
+            name: "model.layers.0.weight".to_string(),
+            addr: "139948187451390".to_string(),
+            size: "134217728".to_string(),
+            device_id: 0,
+            dtype: "bfloat16".to_string(),
+        };
+
+        let json = serde_json::to_string(&original).expect("serialize");
+        let parsed: TensorDescriptorJson = serde_json::from_str(&json).expect("deserialize");
+
+        assert_eq!(parsed.name, original.name);
+        assert_eq!(parsed.addr, original.addr);
+        assert_eq!(parsed.size, original.size);
+        assert_eq!(parsed.device_id, original.device_id);
+        assert_eq!(parsed.dtype, original.dtype);
+
+        let addr: u64 = parsed.addr.parse().expect("addr should parse as u64");
+        assert_eq!(addr, 139948187451390);
+        let size: u64 = parsed.size.parse().expect("size should parse as u64");
+        assert_eq!(size, 134217728);
+    }
+
+    #[test]
+    fn test_tensor_descriptor_json_large_values() {
+        let desc = TensorDescriptorJson {
+            name: "test".to_string(),
+            addr: u64::MAX.to_string(),
+            size: u64::MAX.to_string(),
+            device_id: 7,
+            dtype: "float16".to_string(),
+        };
+
+        let json = serde_json::to_string(&desc).expect("serialize");
+        let parsed: TensorDescriptorJson = serde_json::from_str(&json).expect("deserialize");
+
+        let addr: u64 = parsed.addr.parse().expect("max u64 addr should parse");
+        assert_eq!(addr, u64::MAX);
+    }
+
+    #[test]
+    fn test_set_condition_inserts_new() {
+        let mut status = ModelMetadataStatus::default();
+        assert!(status.conditions.is_empty());
+
+        status.set_condition("Ready", "True", "WorkerPublished", "Published");
+
+        assert_eq!(status.conditions.len(), 1);
+        let cond = &status.conditions[0];
+        assert_eq!(cond.type_, "Ready");
+        assert_eq!(cond.status, "True");
+        assert_eq!(cond.reason.as_deref(), Some("WorkerPublished"));
+        assert_eq!(cond.message.as_deref(), Some("Published"));
+        assert!(cond.last_transition_time.is_some());
+    }
+
+    #[test]
+    fn test_set_condition_updates_existing() {
+        let mut status = ModelMetadataStatus::default();
+        status.set_condition("Ready", "True", "WorkerPublished", "Published");
+        let original_time = status.conditions[0].last_transition_time.clone();
+
+        status.set_condition("Ready", "False", "WorkerStale", "Worker is stale");
+
+        assert_eq!(status.conditions.len(), 1);
+        let cond = &status.conditions[0];
+        assert_eq!(cond.status, "False");
+        assert_eq!(cond.reason.as_deref(), Some("WorkerStale"));
+        assert_ne!(
+            cond.last_transition_time, original_time,
+            "lastTransitionTime must change on status transition"
+        );
+    }
+
+    #[test]
+    fn test_set_condition_same_status_preserves_transition_time() {
+        let mut status = ModelMetadataStatus::default();
+        status.set_condition("Ready", "True", "WorkerPublished", "Published");
+        let original_time = status.conditions[0].last_transition_time.clone();
+
+        status.set_condition("Ready", "True", "StillReady", "Still ready");
+
+        assert_eq!(status.conditions.len(), 1);
+        assert_eq!(status.conditions[0].reason.as_deref(), Some("StillReady"));
+        assert_eq!(
+            status.conditions[0].last_transition_time, original_time,
+            "lastTransitionTime must not change when status stays the same"
+        );
+    }
+
+    #[test]
+    fn test_update_ready_condition_ready() {
+        let mut status = ModelMetadataStatus::default();
+        status.update_ready_condition(2); // SOURCE_STATUS_READY
+
+        assert_eq!(status.conditions.len(), 1);
+        let cond = &status.conditions[0];
+        assert_eq!(cond.type_, "Ready");
+        assert_eq!(cond.status, "True");
+        assert_eq!(cond.reason.as_deref(), Some("WorkerReady"));
+    }
+
+    #[test]
+    fn test_update_ready_condition_not_ready_states() {
+        for (proto, expected_reason) in [
+            (0, "WorkerUnknown"),
+            (1, "WorkerInitializing"),
+            (3, "WorkerStale"),
+        ] {
+            let mut status = ModelMetadataStatus::default();
+            status.update_ready_condition(proto);
+
+            assert_eq!(status.conditions.len(), 1);
+            let cond = &status.conditions[0];
+            assert_eq!(cond.type_, "Ready");
+            assert_eq!(cond.status, "False");
+            assert_eq!(
+                cond.reason.as_deref(),
+                Some(expected_reason),
+                "proto status {} should produce reason {}",
+                proto,
+                expected_reason
+            );
+        }
+    }
+
+    #[test]
+    fn test_update_ready_condition_transition() {
+        let mut status = ModelMetadataStatus::default();
+
+        status.update_ready_condition(1); // Initializing
+        assert_eq!(status.conditions[0].status, "False");
+        let time_false = status.conditions[0].last_transition_time.clone();
+
+        status.update_ready_condition(2); // Ready
+        assert_eq!(status.conditions[0].status, "True");
+        assert_ne!(
+            status.conditions[0].last_transition_time, time_false,
+            "lastTransitionTime must change on False->True transition"
+        );
+
+        status.update_ready_condition(3); // Stale
+        assert_eq!(status.conditions[0].status, "False");
+        assert_eq!(status.conditions[0].reason.as_deref(), Some("WorkerStale"));
+    }
+}

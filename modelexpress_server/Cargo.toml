@@ -22,6 +22,7 @@ memory-backend = []
 integration-tests = ["memory-backend"]
 
 [dependencies]
+modelexpress-types = { workspace = true }
 modelexpress-common = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
