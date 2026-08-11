@@ -126,12 +126,12 @@ struct Cli {
 
     /// Concurrent NVMe write streams per shard: each posted write is striped
     /// across this many transfer requests so the RAID absorbs parallel writers.
-    /// 1 preserves the single-stream behaviour (~2 GB/s on the target array);
-    /// the array's aggregate ceiling is ~3.2 GB/s around 8 streams.
+    /// Measured on the target array (uring queue): 1 stream 2.85 GB/s, 4
+    /// streams 3.0 GB/s (the disk's aggregate ceiling); more buys nothing.
     #[arg(
         long,
         env = modelexpress_common::envs::MODEL_EXPRESS_CACHE_WRITE_STREAMS,
-        default_value_t = 1
+        default_value_t = 4
     )]
     write_streams: usize,
 
