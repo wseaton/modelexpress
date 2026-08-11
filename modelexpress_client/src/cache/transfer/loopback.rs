@@ -82,6 +82,24 @@ pub struct Loopback {
     /// already-loaded name fails until it is invalidated, so tests exercise the
     /// same reconnect behaviour the hardware shows.
     loaded: HashSet<String>,
+    /// Live file registrations (each [`FileRegToken`] decrements on drop), plus
+    /// a monotonic total, so tests can prove registrations are reclaimed and
+    /// that the assertion is not vacuous.
+    active_file_regs: Arc<std::sync::atomic::AtomicUsize>,
+    total_file_regs: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// Guard for a loopback file registration; decrements the agent's live count on
+/// drop, mirroring NIXL's deregister-on-drop `RegistrationHandle`.
+pub struct FileRegToken {
+    active: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Drop for FileRegToken {
+    fn drop(&mut self) {
+        self.active
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 impl Loopback {
@@ -103,7 +121,21 @@ impl Loopback {
             inbox,
             corrupt,
             loaded: HashSet::new(),
+            active_file_regs: Arc::default(),
+            total_file_regs: Arc::default(),
         }
+    }
+
+    /// File registrations currently live (registered and not yet dropped).
+    pub fn active_file_regs(&self) -> usize {
+        self.active_file_regs
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// File registrations ever made by this agent.
+    pub fn total_file_regs(&self) -> usize {
+        self.total_file_regs
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -191,8 +223,16 @@ impl Transport for Loopback {
         Ok(())
     }
 
-    fn register_file(&mut self, _fd: RawFd, _len: usize) -> anyhow::Result<()> {
-        Ok(())
+    type FileReg = FileRegToken;
+
+    fn register_file(&mut self, _fd: RawFd, _len: usize) -> anyhow::Result<FileRegToken> {
+        self.active_file_regs
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.total_file_regs
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(FileRegToken {
+            active: self.active_file_regs.clone(),
+        })
     }
 
     fn read_file_to_dram(&self, dram_base: usize, fd: RawFd, size: u64) -> anyhow::Result<()> {

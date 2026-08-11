@@ -87,14 +87,15 @@ fn chunk_offset(base: usize, i: u64) -> Result<usize, NixlError> {
 }
 
 /// A NIXL agent wired for the GPU-less storage transfer (UCX + POSIX backends,
-/// listen thread enabled). Registration handles are retained so the registered
-/// regions stay live for the agent's lifetime.
+/// listen thread enabled). DRAM registration handles are retained for the
+/// agent's lifetime (the staging buffer is registered once); file registrations
+/// are returned to the caller and deregister on drop.
 pub struct NixlAgent {
     agent: Agent,
     ucx: Backend,
     posix: Backend,
     name: String,
-    regs: Vec<RegistrationHandle>,
+    dram_regs: Vec<RegistrationHandle>,
     /// Concurrent POSIX transfer requests a posted file write is striped across.
     /// One request behaves like a single synchronous stream (~2 GB/s on the
     /// target RAID); striping lets the array absorb parallel writers.
@@ -141,7 +142,7 @@ impl NixlAgent {
             ucx,
             posix,
             name: name.to_string(),
-            regs: Vec::new(),
+            dram_regs: Vec::new(),
             write_streams: 1,
         })
     }
@@ -177,18 +178,21 @@ impl NixlAgent {
         opt.add_backend(&self.ucx)?;
         opt.add_backend(&self.posix)?;
         let handle = self.agent.register_memory(&region, Some(&opt))?;
-        self.regs.push(handle);
+        self.dram_regs.push(handle);
         Ok(())
     }
 
-    /// Register an open file (POSIX backend) as a storage endpoint.
-    pub fn register_file(&mut self, fd: RawFd, len: usize) -> Result<(), NixlError> {
+    /// Register an open file (POSIX backend) as a storage endpoint. The
+    /// registration deregisters when the returned handle drops.
+    pub fn register_file(
+        &mut self,
+        fd: RawFd,
+        len: usize,
+    ) -> Result<RegistrationHandle, NixlError> {
         let region = FileRegion { len, fd };
         let mut opt = OptArgs::new()?;
         opt.add_backend(&self.posix)?;
-        let handle = self.agent.register_memory(&region, Some(&opt))?;
-        self.regs.push(handle);
-        Ok(())
+        self.agent.register_memory(&region, Some(&opt))
     }
 
     /// This agent's metadata blob, published to the registry / sent in-band so a
@@ -390,11 +394,13 @@ impl super::Transport for NixlAgent {
         ax(self.drain_notifs())
     }
 
+    type FileReg = RegistrationHandle;
+
     fn register_dram(&mut self, base: usize, len: usize) -> anyhow::Result<()> {
         ax(self.register_dram(base, len))
     }
 
-    fn register_file(&mut self, fd: RawFd, len: usize) -> anyhow::Result<()> {
+    fn register_file(&mut self, fd: RawFd, len: usize) -> anyhow::Result<RegistrationHandle> {
         ax(self.register_file(fd, len))
     }
 

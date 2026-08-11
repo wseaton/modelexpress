@@ -17,7 +17,6 @@
 //! 3. puller sends `BYE` and we drop its session.
 
 use std::collections::HashMap;
-use std::fs::File;
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -49,9 +48,6 @@ fn parse_pull(msg: &[u8]) -> Option<(usize, u64)> {
 
 struct Session {
     model: String,
-    // Opened files back the NIXL registrations; kept alive for the session and
-    // dropped on BYE.
-    open_files: Vec<File>,
 }
 
 /// Serves any held model to pullers over one [`Transport`]. The staging buffer
@@ -140,7 +136,6 @@ impl<'a, T: Transport, L: ModelLocator> CacheServer<'a, T, L> {
                         sender.to_string(),
                         Session {
                             model: model.to_string(),
-                            open_files: Vec::new(),
                         },
                     );
                     tracing::info!(model, puller = sender, "serving manifest");
@@ -211,7 +206,10 @@ impl<'a, T: Transport, L: ModelLocator> CacheServer<'a, T, L> {
         let t = Instant::now();
         if size > 0 {
             let fd = file.as_raw_fd();
-            self.agent.register_file(fd, usize::try_from(size)?)?;
+            // Both legs are synchronous, so the registration (and the file) can
+            // drop as soon as the shard has been pushed to the puller; holding
+            // them for the session would accumulate NIXL state per shard served.
+            let reg = self.agent.register_file(fd, usize::try_from(size)?)?;
             self.agent
                 .read_file_to_dram(self.buf.base_addr(), fd, size)?;
             self.agent.write_dram_to_peer(
@@ -220,12 +218,10 @@ impl<'a, T: Transport, L: ModelLocator> CacheServer<'a, T, L> {
                 sender,
                 size,
             )?;
+            drop(reg);
         }
         self.agent
             .send_notif(sender, &notif::indexed(notif::DONE, idx))?;
-        if let Some(session) = self.sessions.get_mut(sender) {
-            session.open_files.push(file);
-        }
         tracing::info!(
             model = %model,
             idx,

@@ -174,13 +174,20 @@ pub trait Transport {
     /// Drain pending notifications as `(sender, payload)` pairs.
     fn drain_notifs(&self) -> anyhow::Result<Vec<(String, Vec<u8>)>>;
 
+    /// A live file registration, deregistered with the transport when dropped.
+    /// Must outlive every transfer leg that touches the file, and nothing more:
+    /// a long-lived agent serving thousands of shards must not accumulate
+    /// registrations.
+    type FileReg;
+
     /// Register the staging buffer as both an RDMA endpoint and a storage
     /// endpoint. Called once before any transfer.
     fn register_dram(&mut self, base: usize, len: usize) -> anyhow::Result<()>;
 
     /// Register an open file as a storage endpoint for the POSIX legs. `len` is
-    /// the file's exact size.
-    fn register_file(&mut self, fd: RawFd, len: usize) -> anyhow::Result<()>;
+    /// the file's exact size. The registration lives as long as the returned
+    /// guard.
+    fn register_file(&mut self, fd: RawFd, len: usize) -> anyhow::Result<Self::FileReg>;
 
     /// Storage leg: read exactly `size` bytes of a registered file into the
     /// registered staging buffer (full `CHUNK` descriptors plus a final partial).
