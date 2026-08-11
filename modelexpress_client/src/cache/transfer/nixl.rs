@@ -114,8 +114,28 @@ impl NixlAgent {
         let agent = Agent::new_configured(name, &cfg)?;
         let (_, ucx_params) = agent.get_plugin_params("UCX")?;
         let ucx = agent.create_backend("UCX", &ucx_params)?;
-        let (_, posix_params) = agent.get_plugin_params("POSIX")?;
-        let posix = agent.create_backend("POSIX", &posix_params)?;
+        // The POSIX plugin's default IO queue executes the transfer synchronously
+        // inside postXfer, which serializes the puller's write leg with the next
+        // shard's receive (measured: the whole disk write lands in `post`, none in
+        // `wait`). The uring/aio queues make postXfer actually asynchronous; not
+        // every libnixl build carries them, so fall back in order.
+        let posix = ["use_uring", "use_aio"]
+            .iter()
+            .find_map(|flag| {
+                let (_, mut params) = agent.get_plugin_params("POSIX").ok()?;
+                params.set(flag, "true").ok()?;
+                let backend = agent.create_backend("POSIX", &params).ok()?;
+                tracing::info!(flag, "POSIX backend using async IO queue");
+                Some(backend)
+            })
+            .map_or_else(
+                || {
+                    tracing::warn!("POSIX async IO queues unavailable; writes serialize in post");
+                    let (_, params) = agent.get_plugin_params("POSIX")?;
+                    agent.create_backend("POSIX", &params)
+                },
+                Ok,
+            )?;
         Ok(Self {
             agent,
             ucx,
