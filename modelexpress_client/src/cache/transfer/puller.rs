@@ -32,7 +32,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, bail};
 
 use super::buffer::StagingBuffer;
-use super::{CHUNK, Manifest, Transport, cache_layout, gbps, notif};
+use super::{CHUNK, Manifest, Shard, Transport, cache_layout, gbps, notif};
 
 const POLL: Duration = Duration::from_micros(200);
 const NOTIF_TIMEOUT: Duration = Duration::from_secs(300);
@@ -79,49 +79,59 @@ struct InFlight<H, R> {
 pub struct Puller<'a, T: Transport> {
     agent: &'a mut T,
     buf: StagingBuffer,
-    /// Chunks per slot; a shard must fit one slot.
-    slot_chunks: u64,
-    /// Number of slots (the pipeline depth).
-    depth: usize,
+    /// Total buffer capacity in chunks; carved into slots per pull, once the
+    /// manifest's largest shard is known.
+    cap_chunks: u64,
+    /// Requested pipeline depth; the effective depth of a pull may be lower so
+    /// every slot fits the largest shard.
+    requested_depth: usize,
     direct: bool,
 }
 
+/// Carve a buffer of `cap` chunks into `(slot_chunks, depth)` such that the
+/// largest shard (`max_shard_chunks`) fits one slot, at the deepest pipeline up
+/// to `requested_depth` the buffer allows. Errors only when even the whole
+/// buffer cannot hold the largest shard.
+fn slot_layout(
+    cap: u64,
+    requested_depth: usize,
+    max_shard_chunks: u64,
+) -> anyhow::Result<(u64, usize)> {
+    let need = max_shard_chunks.max(1);
+    if need > cap {
+        bail!("largest shard needs {need} chunks > buffer {cap}; raise buf_gib");
+    }
+    let fit = cap.checked_div(need).unwrap_or(1).max(1);
+    let depth = u64::try_from(requested_depth.max(1))
+        .unwrap_or(1)
+        .min(fit)
+        .max(1);
+    let slot_chunks = cap.checked_div(depth).unwrap_or(need).max(need);
+    let depth = usize::try_from(depth).unwrap_or(1);
+    Ok((slot_chunks, depth))
+}
+
 impl<'a, T: Transport> Puller<'a, T> {
-    /// Allocate + register a receive buffer of `buf_gib` carved into `pool_depth`
-    /// slots (clamped to at least one slot, and to no more slots than the buffer
-    /// has chunks). `direct` selects `O_DIRECT` writes (false in Phase 3/4b).
+    /// Allocate + register a receive buffer of `buf_gib` chunks. The buffer is
+    /// carved into up to `pool_depth` slots per pull, shrinking the depth when
+    /// the manifest's largest shard needs bigger slots. `direct` selects
+    /// `O_DIRECT` writes (false in Phase 3/4b).
     pub fn new(
         agent: &'a mut T,
         buf_gib: u32,
         pool_depth: usize,
         direct: bool,
     ) -> anyhow::Result<Self> {
-        let cap = u64::from(buf_gib).saturating_mul(GIB / CHUNK).max(1);
-        let cap_slots = usize::try_from(cap).unwrap_or(usize::MAX);
-        let depth = pool_depth.max(1).min(cap_slots);
-        let depth_u64 = u64::try_from(depth).unwrap_or(1);
-        let slot_chunks = cap.checked_div(depth_u64).unwrap_or(1).max(1);
-        let total_chunks = slot_chunks
-            .checked_mul(depth_u64)
-            .context("staging buffer chunk count overflow")?;
-        let buf = StagingBuffer::new(total_chunks)?;
+        let cap_chunks = u64::from(buf_gib).saturating_mul(GIB / CHUNK).max(1);
+        let buf = StagingBuffer::new(cap_chunks)?;
         agent.register_dram(buf.base_addr(), buf.len())?;
         Ok(Self {
             agent,
             buf,
-            slot_chunks,
-            depth,
+            cap_chunks,
+            requested_depth: pool_depth.max(1),
             direct,
         })
-    }
-
-    /// Byte length of one slot.
-    fn slot_bytes(&self) -> anyhow::Result<usize> {
-        let bytes = self
-            .slot_chunks
-            .checked_mul(CHUNK)
-            .context("slot byte length overflow")?;
-        usize::try_from(bytes).context("slot byte length too large for usize")
     }
 
     /// Pull `model` from the holder identified by `holder_md`, landing it under
@@ -136,37 +146,40 @@ impl<'a, T: Transport> Puller<'a, T> {
         let req = notif::encode_manifest_request(model, &self.agent.local_md()?);
         self.agent.send_notif(&holder, &req)?;
         let manifest = self.await_manifest(model)?;
+        manifest.ensure_frameable()?;
 
         let dest = dest_for(&manifest.revision);
         std::fs::create_dir_all(&dest)?;
-        tracing::info!(model, files = manifest.shards.len(), dest = %dest.display(), "pulling");
 
-        let slot_bytes = self.slot_bytes()?;
+        // Carve the buffer for this manifest: the largest shard must fit one
+        // slot, so the depth shrinks (down to 1) rather than rejecting the pull.
+        let max_shard_chunks = manifest
+            .shards
+            .iter()
+            .map(Shard::n_chunks)
+            .max()
+            .unwrap_or(1);
+        let (slot_chunks, depth) =
+            slot_layout(self.cap_chunks, self.requested_depth, max_shard_chunks)?;
+        let slot_bytes = usize::try_from(
+            slot_chunks
+                .checked_mul(CHUNK)
+                .context("slot byte length overflow")?,
+        )
+        .context("slot byte length too large for usize")?;
+        tracing::info!(model, files = manifest.shards.len(), depth, dest = %dest.display(), "pulling");
+
         let mut inflight: VecDeque<InFlight<T::WriteHandle, T::FileReg>> = VecDeque::new();
         // Free slots as a stack; starts full.
-        let mut free_slots: Vec<usize> = (0..self.depth).rev().collect();
+        let mut free_slots: Vec<usize> = (0..depth).rev().collect();
         let mut bytes: u64 = 0;
         let pull_start = Instant::now();
         // Per-leg timing comes from these spans (RUST_LOG=...puller=debug); the
         // pull span scopes them and reports the total on close.
-        let _pull = tracing::info_span!(
-            "pull",
-            model,
-            files = manifest.shards.len(),
-            depth = self.depth
-        )
-        .entered();
+        let _pull =
+            tracing::info_span!("pull", model, files = manifest.shards.len(), depth).entered();
 
         for (idx, shard) in manifest.shards.iter().enumerate() {
-            if shard.n_chunks() > self.slot_chunks {
-                bail!(
-                    "{} needs {} chunks > slot {}; raise buf_gib or lower pool depth",
-                    shard.rel_path,
-                    shard.n_chunks(),
-                    self.slot_chunks
-                );
-            }
-
             // Acquire a slot, finalizing the oldest in-flight write if all slots
             // are busy (this is where the pipeline blocks on the write leg).
             let slot = match free_slots.pop() {
@@ -287,7 +300,7 @@ impl<'a, T: Transport> Puller<'a, T> {
             model,
             bytes,
             files,
-            depth = self.depth,
+            depth,
             secs = elapsed.as_secs_f64(),
             gbps = gbps(bytes, elapsed),
             "all files verified"
@@ -425,6 +438,60 @@ mod tests {
             assert!(cache_layout::is_complete(&summary.dest), "sentinel dropped");
             assert!(!cache_layout::temp_path(&summary.dest.join("config.json")).exists());
         });
+    }
+
+    /// The regression case from the Qwen-14B bench: 512-chunk buffer, requested
+    /// depth 4, largest shard 232 chunks. The old fixed carve made 128-chunk
+    /// slots and rejected the pull; the layout must instead shrink the depth.
+    #[test]
+    fn slot_layout_shrinks_depth_to_fit_largest_shard() {
+        let (slot, depth) = slot_layout(512, 4, 232).expect("layout");
+        assert_eq!(depth, 2);
+        assert_eq!(slot, 256);
+
+        // Plenty of room: the requested depth is honored.
+        let (slot, depth) = slot_layout(512, 4, 10).expect("layout");
+        assert_eq!(depth, 4);
+        assert_eq!(slot, 128);
+
+        // Shard fills the whole buffer: single slot.
+        let (slot, depth) = slot_layout(512, 4, 512).expect("layout");
+        assert_eq!(depth, 1);
+        assert_eq!(slot, 512);
+
+        // All-empty manifest degrades to a 1-chunk need, not a div-by-zero.
+        let (_, depth) = slot_layout(512, 2, 0).expect("layout");
+        assert_eq!(depth, 2);
+    }
+
+    #[test]
+    fn slot_layout_rejects_shard_larger_than_buffer() {
+        let err = slot_layout(64, 2, 65).expect_err("too big");
+        assert!(err.to_string().contains("raise buf_gib"));
+    }
+
+    /// A manifest with more shards than the 4-digit notif framing can address
+    /// must be rejected up front, not silently corrupt frame parsing at shard
+    /// 10000 mid-pull.
+    #[test]
+    fn oversized_manifest_is_rejected() {
+        let shard = |i: usize| super::super::Shard {
+            rel_path: format!("f{i}"),
+            true_size: 1,
+            hash: String::new(),
+        };
+        let ok = Manifest {
+            revision: "r".into(),
+            shards: (0..super::super::MAX_SHARDS).map(shard).collect(),
+        };
+        ok.ensure_frameable().expect("exactly MAX_SHARDS is fine");
+
+        let too_big = Manifest {
+            revision: "r".into(),
+            shards: (0..=super::super::MAX_SHARDS).map(shard).collect(),
+        };
+        let err = too_big.ensure_frameable().expect_err("one too many");
+        assert!(err.to_string().contains("at most"));
     }
 
     /// A completed pull must leave zero live file registrations on either side:
@@ -571,7 +638,7 @@ mod tests {
                 .expect("server");
         // buf_gib=1 -> 64 chunks, depth 2 -> two real slots that get recycled.
         let mut puller = Puller::new(&mut puller_agent, 1, 2, false).expect("puller");
-        assert_eq!(puller.depth, 2, "two real slots");
+        assert_eq!(puller.requested_depth, 2, "two real slots");
         let stop = AtomicBool::new(false);
 
         std::thread::scope(|s| {

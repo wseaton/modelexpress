@@ -54,6 +54,11 @@ pub struct Shard {
     pub hash: String,
 }
 
+/// The most shards one manifest can carry: `PULL`/`DONE` notifs frame the shard
+/// index as exactly 4 zero-padded digits, so index 10000 would silently corrupt
+/// the frame (5 digits where the parser reads 4). Enforced on both sides.
+pub const MAX_SHARDS: usize = 10_000;
+
 /// The files a stager will serve for one model, sent in reply to a manifest
 /// request over the notification channel.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -63,6 +68,20 @@ pub struct Manifest {
     /// layout matches what the origin download path produces.
     pub revision: String,
     pub shards: Vec<Shard>,
+}
+
+impl Manifest {
+    /// Error if this manifest has more shards than the notif framing can
+    /// address.
+    pub fn ensure_frameable(&self) -> anyhow::Result<()> {
+        if self.shards.len() > MAX_SHARDS {
+            anyhow::bail!(
+                "manifest has {} shards; the transfer framing addresses at most {MAX_SHARDS}",
+                self.shards.len()
+            );
+        }
+        Ok(())
+    }
 }
 
 impl Shard {

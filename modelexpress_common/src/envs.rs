@@ -43,6 +43,27 @@ pub const MODEL_EXPRESS_TIMEOUT: &str = "MODEL_EXPRESS_TIMEOUT";
 pub const MODEL_EXPRESS_CACHE_DIRECTORY: &str = "MODEL_EXPRESS_CACHE_DIRECTORY";
 /// Concurrent striped NVMe write streams per shard in the cache daemon's puller.
 pub const MODEL_EXPRESS_CACHE_WRITE_STREAMS: &str = "MODEL_EXPRESS_CACHE_WRITE_STREAMS";
+/// Cache daemon: path to the desired-set file (mounted ConfigMap).
+pub const MODEL_EXPRESS_CACHE_MODELS_FILE: &str = "MODEL_EXPRESS_CACHE_MODELS_FILE";
+/// Cache daemon: seconds between reconcile passes.
+pub const MODEL_EXPRESS_CACHE_RECONCILE_SECS: &str = "MODEL_EXPRESS_CACHE_RECONCILE_SECS";
+/// Cache daemon: grow the desired set from what peers advertise.
+pub const MODEL_EXPRESS_CACHE_AUTO_EXPAND: &str = "MODEL_EXPRESS_CACHE_AUTO_EXPAND";
+/// Cache daemon: demand TTL before an unpinned model stops being advertised.
+pub const MODEL_EXPRESS_CACHE_DEMAND_TTL_SECS: &str = "MODEL_EXPRESS_CACHE_DEMAND_TTL_SECS";
+/// Cache daemon: recent-use window that blocks eviction.
+pub const MODEL_EXPRESS_CACHE_GC_GRACE_SECS: &str = "MODEL_EXPRESS_CACHE_GC_GRACE_SECS";
+/// Cache daemon: quiescence window before an externally-downloaded model is captured.
+pub const MODEL_EXPRESS_CACHE_CAPTURE_QUIESCENCE_SECS: &str =
+    "MODEL_EXPRESS_CACHE_CAPTURE_QUIESCENCE_SECS";
+/// Cache daemon: NIXL listen port for the serving agent.
+pub const MODEL_EXPRESS_CACHE_NIXL_PORT: &str = "MODEL_EXPRESS_CACHE_NIXL_PORT";
+/// Cache daemon: staging-buffer size in GiB.
+pub const MODEL_EXPRESS_CACHE_BUF_GIB: &str = "MODEL_EXPRESS_CACHE_BUF_GIB";
+/// Cache daemon: receive pipeline depth (staging-buffer slots).
+pub const MODEL_EXPRESS_CACHE_POOL_DEPTH: &str = "MODEL_EXPRESS_CACHE_POOL_DEPTH";
+/// Cache daemon: write pulled files with O_DIRECT.
+pub const MODEL_EXPRESS_CACHE_O_DIRECT: &str = "MODEL_EXPRESS_CACHE_O_DIRECT";
 /// Log level (client and server).
 pub const MODEL_EXPRESS_LOG_LEVEL: &str = "MODEL_EXPRESS_LOG_LEVEL";
 /// Log output format (client and server).
@@ -324,6 +345,40 @@ mod tests {
             MODEL_EXPRESS_CACHE_WRITE_STREAMS,
             "MODEL_EXPRESS_CACHE_WRITE_STREAMS"
         );
+        assert_eq!(
+            MODEL_EXPRESS_CACHE_MODELS_FILE,
+            "MODEL_EXPRESS_CACHE_MODELS_FILE"
+        );
+        assert_eq!(
+            MODEL_EXPRESS_CACHE_RECONCILE_SECS,
+            "MODEL_EXPRESS_CACHE_RECONCILE_SECS"
+        );
+        assert_eq!(
+            MODEL_EXPRESS_CACHE_AUTO_EXPAND,
+            "MODEL_EXPRESS_CACHE_AUTO_EXPAND"
+        );
+        assert_eq!(
+            MODEL_EXPRESS_CACHE_DEMAND_TTL_SECS,
+            "MODEL_EXPRESS_CACHE_DEMAND_TTL_SECS"
+        );
+        assert_eq!(
+            MODEL_EXPRESS_CACHE_GC_GRACE_SECS,
+            "MODEL_EXPRESS_CACHE_GC_GRACE_SECS"
+        );
+        assert_eq!(
+            MODEL_EXPRESS_CACHE_CAPTURE_QUIESCENCE_SECS,
+            "MODEL_EXPRESS_CACHE_CAPTURE_QUIESCENCE_SECS"
+        );
+        assert_eq!(
+            MODEL_EXPRESS_CACHE_NIXL_PORT,
+            "MODEL_EXPRESS_CACHE_NIXL_PORT"
+        );
+        assert_eq!(MODEL_EXPRESS_CACHE_BUF_GIB, "MODEL_EXPRESS_CACHE_BUF_GIB");
+        assert_eq!(
+            MODEL_EXPRESS_CACHE_POOL_DEPTH,
+            "MODEL_EXPRESS_CACHE_POOL_DEPTH"
+        );
+        assert_eq!(MODEL_EXPRESS_CACHE_O_DIRECT, "MODEL_EXPRESS_CACHE_O_DIRECT");
         assert_eq!(
             MODEL_EXPRESS_SERVER_ENDPOINT,
             "MODEL_EXPRESS_SERVER_ENDPOINT"
