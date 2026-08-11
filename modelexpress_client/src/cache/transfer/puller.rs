@@ -55,7 +55,7 @@ pub struct PullSummary {
 /// A shard whose NVMe write has been posted and is draining while the puller
 /// moves on to the next shard. Held until its write completes and the temp file
 /// is renamed into place.
-struct InFlight<H> {
+struct InFlight<H, R> {
     idx: usize,
     /// Buffer slot this shard occupies; freed for reuse once finalized.
     slot: usize,
@@ -63,6 +63,9 @@ struct InFlight<H> {
     file: File,
     /// The posted write, or `None` for a zero-byte file (no write leg).
     handle: Option<H>,
+    /// The file's transport registration; deregisters when this shard finalizes
+    /// so a long pull does not accumulate registrations.
+    reg: Option<R>,
     tmp: PathBuf,
     final_path: PathBuf,
     rel_path: String,
@@ -139,7 +142,7 @@ impl<'a, T: Transport> Puller<'a, T> {
         tracing::info!(model, files = manifest.shards.len(), dest = %dest.display(), "pulling");
 
         let slot_bytes = self.slot_bytes()?;
-        let mut inflight: VecDeque<InFlight<T::WriteHandle>> = VecDeque::new();
+        let mut inflight: VecDeque<InFlight<T::WriteHandle, T::FileReg>> = VecDeque::new();
         // Free slots as a stack; starts full.
         let mut free_slots: Vec<usize> = (0..self.depth).rev().collect();
         let mut bytes: u64 = 0;
@@ -238,19 +241,22 @@ impl<'a, T: Transport> Puller<'a, T> {
                 file
             };
 
-            let handle = if size > 0 {
+            let (handle, reg) = if size > 0 {
                 let fd = file.as_raw_fd();
-                {
+                let reg = {
                     let _reg = tracing::debug_span!("reg", idx).entered();
-                    self.agent.register_file(fd, usize::try_from(write_size)?)?;
-                }
+                    self.agent.register_file(fd, usize::try_from(write_size)?)?
+                };
                 let _post = tracing::debug_span!("post", idx).entered();
-                Some(
-                    self.agent
-                        .post_write_dram_to_file(slot_base, fd, write_size)?,
+                (
+                    Some(
+                        self.agent
+                            .post_write_dram_to_file(slot_base, fd, write_size)?,
+                    ),
+                    Some(reg),
                 )
             } else {
-                None
+                (None, None)
             };
 
             inflight.push_back(InFlight {
@@ -258,6 +264,7 @@ impl<'a, T: Transport> Puller<'a, T> {
                 slot,
                 file,
                 handle,
+                reg,
                 tmp,
                 final_path,
                 rel_path: shard.rel_path.clone(),
@@ -289,12 +296,14 @@ impl<'a, T: Transport> Puller<'a, T> {
     }
 
     /// Await a posted write, fsync, and atomically rename the temp file into
-    /// place. The SHA was already checked from DRAM when the shard arrived.
-    fn finalize(&mut self, done: InFlight<T::WriteHandle>) -> anyhow::Result<()> {
+    /// place. The SHA was already checked from DRAM when the shard arrived. The
+    /// file's registration drops here, after the write has completed.
+    fn finalize(&mut self, done: InFlight<T::WriteHandle, T::FileReg>) -> anyhow::Result<()> {
         if let Some(handle) = done.handle {
             let _write = tracing::debug_span!("write", idx = done.idx).entered();
             self.agent.wait_write(handle)?;
         }
+        drop(done.reg);
         {
             // Drop any O_DIRECT alignment padding so the file ends at its exact
             // size (a no-op for buffered writes, which wrote exactly `size`).
@@ -416,6 +425,58 @@ mod tests {
             assert!(cache_layout::is_complete(&summary.dest), "sentinel dropped");
             assert!(!cache_layout::temp_path(&summary.dest.join("config.json")).exists());
         });
+    }
+
+    /// A completed pull must leave zero live file registrations on either side:
+    /// a long-lived stager (or a daemon pulling many models) must not
+    /// accumulate transport state per shard served. The totals prove the
+    /// assertion is not vacuous.
+    #[test]
+    fn file_registrations_are_reclaimed() {
+        let src = tempfile::tempdir().expect("src");
+        let dst = tempfile::tempdir().expect("dst");
+        for i in 0..5 {
+            write_file(
+                &src.path().join(format!("model-0000{i}.safetensors")),
+                format!("weights-{i}").as_bytes(),
+            );
+        }
+
+        let fabric = Fabric::default();
+        let mut holder = Loopback::new("h", &fabric);
+        let mut puller_agent = Loopback::new("p", &fabric);
+        let mut server =
+            CacheServer::new(&mut holder, locator_for("m", src.path(), "rev1"), 0, false)
+                .expect("server");
+        let mut puller = Puller::new(&mut puller_agent, 0, 2, false).expect("puller");
+        let stop = AtomicBool::new(false);
+
+        std::thread::scope(|s| {
+            let served = s.spawn(|| server.serve(&stop));
+            let dst_root = dst.path().to_path_buf();
+            puller
+                .pull(b"h", "m", |rev| dst_root.join(rev))
+                .expect("pull");
+            stop.store(true, Ordering::Relaxed);
+            served.join().expect("join").expect("serve ok");
+        });
+
+        assert_eq!(holder.total_file_regs(), 5, "stager registered every shard");
+        assert_eq!(
+            puller_agent.total_file_regs(),
+            5,
+            "puller registered every shard"
+        );
+        assert_eq!(
+            holder.active_file_regs(),
+            0,
+            "stager reclaimed registrations"
+        );
+        assert_eq!(
+            puller_agent.active_file_regs(),
+            0,
+            "puller reclaimed registrations"
+        );
     }
 
     /// Crash-and-retry: a puller opens a session (manifest request lands, no
