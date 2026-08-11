@@ -124,6 +124,17 @@ struct Cli {
     #[arg(long, env = "MODEL_EXPRESS_CACHE_POOL_DEPTH", default_value_t = 2)]
     pool_depth: usize,
 
+    /// Concurrent NVMe write streams per shard: each posted write is striped
+    /// across this many transfer requests so the RAID absorbs parallel writers.
+    /// 1 preserves the single-stream behaviour (~2 GB/s on the target array);
+    /// the array's aggregate ceiling is ~3.2 GB/s around 8 streams.
+    #[arg(
+        long,
+        env = modelexpress_common::envs::MODEL_EXPRESS_CACHE_WRITE_STREAMS,
+        default_value_t = 1
+    )]
+    write_streams: usize,
+
     /// Write pulled files with `O_DIRECT`, bypassing the page cache. Much faster
     /// for the sustained large writes the puller does (block-aligned, with the
     /// partial tail truncated back). Requires a filesystem that supports
@@ -372,10 +383,11 @@ async fn run_pull(cli: &Cli) -> anyhow::Result<()> {
     let buf_gib = cli.buf_gib;
     let pool_depth = cli.pool_depth;
     let o_direct = cli.o_direct;
+    let write_streams = cli.write_streams;
     let pull_model = model.clone();
     // NixlAgent lives only on the blocking thread, never across an .await.
     let dest = tokio::task::spawn_blocking(move || -> anyhow::Result<PathBuf> {
-        let mut agent = NixlAgent::new(&name, 0)?;
+        let mut agent = NixlAgent::new(&name, 0)?.with_write_streams(write_streams);
         let mut puller = Puller::new(&mut agent, buf_gib, pool_depth, o_direct)?;
         let summary = puller.pull(&blob, &pull_model, |rev| {
             resolve_model_path(
@@ -553,6 +565,7 @@ async fn run_reconcile(cli: &Cli) -> anyhow::Result<()> {
         buf_gib: cli.buf_gib,
         pool_depth: cli.pool_depth,
         direct: cli.o_direct,
+        write_streams: cli.write_streams,
         endpoint: cli.endpoint.clone(),
     };
 

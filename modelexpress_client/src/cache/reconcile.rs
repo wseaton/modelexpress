@@ -499,6 +499,8 @@ pub struct NixlFetcher {
     pub pool_depth: usize,
     /// Write pulled files with `O_DIRECT` (bypass the page cache).
     pub direct: bool,
+    /// Concurrent striped transfer requests per posted file write.
+    pub write_streams: usize,
     /// Registry/server endpoint used for the origin fallback download.
     pub endpoint: String,
 }
@@ -520,11 +522,12 @@ impl Fetcher for NixlFetcher {
         let buf_gib = self.buf_gib;
         let pool_depth = self.pool_depth;
         let direct = self.direct;
+        let write_streams = self.write_streams;
         let model = spec.model.clone();
         let dest_root = dest_root.to_path_buf();
         // NixlAgent is !Send: confine it to the blocking worker, never across .await.
         tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-            let mut agent = NixlAgent::new(&name, 0)?;
+            let mut agent = NixlAgent::new(&name, 0)?.with_write_streams(write_streams);
             let mut puller = Puller::new(&mut agent, buf_gib, pool_depth, direct)?;
             puller.pull(&holder_md, &model, |rev| {
                 resolve_model_path(&dest_root, ModelProvider::HuggingFace, &model, Some(rev))

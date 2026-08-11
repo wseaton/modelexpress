@@ -41,6 +41,8 @@ pub const MODEL_EXPRESS_ENDPOINT: &str = "MODEL_EXPRESS_ENDPOINT";
 pub const MODEL_EXPRESS_TIMEOUT: &str = "MODEL_EXPRESS_TIMEOUT";
 /// Local model cache directory (client, server, and both providers).
 pub const MODEL_EXPRESS_CACHE_DIRECTORY: &str = "MODEL_EXPRESS_CACHE_DIRECTORY";
+/// Concurrent striped NVMe write streams per shard in the cache daemon's puller.
+pub const MODEL_EXPRESS_CACHE_WRITE_STREAMS: &str = "MODEL_EXPRESS_CACHE_WRITE_STREAMS";
 /// Log level (client and server).
 pub const MODEL_EXPRESS_LOG_LEVEL: &str = "MODEL_EXPRESS_LOG_LEVEL";
 /// Log output format (client and server).
@@ -317,6 +319,10 @@ mod tests {
         assert_eq!(
             MODEL_EXPRESS_CACHE_EVICTION_ENABLED,
             "MODEL_EXPRESS_CACHE_EVICTION_ENABLED"
+        );
+        assert_eq!(
+            MODEL_EXPRESS_CACHE_WRITE_STREAMS,
+            "MODEL_EXPRESS_CACHE_WRITE_STREAMS"
         );
         assert_eq!(
             MODEL_EXPRESS_SERVER_ENDPOINT,

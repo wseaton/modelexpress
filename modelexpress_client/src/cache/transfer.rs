@@ -207,6 +207,29 @@ pub trait Transport {
     fn wait_write(&self, handle: Self::WriteHandle) -> anyhow::Result<()>;
 }
 
+/// Split `size` bytes into up to `streams` contiguous chunk-aligned stripes as
+/// `(offset, len)` pairs. Stripes land on `CHUNK` boundaries so `O_DIRECT`
+/// alignment is preserved; only the final stripe carries the partial tail. The
+/// stripe count is capped at the chunk count, so tiny transfers degrade to one
+/// stripe rather than zero-length ones.
+pub fn stripe_ranges(size: u64, streams: usize) -> Vec<(u64, u64)> {
+    if size == 0 {
+        return Vec::new();
+    }
+    let n_chunks = size.div_ceil(CHUNK);
+    let streams = u64::try_from(streams.max(1)).unwrap_or(1).min(n_chunks);
+    let chunks_per_stripe = n_chunks.div_ceil(streams);
+    let stripe_bytes = chunks_per_stripe.saturating_mul(CHUNK);
+    let mut out = Vec::new();
+    let mut off = 0u64;
+    while off < size {
+        let len = stripe_bytes.min(size.saturating_sub(off));
+        out.push((off, len));
+        off = off.saturating_add(stripe_bytes);
+    }
+    out
+}
+
 /// Throughput in GB/s (decimal) for moving `bytes` in `dur`. Used for the
 /// per-leg transfer telemetry.
 pub fn gbps(bytes: u64, dur: Duration) -> f64 {
@@ -241,6 +264,38 @@ mod tests {
     fn indexed_tag_is_zero_padded() {
         assert_eq!(notif::indexed(notif::PULL, 7), b"PULL0007");
         assert_eq!(notif::indexed(notif::DONE, 1234), b"DONE1234");
+    }
+
+    #[test]
+    fn stripe_ranges_cover_exactly_once() {
+        for (size, streams) in [
+            (1u64, 1usize),
+            (CHUNK, 4),
+            (CHUNK * 7 + 5, 4),
+            (CHUNK * 232 + 12345, 8),
+            (CHUNK * 3, 16),
+        ] {
+            let stripes = stripe_ranges(size, streams);
+            assert!(stripes.len() <= streams.max(1));
+            let mut expect_off = 0u64;
+            for (off, len) in &stripes {
+                assert_eq!(*off, expect_off, "contiguous");
+                assert_eq!(off % CHUNK, 0, "chunk-aligned start");
+                assert!(*len > 0);
+                expect_off += len;
+            }
+            assert_eq!(expect_off, size, "byte-exact coverage");
+        }
+    }
+
+    #[test]
+    fn stripe_ranges_empty_for_zero_size() {
+        assert!(stripe_ranges(0, 4).is_empty());
+    }
+
+    #[test]
+    fn stripe_ranges_single_stream_is_one_stripe() {
+        assert_eq!(stripe_ranges(CHUNK * 5 + 1, 1).len(), 1);
     }
 
     #[test]

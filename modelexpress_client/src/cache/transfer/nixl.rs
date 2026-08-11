@@ -95,6 +95,10 @@ pub struct NixlAgent {
     posix: Backend,
     name: String,
     regs: Vec<RegistrationHandle>,
+    /// Concurrent POSIX transfer requests a posted file write is striped across.
+    /// One request behaves like a single synchronous stream (~2 GB/s on the
+    /// target RAID); striping lets the array absorb parallel writers.
+    write_streams: usize,
 }
 
 impl NixlAgent {
@@ -118,7 +122,15 @@ impl NixlAgent {
             posix,
             name: name.to_string(),
             regs: Vec::new(),
+            write_streams: 1,
         })
+    }
+
+    /// Set how many concurrent transfer requests a posted file write is striped
+    /// across (clamped to at least 1).
+    pub fn with_write_streams(mut self, streams: usize) -> Self {
+        self.write_streams = streams.max(1);
+        self
     }
 
     pub fn name(&self) -> &str {
@@ -228,35 +240,47 @@ impl NixlAgent {
     }
 
     /// Local storage leg, posted (non-blocking): begin writing `size` bytes of
-    /// the registered host buffer down to a registered file via POSIX. Returns
-    /// the in-flight request to await with [`NixlAgent::wait_write`]; the puller
-    /// posts the next shard's receive while this write drains (the double-buffer).
+    /// the registered host buffer down to a registered file via POSIX, striped
+    /// across `write_streams` concurrent transfer requests (chunk-aligned, so
+    /// `O_DIRECT` alignment holds per stripe). Returns the in-flight requests to
+    /// await with [`NixlAgent::wait_write`]; the puller posts the next shard's
+    /// receive while these drain.
     pub fn post_write_dram_to_file(
         &self,
         dram_base: usize,
         fd: RawFd,
         size: u64,
-    ) -> Result<XferRequest, NixlError> {
-        let dram = Self::chunk_dlist(MemType::Dram, dram_base, size, 0)?;
-        let file = Self::chunk_dlist(MemType::File, 0, size, u64::try_from(fd).unwrap_or(0))?;
+    ) -> Result<Vec<XferRequest>, NixlError> {
+        let dev = u64::try_from(fd).unwrap_or(0);
         let mut opt = OptArgs::new()?;
         opt.add_backend(&self.posix)?;
-        let req =
-            self.agent
-                .create_xfer_req(XferOp::Write, &dram, &file, &self.name, Some(&opt))?;
-        self.agent.post_xfer_req(&req, Some(&opt))?;
-        Ok(req)
+        let mut reqs = Vec::new();
+        for (off, len) in super::stripe_ranges(size, self.write_streams) {
+            let stripe_base = chunk_offset(dram_base, off / CHUNK)?;
+            let file_base = usize::try_from(off).map_err(|_| NixlError::InvalidParam)?;
+            let dram = Self::chunk_dlist(MemType::Dram, stripe_base, len, 0)?;
+            let file = Self::chunk_dlist(MemType::File, file_base, len, dev)?;
+            let req =
+                self.agent
+                    .create_xfer_req(XferOp::Write, &dram, &file, &self.name, Some(&opt))?;
+            self.agent.post_xfer_req(&req, Some(&opt))?;
+            reqs.push(req);
+        }
+        Ok(reqs)
     }
 
-    /// Block until a write posted by [`NixlAgent::post_write_dram_to_file`]
+    /// Block until every stripe posted by [`NixlAgent::post_write_dram_to_file`]
     /// completes.
-    pub fn wait_write(&self, req: XferRequest) -> Result<(), NixlError> {
-        loop {
-            if self.agent.get_xfer_status(&req)?.is_success() {
-                return Ok(());
+    pub fn wait_write(&self, reqs: Vec<XferRequest>) -> Result<(), NixlError> {
+        for req in reqs {
+            loop {
+                if self.agent.get_xfer_status(&req)?.is_success() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_micros(50));
             }
-            std::thread::sleep(Duration::from_micros(50));
         }
+        Ok(())
     }
 
     /// Build a transfer descriptor list covering exactly `size` bytes from
@@ -315,7 +339,7 @@ fn ax<T>(r: Result<T, NixlError>) -> anyhow::Result<T> {
 // Each method delegates to the inherent method of the same name (inherent
 // methods take priority in resolution), converting the error.
 impl super::Transport for NixlAgent {
-    type WriteHandle = XferRequest;
+    type WriteHandle = Vec<XferRequest>;
 
     fn name(&self) -> &str {
         self.name()
@@ -364,11 +388,11 @@ impl super::Transport for NixlAgent {
         dram_base: usize,
         fd: RawFd,
         size: u64,
-    ) -> anyhow::Result<XferRequest> {
+    ) -> anyhow::Result<Vec<XferRequest>> {
         ax(self.post_write_dram_to_file(dram_base, fd, size))
     }
 
-    fn wait_write(&self, handle: XferRequest) -> anyhow::Result<()> {
+    fn wait_write(&self, handle: Vec<XferRequest>) -> anyhow::Result<()> {
         ax(self.wait_write(handle))
     }
 }
