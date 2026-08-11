@@ -202,6 +202,11 @@ impl NixlAgent {
         self.agent.load_remote_md(blob)
     }
 
+    /// Drop a loaded peer's metadata so a same-named reconnect can load fresh.
+    pub fn invalidate_remote(&self, peer: &str) -> Result<(), NixlError> {
+        self.agent.invalidate_remote_md(peer)
+    }
+
     /// Whether this agent currently holds `peer`'s metadata (rkeys resolvable).
     pub fn has_remote(&self, peer: &str) -> bool {
         self.agent.check_remote_metadata(peer, None)
@@ -371,6 +376,10 @@ impl super::Transport for NixlAgent {
 
     fn load_remote(&mut self, blob: &[u8]) -> anyhow::Result<String> {
         ax(NixlAgent::load_remote(self, blob))
+    }
+
+    fn invalidate_remote(&mut self, peer: &str) -> anyhow::Result<()> {
+        ax(NixlAgent::invalidate_remote(self, peer))
     }
 
     fn send_notif(&self, peer: &str, msg: &[u8]) -> anyhow::Result<()> {

@@ -159,8 +159,14 @@ pub trait Transport {
     /// This agent's metadata blob, handed to a peer so it can `load_remote` us.
     fn local_md(&self) -> anyhow::Result<Vec<u8>>;
 
-    /// Load a peer's metadata blob; returns the peer's agent name.
+    /// Load a peer's metadata blob; returns the peer's agent name. Loading a
+    /// name that is already loaded fails (NIXL rejects it); call
+    /// [`Transport::invalidate_remote`] first when a known peer reconnects.
     fn load_remote(&mut self, blob: &[u8]) -> anyhow::Result<String>;
+
+    /// Drop a previously-loaded peer's metadata (connection state, rkeys), so a
+    /// restarted peer reusing the same agent name can be loaded fresh.
+    fn invalidate_remote(&mut self, peer: &str) -> anyhow::Result<()>;
 
     /// Send a notification to `peer`.
     fn send_notif(&self, peer: &str, msg: &[u8]) -> anyhow::Result<()>;

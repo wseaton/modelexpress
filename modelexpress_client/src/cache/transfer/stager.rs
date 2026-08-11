@@ -70,6 +70,10 @@ pub struct CacheServer<'a, T: Transport, L: ModelLocator> {
     held: HashMap<String, (Option<std::time::SystemTime>, PathBuf, Manifest)>,
     /// Live sessions keyed by puller agent name.
     sessions: HashMap<String, Session>,
+    /// Puller agent names whose metadata is loaded. A puller that crashed
+    /// without `BYE` and reconnected under the same name must be invalidated
+    /// before its fresh metadata can load (NIXL rejects a duplicate load).
+    loaded: std::collections::HashSet<String>,
 }
 
 impl<'a, T: Transport, L: ModelLocator> CacheServer<'a, T, L> {
@@ -86,6 +90,7 @@ impl<'a, T: Transport, L: ModelLocator> CacheServer<'a, T, L> {
             direct,
             held: HashMap::new(),
             sessions: HashMap::new(),
+            loaded: std::collections::HashSet::new(),
         })
     }
 
@@ -101,7 +106,11 @@ impl<'a, T: Transport, L: ModelLocator> CacheServer<'a, T, L> {
         tracing::info!("cache server ready");
         while !stop.load(Ordering::Relaxed) {
             for (sender, msg) in self.agent.drain_notifs()? {
-                self.handle(&sender, &msg)?;
+                // One puller's bad request must not take the server down for
+                // every other puller; log it and keep serving.
+                if let Err(e) = self.handle(&sender, &msg) {
+                    tracing::warn!(puller = %sender, error = %e, "request failed");
+                }
             }
             std::thread::sleep(POLL);
         }
@@ -110,8 +119,20 @@ impl<'a, T: Transport, L: ModelLocator> CacheServer<'a, T, L> {
 
     fn handle(&mut self, sender: &str, msg: &[u8]) -> anyhow::Result<()> {
         if let Some((model, md)) = notif::decode_manifest_request(msg) {
+            // A manifest request from a name we already know is a puller that
+            // crashed without BYE and restarted: drop the stale session (and its
+            // open files) and invalidate the dead peer's metadata, or loading
+            // the fresh blob below is rejected and the reconnect times out.
+            if self.sessions.remove(sender).is_some() {
+                tracing::info!(puller = sender, "dropped stale session on reconnect");
+            }
+            if self.loaded.contains(sender) {
+                self.agent.invalidate_remote(sender)?;
+                self.loaded.remove(sender);
+            }
             // Register the puller's rkeys so a later PULL can RDMA-write to it.
             self.agent.load_remote(md)?;
+            self.loaded.insert(sender.to_string());
             match self.manifest_reply(model) {
                 Ok(reply) => {
                     self.agent.send_notif(sender, &reply)?;
@@ -247,6 +268,48 @@ mod tests {
         assert_eq!(notes.len(), 1);
         assert!(notes[0].1.starts_with(notif::NOT_FOUND));
         assert!(server.sessions.is_empty());
+    }
+
+    /// A puller that crashed without BYE and reconnects under the same agent
+    /// name must be served, not rejected. The loopback rejects a duplicate
+    /// metadata load exactly like NIXL does, so this passing proves the stager
+    /// invalidates the dead peer and drops its stale session first.
+    #[test]
+    fn reconnect_after_crash_replaces_session() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("a.safetensors"), b"weights").expect("write");
+        let fabric = Fabric::default();
+        let mut agent = Loopback::new("h", &fabric);
+        let mut map = HashMap::new();
+        map.insert(
+            "m".to_string(),
+            (dir.path().to_path_buf(), "rev".to_string()),
+        );
+        let mut server = CacheServer::new(&mut agent, MapLocator(map), 0, false).expect("server");
+
+        // First connect: session established, metadata loaded.
+        server
+            .handle("p", &notif::encode_manifest_request("m", b"p"))
+            .expect("first manifest");
+        assert!(server.sessions.contains_key("p"));
+
+        // The puller dies mid-session (no BYE) and a restarted pod reconnects
+        // under the same name with fresh metadata.
+        server
+            .handle("p", &notif::encode_manifest_request("m", b"p"))
+            .expect("reconnect must be served, not rejected");
+        assert_eq!(
+            server.sessions.len(),
+            1,
+            "stale session replaced, not leaked"
+        );
+
+        // The replacement session is live: a PULL is served.
+        let mut pull = notif::indexed(notif::PULL, 0);
+        let buf = vec![0u8; 7];
+        pull.extend_from_slice(&(buf.as_ptr() as u64).to_le_bytes());
+        server.handle("p", &pull).expect("pull on new session");
+        assert_eq!(buf.as_slice(), b"weights");
     }
 
     #[test]

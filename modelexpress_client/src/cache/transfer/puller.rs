@@ -418,6 +418,68 @@ mod tests {
         });
     }
 
+    /// Crash-and-retry: a puller opens a session (manifest request lands, no
+    /// BYE ever sent), dies, and a restarted puller under the same agent name
+    /// runs a full pull against the same live server. Reproduces the on-hardware
+    /// failure where the stager rejected the reconnect's metadata load and the
+    /// retry timed out.
+    #[test]
+    fn round_trip_after_crashed_predecessor() {
+        let src = tempfile::tempdir().expect("src");
+        let dst = tempfile::tempdir().expect("dst");
+        write_file(
+            &src.path().join("model-00001.safetensors"),
+            b"crash weights",
+        );
+        write_file(&src.path().join("config.json"), b"{}");
+
+        let fabric = Fabric::default();
+        let mut holder = Loopback::new("h", &fabric);
+        let mut server =
+            CacheServer::new(&mut holder, locator_for("m", src.path(), "rev1"), 0, false)
+                .expect("server");
+        let stop = AtomicBool::new(false);
+
+        std::thread::scope(|s| {
+            let served = s.spawn(|| server.serve(&stop));
+
+            // First incarnation: requests the manifest, then dies without BYE.
+            {
+                let crashed = Loopback::new("p", &fabric);
+                let req = notif::encode_manifest_request("m", &crashed.local_md().expect("md"));
+                crashed.send_notif("h", &req).expect("send");
+                // Wait until the server has actually opened the session.
+                let start = std::time::Instant::now();
+                loop {
+                    if crashed
+                        .drain_notifs()
+                        .expect("drain")
+                        .iter()
+                        .any(|(_, m)| m.starts_with(notif::MANIFEST))
+                    {
+                        break;
+                    }
+                    assert!(start.elapsed() < NOTIF_TIMEOUT, "no manifest reply");
+                    std::thread::sleep(POLL);
+                }
+            }
+
+            // Second incarnation, same name: the full pull must succeed.
+            let mut retry_agent = Loopback::new("p", &fabric);
+            let mut puller = Puller::new(&mut retry_agent, 0, 2, false).expect("puller");
+            let dst_root = dst.path().to_path_buf();
+            let summary = puller
+                .pull(b"h", "m", |rev| dst_root.join(rev))
+                .expect("retry pull after crash");
+            stop.store(true, Ordering::Relaxed);
+            served.join().expect("join").expect("serve ok");
+
+            assert_eq!(summary.files, 2);
+            let got = std::fs::read(summary.dest.join("model-00001.safetensors")).expect("read");
+            assert_eq!(got.as_slice(), b"crash weights");
+        });
+    }
+
     /// Pipelined path: with depth 2 and more files than slots, slots are reused.
     /// The loopback defers each write to wait time, reading the slot bytes then,
     /// so a slot reused before its write was awaited would corrupt the file and

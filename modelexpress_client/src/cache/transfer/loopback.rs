@@ -13,8 +13,7 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use std::collections::HashMap;
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::os::raw::c_void;
 use std::os::unix::io::RawFd;
 use std::path::PathBuf;
@@ -79,6 +78,10 @@ pub struct Loopback {
     /// When set, flip a byte during the network leg so the puller's SHA check
     /// sees corruption (tests data-integrity detection honestly).
     corrupt: bool,
+    /// Peers whose metadata is loaded. Mirrors NIXL's semantics: loading an
+    /// already-loaded name fails until it is invalidated, so tests exercise the
+    /// same reconnect behaviour the hardware shows.
+    loaded: HashSet<String>,
 }
 
 impl Loopback {
@@ -99,6 +102,7 @@ impl Loopback {
             fabric: fabric.clone(),
             inbox,
             corrupt,
+            loaded: HashSet::new(),
         }
     }
 }
@@ -162,7 +166,16 @@ impl Transport for Loopback {
     }
 
     fn load_remote(&mut self, blob: &[u8]) -> anyhow::Result<String> {
-        Ok(String::from_utf8(blob.to_vec())?)
+        let peer = String::from_utf8(blob.to_vec())?;
+        if !self.loaded.insert(peer.clone()) {
+            anyhow::bail!("loadRemoteMD: {peer} already loaded (NIXL_ERR_NOT_ALLOWED)");
+        }
+        Ok(peer)
+    }
+
+    fn invalidate_remote(&mut self, peer: &str) -> anyhow::Result<()> {
+        self.loaded.remove(peer);
+        Ok(())
     }
 
     fn send_notif(&self, peer: &str, msg: &[u8]) -> anyhow::Result<()> {
