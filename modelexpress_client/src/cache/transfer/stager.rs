@@ -165,6 +165,7 @@ impl<'a, T: Transport, L: ModelLocator> CacheServer<'a, T, L> {
         let cached_fresh = matches!(self.held.get(model), Some((m, _, _)) if *m == mtime);
         if !cached_fresh {
             let manifest = cache_layout::scan_manifest(&dir, &revision)?;
+            manifest.ensure_frameable()?;
             self.held.insert(model.to_string(), (mtime, dir, manifest));
         }
         let (_, _, manifest) = self.held.get(model).context("manifest vanished")?;

@@ -53,18 +53,18 @@ struct Cli {
     /// `model@revision` per line, `#` comments allowed), re-read every pass so a
     /// mounted ConfigMap can be edited to reconverge the fleet without a restart.
     /// Takes precedence over `--model` when set.
-    #[arg(long, env = "MODEL_EXPRESS_CACHE_MODELS_FILE")]
+    #[arg(long, env = modelexpress_common::envs::MODEL_EXPRESS_CACHE_MODELS_FILE)]
     models_file: Option<PathBuf>,
 
     /// Seconds between reconcile passes in `--reconcile` mode.
-    #[arg(long, env = "MODEL_EXPRESS_CACHE_RECONCILE_SECS", default_value_t = 60)]
+    #[arg(long, env = modelexpress_common::envs::MODEL_EXPRESS_CACHE_RECONCILE_SECS, default_value_t = 60)]
     reconcile_secs: u64,
 
     /// `--reconcile` only: grow the desired set to include every model any peer
     /// advertises to the registry, on top of the `--model`/`--models-file` base.
     /// A model used on any node then replicates fleet-wide automatically. Off by
     /// default; the cache only grows while it is set (no eviction yet).
-    #[arg(long, env = "MODEL_EXPRESS_CACHE_AUTO_EXPAND")]
+    #[arg(long, env = modelexpress_common::envs::MODEL_EXPRESS_CACHE_AUTO_EXPAND)]
     auto_expand: bool,
 
     /// `--auto-expand` only: a model that is not pinned (in the base set) and has
@@ -72,7 +72,7 @@ struct Cli {
     /// out of the registry, and is then evicted. Default 7 days.
     #[arg(
         long,
-        env = "MODEL_EXPRESS_CACHE_DEMAND_TTL_SECS",
+        env = modelexpress_common::envs::MODEL_EXPRESS_CACHE_DEMAND_TTL_SECS,
         default_value_t = 7 * 24 * 3600
     )]
     demand_ttl_secs: u64,
@@ -81,7 +81,7 @@ struct Cli {
     /// evicted, a guard against deleting one just pulled or in use. Default 6h.
     #[arg(
         long,
-        env = "MODEL_EXPRESS_CACHE_GC_GRACE_SECS",
+        env = modelexpress_common::envs::MODEL_EXPRESS_CACHE_GC_GRACE_SECS,
         default_value_t = 6 * 3600
     )]
     gc_grace_secs: u64,
@@ -92,7 +92,7 @@ struct Cli {
     /// download is not advertised. Default 15s.
     #[arg(
         long,
-        env = "MODEL_EXPRESS_CACHE_CAPTURE_QUIESCENCE_SECS",
+        env = modelexpress_common::envs::MODEL_EXPRESS_CACHE_CAPTURE_QUIESCENCE_SECS,
         default_value_t = 15
     )]
     capture_quiescence_secs: u64,
@@ -102,26 +102,26 @@ struct Cli {
     name: String,
 
     /// NIXL listen port for the serving agent.
-    #[arg(long, env = "MODEL_EXPRESS_CACHE_NIXL_PORT", default_value_t = 7000)]
+    #[arg(long, env = modelexpress_common::envs::MODEL_EXPRESS_CACHE_NIXL_PORT, default_value_t = 7000)]
     nixl_port: u16,
 
     /// P2P registry endpoint (the ModelExpress server).
     #[arg(
         long,
-        env = "MODEL_EXPRESS_ENDPOINT",
+        env = modelexpress_common::envs::MODEL_EXPRESS_ENDPOINT,
         default_value = "http://localhost:8001"
     )]
     endpoint: String,
 
     /// Bounded staging-buffer size in GiB (the DRAM cap for a transfer).
-    #[arg(long, env = "MODEL_EXPRESS_CACHE_BUF_GIB", default_value_t = 4)]
+    #[arg(long, env = modelexpress_common::envs::MODEL_EXPRESS_CACHE_BUF_GIB, default_value_t = 4)]
     buf_gib: u32,
 
     /// Receive pipeline depth: the staging buffer is carved into this many slots
     /// so a shard's NVMe write overlaps the next shard's RDMA receive. Each slot
     /// must hold the largest shard, so raising depth needs proportionally more
     /// `--buf-gib`. 2 is the validated double-buffer.
-    #[arg(long, env = "MODEL_EXPRESS_CACHE_POOL_DEPTH", default_value_t = 2)]
+    #[arg(long, env = modelexpress_common::envs::MODEL_EXPRESS_CACHE_POOL_DEPTH, default_value_t = 2)]
     pool_depth: usize,
 
     /// Concurrent NVMe write streams per shard: each posted write is striped
@@ -139,12 +139,12 @@ struct Cli {
     /// for the sustained large writes the puller does (block-aligned, with the
     /// partial tail truncated back). Requires a filesystem that supports
     /// `O_DIRECT` (real NVMe does; tmpfs does not).
-    #[arg(long, env = "MODEL_EXPRESS_CACHE_O_DIRECT")]
+    #[arg(long, env = modelexpress_common::envs::MODEL_EXPRESS_CACHE_O_DIRECT)]
     o_direct: bool,
 
     /// Local model cache root. Defaults to the standard ModelExpress cache
     /// discovery (`MODEL_EXPRESS_CACHE_DIRECTORY`, config file, or `~`).
-    #[arg(long, env = "MODEL_EXPRESS_CACHE_DIRECTORY")]
+    #[arg(long, env = modelexpress_common::envs::MODEL_EXPRESS_CACHE_DIRECTORY)]
     cache_dir: Option<PathBuf>,
 }
 
