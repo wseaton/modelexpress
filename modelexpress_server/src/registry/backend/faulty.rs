@@ -52,6 +52,13 @@ pub enum RegistryOp {
     TryResetErrorForRetry {
         model_name: String,
     },
+    RefreshDownloadClaim {
+        model_name: String,
+    },
+    FinishDownloadClaim {
+        model_name: String,
+        status: ModelStatus,
+    },
 }
 
 impl RegistryOp {
@@ -68,6 +75,8 @@ impl RegistryOp {
             Self::GetStatusCounts => "get_status_counts",
             Self::TryClaimForDownload { .. } => "try_claim_for_download",
             Self::TryResetErrorForRetry { .. } => "try_reset_error_for_retry",
+            Self::RefreshDownloadClaim { .. } => "refresh_download_claim",
+            Self::FinishDownloadClaim { .. } => "finish_download_claim",
         }
     }
 }
@@ -210,13 +219,15 @@ impl RegistryBackend for FaultyRegistryBackend {
         &self,
         model_name: &str,
         provider: ModelProvider,
+        claim_id: &str,
+        lease_duration: Duration,
     ) -> RegistryResult<ClaimOutcome> {
         self.gate(RegistryOp::TryClaimForDownload {
             model_name: model_name.to_string(),
         })
         .await?;
         self.inner
-            .try_claim_for_download(model_name, provider)
+            .try_claim_for_download(model_name, provider, claim_id, lease_duration)
             .await
     }
 
@@ -224,13 +235,49 @@ impl RegistryBackend for FaultyRegistryBackend {
         &self,
         model_name: &str,
         provider: ModelProvider,
+        claim_id: &str,
+        lease_duration: Duration,
     ) -> RegistryResult<bool> {
         self.gate(RegistryOp::TryResetErrorForRetry {
             model_name: model_name.to_string(),
         })
         .await?;
         self.inner
-            .try_reset_error_for_retry(model_name, provider)
+            .try_reset_error_for_retry(model_name, provider, claim_id, lease_duration)
+            .await
+    }
+
+    async fn refresh_download_claim(
+        &self,
+        model_name: &str,
+        provider: ModelProvider,
+        claim_id: &str,
+        lease_duration: Duration,
+    ) -> RegistryResult<bool> {
+        self.gate(RegistryOp::RefreshDownloadClaim {
+            model_name: model_name.to_string(),
+        })
+        .await?;
+        self.inner
+            .refresh_download_claim(model_name, provider, claim_id, lease_duration)
+            .await
+    }
+
+    async fn finish_download_claim(
+        &self,
+        model_name: &str,
+        provider: ModelProvider,
+        claim_id: &str,
+        status: ModelStatus,
+        message: Option<String>,
+    ) -> RegistryResult<bool> {
+        self.gate(RegistryOp::FinishDownloadClaim {
+            model_name: model_name.to_string(),
+            status,
+        })
+        .await?;
+        self.inner
+            .finish_download_claim(model_name, provider, claim_id, status, message)
             .await
     }
 }

@@ -23,7 +23,7 @@ use std::collections::HashMap;
 use std::num::NonZeroU16;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, Once};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use modelexpress_client::cache::desired::ModelSpec;
@@ -37,6 +37,7 @@ use modelexpress_client::cache::{advertise, discover};
 use modelexpress_common::cache::resolve_model_path;
 use modelexpress_common::grpc::p2p::worker_metadata::BackendMetadata;
 use modelexpress_common::models::ModelProvider;
+use modelexpress_server::backend_config::BackendConfig;
 use modelexpress_server::config::ServerConfig;
 use modelexpress_server::run_server;
 use tokio::sync::oneshot;
@@ -44,22 +45,12 @@ use tokio::task::JoinHandle;
 
 type ServerResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
-fn ensure_memory_backend() {
-    static INIT: Once = Once::new();
-    INIT.call_once(|| {
-        // SAFETY: set once under `Once`, before any server reads the env.
-        unsafe { std::env::set_var("MX_METADATA_BACKEND", "memory") };
-    });
-}
-
 fn free_port() -> u16 {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
     listener.local_addr().expect("local addr").port()
 }
 
 fn start_server(port: u16) -> (oneshot::Sender<()>, JoinHandle<ServerResult>) {
-    ensure_memory_backend();
-
     let mut config = ServerConfig::default();
     config.server.host = "127.0.0.1".to_string();
     config.server.port = NonZeroU16::new(port).expect("port is non-zero");
@@ -69,7 +60,7 @@ fn start_server(port: u16) -> (oneshot::Sender<()>, JoinHandle<ServerResult>) {
     let shutdown = async move {
         let _ = rx.await;
     };
-    let handle = tokio::spawn(run_server(config, shutdown));
+    let handle = tokio::spawn(run_server(config, BackendConfig::Memory, shutdown));
     (tx, handle)
 }
 

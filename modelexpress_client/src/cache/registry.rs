@@ -58,6 +58,7 @@ impl Registry {
                 identity: Some(identity),
                 worker: Some(worker),
                 worker_id: worker_id.into(),
+                ..Default::default()
             })
             .await?
             .into_inner();
@@ -102,6 +103,7 @@ impl Registry {
             .list_sources(ListSourcesRequest {
                 identity: Some(identity),
                 status_filter: Some(SourceStatus::Ready as i32),
+                ..Default::default()
             })
             .await?
             .into_inner();
@@ -118,6 +120,7 @@ impl Registry {
             .list_sources(ListSourcesRequest {
                 identity: None,
                 status_filter: Some(SourceStatus::Ready as i32),
+                ..Default::default()
             })
             .await?
             .into_inner();

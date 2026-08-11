@@ -1532,7 +1532,12 @@ mod tests {
 
         // Owner claims the model: the registry now reports DOWNLOADING.
         let claimed = registry
-            .try_claim_for_download("m", ModelProvider::HuggingFace)
+            .try_claim_for_download(
+                "m",
+                ModelProvider::HuggingFace,
+                "test-claim",
+                std::time::Duration::from_secs(60),
+            )
             .await
             .expect("claim");
         assert!(matches!(claimed, ClaimOutcome::Claimed));

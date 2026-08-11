@@ -61,14 +61,10 @@ pub fn file_cache_identity(
         mx_version: MX_VERSION.to_string(),
         mx_source_type: MxSourceType::FileCache as i32,
         model_name: model_name.into(),
-        backend_framework: 0, // UNKNOWN: not tied to a GPU framework
-        tensor_parallel_size: 0,
-        pipeline_parallel_size: 0,
-        expert_parallel_size: 0,
-        dtype: String::new(),
-        quantization: String::new(),
-        extra_parameters: Default::default(),
         revision: revision.into(),
+        // GPU-layout and compile-artifact fields stay at their defaults: a file
+        // cache is framework- and parallelism-agnostic.
+        ..Default::default()
     }
 }
 
@@ -86,12 +82,11 @@ pub fn cache_worker(
     WorkerMetadata {
         worker_rank: 0,
         backend_metadata: Some(BackendMetadata::NixlMetadata(nixl_md)),
-        tensors: Vec::new(),
         status: SourceStatus::Ready as i32,
         updated_at: now_millis(),
         metadata_endpoint: metadata_endpoint.into(),
         agent_name: agent_name.into(),
-        worker_grpc_endpoint: String::new(),
+        ..Default::default()
     }
 }
 
@@ -147,7 +142,7 @@ mod tests {
         assert_eq!(worker.agent_name, "agent-a");
         assert_eq!(worker.metadata_endpoint, "10.0.0.1:7000");
         assert!(
-            worker.tensors.is_empty(),
+            worker.source_payload.is_none(),
             "manifest moves in-band, not here"
         );
         assert!(worker.updated_at > 0, "must be stamped or it is born stale");

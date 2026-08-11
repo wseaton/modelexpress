@@ -50,6 +50,7 @@ impl ModelMetadataSpec {
             Ok(MxSourceType::CuteDslCache) => "cute_dsl_cache",
             Ok(MxSourceType::FlashinferCache) => "flashinfer_cache",
             Ok(MxSourceType::TvmFfiCache) => "tvm_ffi_cache",
+            Ok(MxSourceType::FileCache) => "file_cache",
             Err(_) => "unknown",
         }
         .to_string()
