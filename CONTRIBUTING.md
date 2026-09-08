@@ -5,7 +5,7 @@ SPDX-License-Identifier: Apache-2.0
 
 # Contributing to ModelExpress
 
-For technical architecture, see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). For AI assistant instructions, see `CLAUDE.md`.
+For technical architecture, see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). For AI coding-agent instructions, see [`AGENTS.md`](AGENTS.md).
 
 ## Development Setup
 
@@ -125,7 +125,6 @@ MX_METADATA_BACKEND=redis REDIS_URL=redis://localhost:6379 cargo run -p modelexp
 | `MODEL_EXPRESS_ENDPOINT` | `http://localhost:8001` | Server endpoint |
 | `MODEL_EXPRESS_TIMEOUT` | `30` | Request timeout in seconds |
 | `MODEL_EXPRESS_CACHE_DIRECTORY` | (see below) | Cache path override |
-| `MODEL_EXPRESS_MAX_RETRIES` | (none) | Max retry attempts |
 | `MODEL_EXPRESS_NO_SHARED_STORAGE` | `false` | Disable shared storage mode |
 
 Cache directory resolution order: `MODEL_EXPRESS_CACHE_DIRECTORY` -> `HF_HUB_CACHE` -> `~/.cache/huggingface/hub`.
@@ -224,4 +223,9 @@ Signed-off-by: Jane Smith <jane.smith@email.com>
 
 You can use `-s` or `--signoff` to add the `Signed-off-by` line automatically.
 
-If your pull request fails the DCO check, see the [DCO Troubleshooting Guide](DCO.md).
+If your pull request fails the DCO check, add the trailer to the existing commits and force-push:
+
+```bash
+git rebase --signoff origin/main
+git push --force-with-lease
+```

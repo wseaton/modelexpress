@@ -147,6 +147,12 @@ spec:
                     description: Number of tensors registered by this worker
                     format: int32
                     type: integer
+                  topology:
+                    additionalProperties:
+                      type: string
+                    default: {}
+                    description: Datacenter topology domain values keyed by level.
+                    type: object
                   transferEngineSessionId:
                     description: Mooncake TransferEngine session ID
                     nullable: true

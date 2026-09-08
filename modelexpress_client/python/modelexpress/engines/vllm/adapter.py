@@ -21,24 +21,43 @@ from ...adapter import EngineAdapter
 from ...accelerators import accelerator_backend_for
 from ...load_strategy.context import LoadContext, LoadResult
 from ...metadata.client_factory import create_metadata_client
-from ...metadata.publish import build_source_identity
 from ...rank_utils import get_global_rank
 from ...tensor_utils import adopt_hidden_tensors, capture_tensor_attrs, collect_module_tensors
+from .source_identity import build_source_identity
 
 logger = logging.getLogger("modelexpress.engines.vllm.adapter")
 
-_VLLM_POST_LOAD_FINALIZER_NAMES = (
-    # DeepSeek V4 finalizes MegaMoE expert layouts from load_weights().
-    # The RDMA target path uses vLLM's dummy loader, which bypasses the
-    # model load_weights() method, so mirror the model-level hook here.
+_VLLM_PRE_RDMA_FINALIZER_NAMES = (
+    # MegaMoE changes the model's tensor layout. It must run before tensor
+    # discovery and RDMA registration so the target exposes the same regions
+    # that the source published.
     "finalize_mega_moe_weights",
 )
+
+_VLLM_POST_RDMA_FINALIZER_NAMES = (
+    # DeepSeek V4 derives this tensor from hc_attn_fn. Unlike MegaMoE, it is
+    # target-local and is not sent by RDMA, so it must be built only after
+    # hc_attn_fn has received its real weight values.
+    "finalize_mhc_broadcast_weights",
+)
+
+# vLLM keeps accelerator-backed attention scales together with host mirrors
+# consumed by backends such as FlashInfer and AITER. Only the accelerator
+# tensors are part of the ModelExpress manifest, so an RDMA target must refresh
+# the mirrors after the received values overwrite its dummy-loaded tensors.
+_VLLM_ATTENTION_SCALE_NAMES: tuple[str, ...] = ("q", "k", "v")
 
 # MTP draft weights live under an "mtp." prefix in the shared checkpoint. The
 # draft's embedding and lm_head come from the target, so these are all it needs.
 _DRAFT_WEIGHT_PREFIXES: tuple[str, ...] = ("mtp.",)
 
 _SAFETENSORS_INDEX_NAME = "model.safetensors.index.json"
+
+# Registries on compilation_config that vLLM keys by layer name.
+_LAYER_REGISTRY_FIELDS: tuple[str, ...] = (
+    "static_forward_context",
+    "static_all_moe_layers",
+)
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -85,13 +104,21 @@ def _read_safetensors_index(model_uri: str) -> dict | None:
     from runai_model_streamer import pull_files
 
     with tempfile.TemporaryDirectory() as tmp:
-        pull_files(model_uri, tmp, allow_pattern=[_SAFETENSORS_INDEX_NAME])
+        # runai's allow_pattern is a glob matched against the full object key,
+        # so a bare filename never matches; anchor it with a leading wildcard.
+        pull_files(model_uri, tmp, allow_pattern=[f"*{_SAFETENSORS_INDEX_NAME}"])
         for root, _dirs, files in os.walk(tmp):
             if _SAFETENSORS_INDEX_NAME in files:
                 with open(
                     os.path.join(root, _SAFETENSORS_INDEX_NAME), encoding="utf-8"
                 ) as handle:
                     return json.load(handle)
+    logger.warning(
+        "safetensors index %s not found under %s; draft-shard selection will "
+        "fall back to streaming all shards",
+        _SAFETENSORS_INDEX_NAME,
+        model_uri,
+    )
     return None
 
 
@@ -195,6 +222,12 @@ class VllmAdapter(EngineAdapter):
             dummy_config.load_format = "dummy"
         except AttributeError:
             object.__setattr__(dummy_config, "load_format", "dummy")
+        # DummyModelLoader rejects any model_loader_extra_config. The RDMA
+        # target only allocates empty tensors, so strip the streamer-oriented
+        # extra config (e.g. distributed / memory_limit) the source config may
+        # carry. Rebind rather than mutate: the shared dict is still used by the
+        # streamer fallback path.
+        _set_load_config_extra_config(dummy_config, {})
         DummyModelLoader(dummy_config).load_weights(result.model, self.model_config)
         return result
 
@@ -203,8 +236,17 @@ class VllmAdapter(EngineAdapter):
         # post-load processing. RDMA targets use the dummy loader, so run
         # those hooks before receiving tensors to expose the same target
         # tensor layout and hidden buffers that the source published.
-        result = self._finalize_model_specific_weights(result)
+        result = self._finalize_model_specific_weights(
+            result, _VLLM_PRE_RDMA_FINALIZER_NAMES
+        )
         return self._process_weights_after_loading(result)
+
+    def after_rdma_receive(self, result: LoadResult) -> LoadResult:
+        """Build target-local tensors derived from the received weights."""
+        result = self._finalize_model_specific_weights(
+            result, _VLLM_POST_RDMA_FINALIZER_NAMES
+        )
+        return self._refresh_host_quantization_state(result)
 
     def apply_weight_iter(
         self,
@@ -323,12 +365,16 @@ class VllmAdapter(EngineAdapter):
     def reinit_for_retry(self, result: LoadResult) -> LoadResult:
         from vllm.model_executor.model_loader.utils import initialize_model
 
-        old_value = result.value
+        stale_value = result.value
+        stale_model = result.model
         result.value = None
         result.model = None
-        del old_value
+        # Unregister before dropping the model: its registrations identify it,
+        # and clearing them frees its parameters before the rebuild allocates.
+        self._unregister_model_layers(stale_model)
+        del stale_value
+        del stale_model
         self.accelerator_backend.empty_cache()
-        self._reset_compilation_state()
         logger.info(
             "[Worker %s] Re-initializing vLLM model after failed strategy",
             self.get_global_rank(),
@@ -357,11 +403,173 @@ class VllmAdapter(EngineAdapter):
             )
         return result
 
+    @torch.no_grad()
+    def _refresh_host_quantization_state(self, result: LoadResult) -> LoadResult:
+        """Refresh vLLM host mirrors after RDMA overwrites device scales.
+
+        vLLM's attention PWAL copies ``_q/_k/_v_scale`` into Python floats and,
+        for some backends, CPU tensors whose launch APIs require host scalars.
+        RDMA receives only the registered accelerator tensors, leaving those
+        mirrors at values derived from the target's dummy load. Re-running PWAL
+        is not a safe repair because the incoming model is already in its
+        processed runtime representation; update only the non-transferable
+        mirrors that the selected backend exposes.
+
+        Compressed-tensors may use per-head scales. Match vLLM's own conversion
+        by using their maximum for the scalar host mirror.
+        """
+        if result.model is None:
+            raise RuntimeError("vLLM RDMA post-load processing requires result.model")
+
+        float_names = tuple(
+            f"_{scale_name}_scale_float"
+            for scale_name in _VLLM_ATTENTION_SCALE_NAMES
+        )
+        cpu_names = ("_k_scale_cpu", "_v_scale_cpu")
+        device_names = tuple(
+            f"_{scale_name}_scale" for scale_name in _VLLM_ATTENTION_SCALE_NAMES
+        )
+        required_names = device_names + float_names + ("_o_scale_float",)
+        flashinfer_cache_names = ("bmm1_scale", "bmm2_scale", "o_sf_scale")
+
+        cache_config = getattr(self.vllm_config, "cache_config", None)
+        configured_cache_dtype = getattr(cache_config, "cache_dtype", None)
+        fp8_expected = isinstance(configured_cache_dtype, str) and (
+            configured_cache_dtype.startswith("fp8")
+        )
+
+        # This is a shim over vLLM private attributes, so an upstream scale
+        # contract change must fail the RDMA strategy instead of silently
+        # serving with stale values. Any failure after mutation is recovered by
+        # the outer strategy reinitializing the whole model before fallback.
+        refreshed_values = 0
+        stale_values = 0
+        refreshed_modules = 0
+        for module_name, module in result.model.named_modules():
+            module_label = module_name or type(module).__name__
+            kv_cache_dtype = getattr(module, "kv_cache_dtype", None)
+            if isinstance(kv_cache_dtype, str) and kv_cache_dtype.startswith("fp8"):
+                fp8_expected = True
+
+            host_names = float_names + cpu_names
+            if not any(hasattr(module, name) for name in host_names):
+                continue
+
+            missing_names = [
+                name for name in required_names if not hasattr(module, name)
+            ]
+            if missing_names:
+                raise RuntimeError(
+                    "Incomplete vLLM attention scale contract on "
+                    f"{module_label}: missing {', '.join(missing_names)}"
+                )
+
+            for float_name in float_names:
+                if not isinstance(getattr(module, float_name), float):
+                    raise RuntimeError(
+                        "Invalid vLLM attention host scalar on "
+                        f"{module_label}: {float_name} must be a float"
+                    )
+
+            for cpu_name in cpu_names:
+                if not hasattr(module, cpu_name):
+                    continue
+                cpu_mirror = getattr(module, cpu_name)
+                if (
+                    not isinstance(cpu_mirror, torch.Tensor)
+                    or cpu_mirror.numel() != 1
+                    or not torch.is_floating_point(cpu_mirror)
+                ):
+                    raise RuntimeError(
+                        "Invalid vLLM attention CPU scale on "
+                        f"{module_label}: {cpu_name} must be a floating-point "
+                        "singleton tensor"
+                    )
+
+            impl = getattr(module, "impl", None)
+            initialized_cache_names = []
+            if module._o_scale_float is not None:
+                initialized_cache_names.append("_o_scale_float")
+            initialized_cache_names.extend(
+                cache_name
+                for cache_name in flashinfer_cache_names
+                if hasattr(impl, cache_name) and getattr(impl, cache_name) is not None
+            )
+            if initialized_cache_names:
+                raise RuntimeError(
+                    "vLLM attention host-scale refresh requires a cold-load "
+                    f"state on {module_label}; already initialized: "
+                    f"{', '.join(initialized_cache_names)}"
+                )
+
+            for scale_name, tensor_name in zip(
+                _VLLM_ATTENTION_SCALE_NAMES, device_names, strict=True
+            ):
+                scale = getattr(module, tensor_name)
+                if (
+                    not isinstance(scale, torch.Tensor)
+                    or not self.accelerator_backend.is_accel_tensor(scale)
+                    or scale.numel() == 0
+                    or not torch.is_floating_point(scale)
+                ):
+                    raise RuntimeError(
+                        "Invalid vLLM accelerator attention scale on "
+                        f"{module_label}: {tensor_name} must be a nonempty "
+                        "floating-point accelerator tensor"
+                    )
+
+                scale_float = scale.detach().float()
+                if not bool(torch.isfinite(scale_float).all().item()) or not bool(
+                    (scale_float > 0).all().item()
+                ):
+                    raise RuntimeError(
+                        "Invalid vLLM accelerator attention scale on "
+                        f"{module_label}: {tensor_name} must contain only finite, "
+                        "positive values"
+                    )
+                value = float(scale_float.max().item())
+                float_name = f"_{scale_name}_scale_float"
+                previous = getattr(module, float_name)
+                if previous != value:
+                    stale_values += 1
+                    logger.debug(
+                        "Refreshing vLLM host scale %s.%s: %r -> %r",
+                        module_label,
+                        float_name,
+                        previous,
+                        value,
+                    )
+                setattr(module, float_name, value)
+
+                cpu_mirror = getattr(module, f"_{scale_name}_scale_cpu", None)
+                if isinstance(cpu_mirror, torch.Tensor):
+                    cpu_mirror.fill_(value)
+
+                refreshed_values += 1
+            refreshed_modules += 1
+
+        if fp8_expected and not refreshed_modules:
+            raise RuntimeError(
+                "FP8 KV cache requires recognizable vLLM q/k/v host scale state, "
+                "but no attention module was refreshed"
+            )
+
+        if refreshed_values:
+            logger.info(
+                "Refreshed %d vLLM host attention scales across %d modules "
+                "after RDMA receive (%d stale dummy values replaced)",
+                refreshed_values,
+                refreshed_modules,
+                stale_values,
+            )
+        return result
+
     def _finalize_model_specific_weights(
         self,
         result: LoadResult,
+        finalizer_names: tuple[str, ...],
     ) -> LoadResult:
-        """Run model finalizers that vLLM normally calls in load_weights()."""
+        """Run selected model finalizers that vLLM normally calls in load_weights()."""
 
         if result.model is None:
             raise RuntimeError("vLLM RDMA post-load processing requires result.model")
@@ -379,13 +587,13 @@ class VllmAdapter(EngineAdapter):
                     continue
 
                 module_finalized = False
-                for finalizer_name in _VLLM_POST_LOAD_FINALIZER_NAMES:
+                for finalizer_name in finalizer_names:
                     finalizer = getattr(module, finalizer_name, None)
                     if not callable(finalizer):
                         continue
 
                     logger.info(
-                        "Running vLLM model-specific post-load finalizer %s on %s",
+                        "Running vLLM model finalizer %s on %s",
                         finalizer_name,
                         name or type(module).__name__,
                     )
@@ -404,21 +612,35 @@ class VllmAdapter(EngineAdapter):
         )
         return torch.device(load_device)
 
-    def _reset_compilation_state(self) -> None:
-        compilation_config = self.vllm_config.compilation_config
-        # vLLM registers each attention / MLA / Mamba / FusedMoE layer into
-        # fields on vllm_config.compilation_config during initialize_model().
-        # Those fields live on the config object, not the model, so they survive
-        # del model and trip duplicate registration on the next initialize_model().
-        # Clear them so re-init starts from a clean slate. Audited against vLLM
-        # 0.17.1; other versions may add init=False fields that need similar
-        # treatment.
-        compilation_config.static_forward_context.clear()
-        compilation_config.static_all_moe_layers.clear()
-        compilation_config.enabled_custom_ops.clear()
-        compilation_config.disabled_custom_ops.clear()
-        compilation_config.traced_files.clear()
-        compilation_config.compilation_time = 0.0
+    def _unregister_model_layers(self, stale_model: torch.nn.Module | None) -> None:
+        """Remove `stale_model`'s layers from vLLM's layer registries.
+
+        The registries live on compilation_config, so dropping the model leaves
+        its entries behind and the rebuild fails vLLM's duplicate-name check.
+        Clearing them is wrong: one compilation_config is shared by every model
+        built from a VllmConfig, so under MTP they also hold the live target's
+        layers. Remove only what this model registered, matched by its own
+        modules or the `layer_name` they registered under.
+
+        Args:
+            stale_model: Model being discarded, or None to clear outright.
+        """
+        owned_ids: set[int] = set()
+        owned_names: set[str] = set()
+        for module in stale_model.modules() if stale_model is not None else ():
+            owned_ids.add(id(module))
+            layer_name = getattr(module, "layer_name", None)
+            if isinstance(layer_name, str):
+                owned_names.add(layer_name)
+
+        for attr in _LAYER_REGISTRY_FIELDS:
+            registry = getattr(self.vllm_config.compilation_config, attr, None)
+            if registry is None:
+                continue
+            if stale_model is None:
+                registry.clear()
+            else:
+                _drop_owned_entries(attr, registry, owned_ids, owned_names)
 
     def _model_streamer_distributed_enabled(self) -> bool:
         tp_size = getattr(self.vllm_config.parallel_config, "tensor_parallel_size", 1)
@@ -437,6 +659,35 @@ def _set_load_config_extra_config(load_config, extra_config: dict) -> None:
 
 def _is_same_or_descendant(name: str, prefix: str) -> bool:
     return prefix == "" or name == prefix or name.startswith(f"{prefix}.")
+
+
+def _drop_owned_entries(
+    attr: str,
+    registry,
+    owned_ids: set[int],
+    owned_names: set[str],
+) -> None:
+    """Remove one compilation registry's entries belonging to a single model."""
+
+    def is_owned(entry) -> bool:
+        return id(entry) in owned_ids or (isinstance(entry, str) and entry in owned_names)
+
+    if isinstance(registry, dict):
+        for key in [k for k, v in registry.items() if is_owned(k) or is_owned(v)]:
+            del registry[key]
+    elif isinstance(registry, set):
+        registry.difference_update({e for e in registry if is_owned(e)})
+    elif isinstance(registry, list):
+        registry[:] = [e for e in registry if not is_owned(e)]
+    else:
+        # A leftover entry only fails the rebuild's duplicate-name check, while
+        # clearing blind could unregister a co-owner's layers.
+        logger.warning(
+            "compilation_config.%s is a %s, which cannot be filtered by owner; "
+            "leaving it untouched",
+            attr,
+            type(registry).__name__,
+        )
 
 
 def _get_vllm_worker_rank(

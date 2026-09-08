@@ -7,7 +7,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "modelexpress"
-version = "0.5.0"
+version = "0.5.1"
 description = "Python client for ModelExpress P2P GPU transfer service"
 readme = "README.md"
 license = "Apache-2.0"
@@ -33,12 +33,22 @@ dependencies = [
     "torch>=2.6.0",
     "runai-model-streamer[s3,gcs,azure]; sys_platform == 'linux'",
     "instanttensor>=0.1.9 ; sys_platform == 'linux'",
+    # First release with IfNoneMatch on CompleteMultipartUpload.
+    "boto3>=1.35.2",
+    "zstandard>=0.22.0",
+    "safetensors>=0.8.0",
+    "s3transfer>=0.10.0",
 ]
 
 [project.optional-dependencies]
 dev = [
     "opentelemetry-api>=1.41.1",
     "opentelemetry-sdk>=1.41.1",
+    # tests/test_metrics.py builds the real collectors and forks real ranks, so
+    # the test extra needs what the metrics extra installs. CI installs only
+    # [dev]; without this the metrics tests would error out on import rather
+    # than run.
+    "prometheus-client>=0.20.0",
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
 ]
@@ -67,7 +77,7 @@ Repository = "https://github.com/ai-dynamo/modelexpress.git"
 Documentation = "https://github.com/ai-dynamo/modelexpress/tree/main/docs"
 
 [project.entry-points."vllm.general_plugins"]
-modelexpress = "modelexpress:register_modelexpress_loaders"
+modelexpress = "modelexpress:register_modelexpress"
 
 [tool.pytest.ini_options]
 markers = [

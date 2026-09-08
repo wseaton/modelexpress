@@ -13,10 +13,11 @@ are auto-promoted to non-persistent buffers via capture_tensor_attrs().
 
 Uses LoadStrategyChain to auto-detect the best loading strategy:
     1. RDMA (P2P GPU transfer via NIXL) - if a source is already serving
-    2. InstantTensor (fast local safetensors, direct I/O + GDS) - set MX_INSTANT_TENSOR=0 to disable
-    3. ModelStreamer (S3/GCS/Azure/local via runai-model-streamer) - set MX_MODEL_URI
-    4. GDS (GPUDirect Storage) - direct file-to-GPU, bypassing CPU
-    5. Default (vLLM DefaultModelLoader) - standard CPU-staged loading
+    2. ServerCache (stream weights from ModelExpress Server) - set MODEL_EXPRESS_NO_SHARED_STORAGE=1
+    3. InstantTensor (fast local safetensors, direct I/O + GDS) - set MX_INSTANT_TENSOR=0 to disable
+    4. ModelStreamer (S3/GCS/Azure/local via runai-model-streamer) - set MX_MODEL_URI
+    5. GDS (GPUDirect Storage) - direct file-to-GPU, bypassing CPU
+    6. Default (vLLM DefaultModelLoader) - standard CPU-staged loading
 
 Usage:
     --load-format modelexpress
@@ -31,8 +32,9 @@ import time
 import torch
 import torch.nn as nn
 
-from ... import configure_vllm_logging, envs
+from ... import configure_vllm_logging, envs, model_prefetch
 from ...load_strategy import LoadContext, LoadStrategyChain
+from ...metrics import enable_metrics, metrics
 from ...nixl_transfer import NixlTransferManager
 from ...vmm.runtime import log_arena_post_load, maybe_enter_vmm_arena
 from .adapter import _is_speculative_draft, build_vllm_load_context
@@ -70,6 +72,11 @@ class MxModelLoader(BaseModelLoader):
     def __init__(self, load_config: LoadConfig):
         super().__init__(load_config)
         configure_vllm_logging()
+        # Unconditionally, and off the load path: a run that skips P2P and falls
+        # back to a local or HuggingFace path must still bring the exporter up,
+        # or it produces output byte-identical to MX_METRICS_ENABLED=0 -- the run
+        # you most need to diagnose. No-op unless enabled; never raises.
+        enable_metrics()
         self._ctx: LoadContext | None = None
 
     def load_model(
@@ -97,29 +104,49 @@ class MxModelLoader(BaseModelLoader):
             f"(model={ctx.identity.model_name}, p2p_enabled={ctx.p2p_enabled})"
         )
 
-        with maybe_enter_vmm_arena(ctx):
-            if ctx.p2p_enabled:
-                install_vllm_cache_artifacts(ctx)
-            with set_default_torch_dtype(model_config.dtype):
-                with ctx.target_device:
-                    model = initialize_model(
-                        vllm_config=vllm_config,
-                        model_config=model_config,
-                        prefix=prefix,
-                    )
+        # A speculative draft loads through this same path and finishes far
+        # sooner than the model the user asked for, so timing them together
+        # makes the p99 of neither meaningful. Asked directly rather than
+        # inferred from p2p_enabled: that flag happens to agree today, but it is
+        # a capability switch and any future reason to clear it would silently
+        # relabel real loads as drafts.
+        model_role = "draft" if _is_speculative_draft(vllm_config, model_config) else "main"
 
-                model = LoadStrategyChain.run(model, ctx)
-
+        # L0 wraps everything below, and the four L1 phases inside it are
+        # disjoint, so their sum is bounded by the total by construction. The
+        # timers only bracket existing calls; nothing here changes load order.
+        model_id = ctx.identity.model_name
+        with metrics.time_load("vllm", model_id, model_role):
+            with maybe_enter_vmm_arena(ctx):
                 if ctx.p2p_enabled:
-                    _tensor_registry[ctx.device_id] = ctx.tensors
-                    if ctx.nixl_manager is not None:
-                        _nixl_managers[ctx.device_id] = ctx.nixl_manager
-                    else:
-                        _nixl_managers.pop(ctx.device_id, None)
+                    with metrics.time_load_phase("vllm", model_id, "artifact_install"):
+                        install_vllm_cache_artifacts(ctx)
+                with set_default_torch_dtype(model_config.dtype):
+                    with ctx.target_device:
+                        with metrics.time_load_phase("vllm", model_id, "model_init"):
+                            model = initialize_model(
+                                vllm_config=vllm_config,
+                                model_config=model_config,
+                                prefix=prefix,
+                            )
 
-                    schedule_vllm_cache_artifact_publish(ctx)
+                    with metrics.time_load_phase("vllm", model_id, "chain"):
+                        model = LoadStrategyChain.run(model, ctx)
 
-        log_arena_post_load(ctx)
+                    if ctx.p2p_enabled:
+                        _tensor_registry[ctx.device_id] = ctx.tensors
+                        if ctx.nixl_manager is not None:
+                            _nixl_managers[ctx.device_id] = ctx.nixl_manager
+                        else:
+                            _nixl_managers.pop(ctx.device_id, None)
+
+                        # Scheduling the publish, not completing it: the work is
+                        # handed to a background thread, so this phase measures
+                        # the handoff and never the upload.
+                        with metrics.time_load_phase("vllm", model_id, "publish"):
+                            schedule_vllm_cache_artifact_publish(ctx)
+
+            log_arena_post_load(ctx)
 
         total_time = time.perf_counter() - load_start
         logger.info(
@@ -130,6 +157,17 @@ class MxModelLoader(BaseModelLoader):
 
     def download_model(self, model_config: ModelConfig) -> None:
         """Download the model so it can be loaded immediately."""
+        if model_prefetch.is_enabled():
+            # Without shared storage this would pull the full weight set from
+            # Hugging Face before any strategy runs, defeating P2P-first and
+            # failing outright when the worker is offline. The strategy chain
+            # decides where the weights come from.
+            logger.info(
+                "MODEL_EXPRESS_NO_SHARED_STORAGE is set; leaving weight "
+                "acquisition to the ModelExpress strategy chain"
+            )
+            return
+
         import copy
 
         disk_config = copy.copy(self.load_config)

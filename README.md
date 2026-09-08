@@ -19,6 +19,7 @@ SPDX-License-Identifier: Apache-2.0
 </p>
 
 <p align="center">
+  <a href="docs/README.md">Docs hub</a> •
   <a href="#features">Features</a> •
   <a href="#modelexpress-architecture">Architecture</a> •
   <a href="#benchmarks">Benchmarks</a> •
@@ -46,12 +47,14 @@ ModelExpress (MX) starts with a simple question: before loading a model, where d
 
 ### Runtime path selection
 
-At startup, ModelExpress probes the capabilities available in the environment and tries loading strategies in priority order:
+At startup, ModelExpress probes the capabilities available in the environment and tries the fixed loading strategy chain documented in [Configuration](docs/CONFIGURATION.md#loading-strategy-selection):
 
 1. **Serving peer → GPU** — Transfer post-processed weights directly from a compatible replica over NIXL P2P RDMA. Each new replica then joins the source pool, turning scale-out into GPU-to-GPU fan-out.
-2. **Remote or local storage → GPU with ModelStreamer** — Fetch safetensor ranges concurrently through a bounded CPU staging buffer while overlapping reads with GPU placement. Tensor-parallel ranks can divide remote reads instead of each downloading the full checkpoint.
-3. **Local storage → GPU with GDS** — Use NIXL's multithreaded GPUDirect Storage backend to bypass host-memory staging when the platform supports it.
-4. **Default loader** — Fall back to the inference engine's host-staged POSIX I/O path.
+2. **Server cache → runtime** — In no-shared-storage mode, fetch the snapshot through the ModelExpress server and hand it to the runtime's native loader.
+3. **Local safetensors → GPU** — Use InstantTensor when its package, CUDA-like device, and runtime adapter capability are available.
+4. **Remote or local storage → GPU with ModelStreamer** — Fetch safetensor ranges concurrently through a bounded CPU staging buffer while overlapping reads with GPU placement.
+5. **Local storage → GPU with GDS** — Use GPUDirect Storage when the platform and runtime adapter support it.
+6. **Default loader** — Fall back to the inference engine's native path.
 
 The first applicable strategy runs. If a strategy fails before changing model state, ModelExpress continues to the next one. If weights may already have landed, it reinitializes the model before continuing so a partially loaded model is never served.
 
@@ -62,7 +65,7 @@ The ModelExpress control plane discovers compatible sources through Redis, Kuber
 ## Features
 
 - **Cold start reduction** — GPU-to-GPU P2P transfer over InfiniBand instead of disk load
-- **Capability-driven loading** — Automatic priority chain: P2P RDMA → ModelStreamer → GDS → native loader, with safe fallback
+- **Capability-driven loading** — Fixed priority chain: P2P RDMA → server cache → InstantTensor → ModelStreamer → GDS → native loader, with safe fallback
 - **HuggingFace caching** — PVC-backed cache, `HF_HUB_OFFLINE`, `ignore_weights`, `get_model_path` for Dynamo
 - **P2P GPU transfer** — vLLM `modelexpress` loader, SGLang `remote_instance` loader with the `modelexpress` backend, and TRT-LLM `checkpoint_format="MX"` with NVIDIA NIXL over InfiniBand, RoCE, NVLink, EFA, and other supported fabrics
 - **JIT cache transfer** — Reuse compatible vLLM and SGLang NIXL compilation caches when replicas scale out
@@ -83,6 +86,7 @@ The ModelExpress control plane discovers compatible sources through Redis, Kuber
 | TensorRT-LLM | Native `checkpoint_format="MX"` for Llama-family P2P weight transfer (beta) — [TensorRT-LLM example](examples/p2p_transfer_k8s/client/trtllm/) |
 | NVIDIA Dynamo vLLM runtime | `--load-format modelexpress` for P2P weight and JIT cache transfer — [Dynamo P2P example](examples/dynamo_p2p_transfer_k8s/README.md) |
 | NVIDIA Dynamo SGLang runtime | `remote_instance` + `modelexpress` backend for P2P weight transfer; `transport=nixl` also supports JIT cache transfer — see [`docs/SGLANG.md`](docs/SGLANG.md) |
+| llm-d | Upstream Optimized Baseline integration — [llm-d integration guide](docs/integrations/orchestrators/llm-d.md) |
 
 ---
 
@@ -147,7 +151,7 @@ The artifact-enabled run reused compatible Triton, DeepGEMM, TileLang, CuTe DSL,
 
 ## Quick Start
 
-This Quick Start sets up the P2P path, which is what the benchmarks above measure, so it needs the full NIXL and metadata-backend prerequisites listed below. For a local single-machine setup instead, `docker compose -f docker/docker-compose.yml up --build` brings up the server with a Redis backend and no NIXL, and the `modelexpress-cli` commands in [CLI](docs/CLI.md) exercise it. See [Deployment](docs/DEPLOYMENT.md) for both.
+This Quick Start sets up the P2P path, which is what the benchmarks above measure, so it needs the full NIXL and metadata-backend prerequisites listed below. For a local single-machine setup instead, `docker compose -f docker/docker-compose.yml up --build` brings up the server with a Redis backend and no NIXL, and the `modelexpress-cli` commands in [CLI](docs/CLI.md) exercise it. See the [documentation hub](docs/README.md) for the scenario that matches your storage and orchestration setup.
 
 **Requirements:** vLLM 0.23.0+, the ModelExpress Python package, NIXL-compatible GPU nodes, and a reachable [metadata backend](examples/p2p_transfer_k8s/server/README.md).
 
@@ -210,7 +214,7 @@ docker compose -f docker/docker-compose.yml up --build
 
 ## Configuration
 
-**Precedence:** CLI → env vars (`MODEL_EXPRESS_*`, `MX_*`) → YAML → defaults.
+**Precedence:** CLI → env vars (`MODEL_EXPRESS_*`, `MX_*`) → YAML → defaults. See the [configuration reference](docs/CONFIGURATION.md) for defaults and eligibility gates.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -263,13 +267,20 @@ cargo bench
 
 ## Documentation
 
+Start with the [ModelExpress documentation hub](docs/README.md).
+
 | Doc | Description |
 |-----|-------------|
-| [Deployment](docs/DEPLOYMENT.md) | Server/client config, Docker, K8s, P2P |
+| [Choose a path](docs/guides/choose-a-path.md) | Scenario-driven path selection for P2P, storage, no shared storage, and orchestrators |
+| [Deployment](docs/DEPLOYMENT.md) | Server prerequisites, Docker, Kubernetes, Helm, and rollout |
+| [Configuration](docs/CONFIGURATION.md) | ModelExpress-owned settings, defaults, and fixed loader-chain eligibility |
+| [Integrations](docs/integrations/README.md) | vLLM, SGLang, TensorRT-LLM, Dynamo, and llm-d |
+| [Troubleshooting](docs/TROUBLESHOOTING.md) | Symptom-driven diagnostics |
 | [Architecture](docs/ARCHITECTURE.md) | Components, gRPC, NIXL, FP8 |
 | [Benchmarks](docs/BENCHMARKS.md) | Loading paths, NIXL registration, and artifact-transfer results |
 | [RL weight refit](modelexpress_client/python/modelexpress/refit/README.md) | Receiver-driven trainer-to-rollout resharding design and implementation status |
 | [CLI](docs/CLI.md) | Full CLI reference |
+| [Metrics](docs/METRICS.md) | Prometheus exposition for the server and the client |
 | [Metadata](docs/metadata.md) | Redis keys, K8s CRD schema |
 | [Helm](helm/README.md) | Kubernetes configuration |
 
@@ -292,7 +303,7 @@ cargo bench
 - **Multi-tier cache hierarchy**: Promote and demote models across DRAM, NVMe, and PVC tiers based on access patterns.
 - **Distributed sharded cache**: Shard large models across nodes using consistent hashing and parallel shard assembly.
 - **Training checkpoint management**: Cache and reuse CUDA kernel compilations (torch.compile, deepGEMM) and CUDA graphs across restarts.
-- **Metrics and observability**: Cache hit rates, eviction frequency, and P2P RDMA utilization via Prometheus/OpenTelemetry. Client-side P2P source-selection and transfer-duration metrics ship today behind `MX_METRICS_ENABLED=1` (see [Deployment](docs/DEPLOYMENT.md)); the server currently exposes structured logs only.
+- **Metrics and observability**: The exposition path exists today — the server serves `/metrics` on its own port, and the client collector is opt-in behind `MX_METRICS_ENABLED=1` (see [Metrics](docs/METRICS.md)). Still to build on it: cache hit rates, eviction frequency, and P2P RDMA utilization.
 - **Predictive prefetching**: Pre-warm caches from workload history or scheduling hints.
 - **Dynamic EPLB (Expert Parallelism Load Balancer)**: Rebalance MoE expert placement across GPUs at runtime via P2P transfer of expert weights as load shifts.
 
