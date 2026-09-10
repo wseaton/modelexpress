@@ -16,11 +16,31 @@ spec:
     singular: modelcacheentry
   scope: Namespaced
   versions:
-  - additionalPrinterColumns: []
+  - additionalPrinterColumns:
+    - jsonPath: .spec.modelName
+      name: Model
+      type: string
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .status.lastUsedAt
+      name: LastUsed
+      type: date
+    - jsonPath: .status.claimId
+      name: Claim
+      priority: 1
+      type: string
+    - jsonPath: .status.leaseExpiresAt
+      name: Lease
+      priority: 1
+      type: date
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
     name: v1alpha1
     schema:
       openAPIV3Schema:
-        description: Auto-generated derived type for ModelCacheEntrySpec via `CustomResource`
+        description: ModelExpress model-download lifecycle metadata
         properties:
           spec:
             description: ModelCacheEntry spec - desired state. One CR per cached model.
@@ -30,6 +50,11 @@ spec:
                 type: string
               provider:
                 description: Provider string — `"HuggingFace"`, `"Ngc"`, `"Gcs"`, or `"S3"`.
+                enum:
+                - HuggingFace
+                - Ngc
+                - Gcs
+                - S3
                 type: string
             required:
             - modelName
@@ -45,14 +70,17 @@ spec:
                 type: string
               createdAt:
                 description: RFC3339 timestamp of first write. Omitted until the first status patch.
+                format: date-time
                 nullable: true
                 type: string
               lastUsedAt:
                 description: RFC3339 timestamp of most recent status write or touch.
+                format: date-time
                 nullable: true
                 type: string
               leaseExpiresAt:
                 description: Owner-generated RFC3339 heartbeat deadline. Observers use changes in this value to measure liveness locally instead of comparing clocks across replicas.
+                format: date-time
                 nullable: true
                 type: string
               message:
@@ -62,6 +90,11 @@ spec:
               phase:
                 default: ''
                 description: One of `"Downloading"`, `"Downloaded"`, `"Error"`. Empty string on freshly-created records that haven't yet received a status patch.
+                enum:
+                - ''
+                - Downloading
+                - Downloaded
+                - Error
                 type: string
             type: object
         required:
