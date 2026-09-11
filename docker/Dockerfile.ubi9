@@ -39,7 +39,7 @@ RUN set -eux; \
 
 WORKDIR /src
 COPY . .
-RUN cargo build --release --bin modelexpress-server \
+RUN cargo build --release --package modelexpress-server --bin modelexpress-server \
         --no-default-features --features openssl \
     && cp target/release/modelexpress-server /modelexpress-server
 
