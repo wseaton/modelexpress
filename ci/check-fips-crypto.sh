@@ -7,8 +7,9 @@
 # only through aws-lc-fips-sys, not the aws-lc-sys rustls pulls.
 #
 # Reads the symbol table of the binary itself, so it sees exactly what was
-# linked regardless of how cargo resolved features. The Konflux Dockerfiles
-# run it on the binary they ship.
+# linked regardless of how cargo resolved features. If the binary carries
+# cargo-auditable data, that must not list the banned crates either. The
+# Konflux Dockerfiles run it on the binary they ship.
 #
 # Usage: ci/check-fips-crypto.sh <binary>...
 
@@ -53,6 +54,28 @@ for bin in "$@"; do
     else
         echo "    FAIL: no openssl symbols; the openssl feature did not apply"
         failed=1
+    fi
+
+    if [[ "$(objdump -h "${bin}")" == *.dep-v0* ]]; then
+        section=$(mktemp)
+        copy=$(mktemp)
+        objcopy --dump-section .dep-v0="${section}" "${bin}" "${copy}"
+        rm -f "${copy}"
+        stamped=$(python3 - "${section}" <<'EOF'
+import json, sys, zlib
+banned = {"ring", "rustls", "aws-lc-rs", "aws-lc-sys"}
+with open(sys.argv[1], "rb") as f:
+    packages = json.loads(zlib.decompress(f.read()))["packages"]
+print(" ".join(sorted({p["name"] for p in packages} & banned)))
+EOF
+)
+        rm -f "${section}"
+        if [[ -n "${stamped}" ]]; then
+            echo "    FAIL: cargo-auditable data lists ${stamped}; build with -Z sbom"
+            failed=1
+        else
+            echo "    ok: cargo-auditable data lists no ring, rustls or aws-lc"
+        fi
     fi
 done
 
