@@ -3,7 +3,8 @@
 
 # RPMs for docker/Dockerfile.ubi9, build and runtime stages combined.
 #
-# Regenerate the lockfile after editing:
+# MintMaker refreshes rpms.lock.yaml on its own schedule. After editing this
+# file, regenerate it locally:
 #   ./docker/konflux/lock-rpms.sh server
 contentOrigin:
   repos:
