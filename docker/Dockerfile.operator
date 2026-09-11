@@ -11,13 +11,18 @@ FROM registry.access.redhat.com/ubi9/ubi:9.8@sha256:bcbf1fe577df63bd975ea19ebae6
 
 # openssl-devel: FIPS builds link RHEL's openssl (ci/check-fips-crypto.sh)
 RUN dnf install -y --nodocs --setopt=install_weak_deps=0 \
-        rust cargo gcc openssl-devel \
+        rust cargo gcc binutils openssl-devel \
     && dnf clean all
+
+# Embeds the dependency tree in the binary for cargo audit bin and SBOM scanners
+ARG CARGO_AUDITABLE_VERSION=0.7.5
+RUN cargo install cargo-auditable --locked --version "${CARGO_AUDITABLE_VERSION}" --root /usr/local
 
 WORKDIR /src
 COPY . .
-RUN cargo build --release --package modelexpress-operator \
+RUN cargo auditable build --release --package modelexpress-operator \
         --no-default-features --features openssl \
+    && objdump -h target/release/modelexpress-operator | grep -q '\.dep-v0' \
     && cp target/release/modelexpress-operator /modelexpress-operator
 
 FROM registry.access.redhat.com/ubi9/ubi-minimal:9.8@sha256:7c372902c8d211db2d25c8277ba534a73b92742a334874dced829a63b0f21221
