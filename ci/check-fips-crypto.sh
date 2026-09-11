@@ -2,43 +2,58 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-# Assert the shipped binaries reach no non-FIPS crypto. RHEL's openssl is the
+# Assert a built binary links no non-FIPS crypto. RHEL's openssl is the
 # validated implementation; ring holds no certificate and aws-lc-rs qualifies
 # only through aws-lc-fips-sys, not the aws-lc-sys rustls pulls.
 #
-# Not cargo-deny: its --features flags apply to the whole virtual workspace, so
-# feature unification drags rustls back in via workspace-tests and the default
-# gcs feature regardless of how the product is built.
+# Reads the symbol table of the binary itself, so it sees exactly what was
+# linked regardless of how cargo resolved features. The Konflux Dockerfiles
+# run it on the binary they ship.
+#
+# Usage: ci/check-fips-crypto.sh <binary>...
 
 set -euo pipefail
 
-# package:features pairs, matching how each image is built
-TARGETS=(
-    "modelexpress-server:openssl"
-    "modelexpress-operator:openssl"
-)
-BANNED=(ring aws-lc-rs aws-lc-sys rustls)
+if [[ $# -eq 0 ]]; then
+    echo "usage: $0 <binary>..." >&2
+    exit 2
+fi
+
+# Rust paths (ring::, rustls::, ...) and the prefixed C symbols ring and
+# aws-lc build with. \b keeps string:: from matching ring::.
+BANNED='\b(ring|rustls|aws_lc_rs|aws_lc_sys)::|\bring_core_[0-9]|\baws_lc_[0-9]'
 
 failed=0
-for target in "${TARGETS[@]}"; do
-    pkg="${target%%:*}"
-    features="${target##*:}"
-    echo "==> ${pkg} (--no-default-features --features ${features})"
+for bin in "$@"; do
+    echo "==> ${bin}"
+    if [[ ! -f "${bin}" ]]; then
+        echo "    FAIL: no such file"
+        failed=1
+        continue
+    fi
+    symbols=$(nm --demangle "${bin}" 2>/dev/null || true)
 
-    for crate in "${BANNED[@]}"; do
-        # Passing looks like two things: a non-zero exit when the crate is
-        # absent, and an empty tree when it is reachable only over dev edges.
-        tree=$(cargo tree --quiet --package "${pkg}" \
-                 --no-default-features --features "${features}" \
-                 --invert "${crate}" --edges normal 2>/dev/null) || tree=""
-        if [[ -n "${tree//[[:space:]]/}" ]]; then
-            echo "    FAIL: ${crate} reachable from ${pkg}"
-            echo "${tree}" | head -20 | sed 's/^/      /'
-            failed=1
-        else
-            echo "    ok: ${crate} not linked"
-        fi
-    done
+    if [[ -z "${symbols}" ]]; then
+        echo "    FAIL: no symbol table; a stripped binary cannot be checked"
+        failed=1
+        continue
+    fi
+
+    banned=$(grep -oE "${BANNED}" <<<"${symbols}" | sort | uniq -c || true)
+    if [[ -n "${banned}" ]]; then
+        echo "    FAIL: non-FIPS crypto linked (symbol count per match):"
+        sed 's/^/      /' <<<"${banned}"
+        failed=1
+    else
+        echo "    ok: no ring, rustls or aws-lc symbols"
+    fi
+
+    if grep -qE '\bopenssl::' <<<"${symbols}"; then
+        echo "    ok: openssl linked"
+    else
+        echo "    FAIL: no openssl symbols; the openssl feature did not apply"
+        failed=1
+    fi
 done
 
 if [[ ${failed} -ne 0 ]]; then
@@ -46,14 +61,16 @@ if [[ ${failed} -ne 0 ]]; then
 
 Non-FIPS crypto reached a shipped binary.
 
-Most likely a new dependency defaulted to rustls. Give it
-default-features = false and select the native-tls/openssl backend, the way
-kube (openssl-tls) and reqwest (native-tls) are wired in Cargo.toml.
+Build with --package <crate> --no-default-features --features openssl.
+Without --package, cargo resolves features across the whole workspace and
+rustls comes back through other members.
 
-Note that the gcs feature can never be part of a FIPS build:
-google-cloud-auth hardcodes rustls.
+A new dependency that defaults to rustls needs default-features = false and
+its native-tls/openssl backend, the way kube (openssl-tls) and reqwest
+(native-tls) are wired in Cargo.toml.
+
+The gcs feature can never be part of a FIPS build: google-cloud-auth
+hardcodes rustls.
 EOF
     exit 1
 fi
-
-echo "all clear: no non-FIPS crypto in the shipped feature sets"
