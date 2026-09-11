@@ -6,17 +6,22 @@
 # Multi-stage build that compiles the operator from source on UBI9.
 # Runtime stage uses ubi-minimal for a small footprint with microdnf
 # available if additional packages are ever needed.
+#
+# Hermetic: every input is prefetched by Hermeto (cargo, rpm, generic) per
+# docker/konflux/operator/. Local build: ./docker/konflux/build-local.sh operator
 
 FROM registry.access.redhat.com/ubi9/ubi:9.8@sha256:bcbf1fe577df63bd975ea19ebae604b5f072e1833b2bde417a0ffd4afd938b96 AS build
 
 # openssl-devel: FIPS builds link RHEL's openssl (ci/check-fips-crypto.sh)
 RUN dnf install -y --nodocs --setopt=install_weak_deps=0 \
-        rust cargo gcc binutils openssl-devel \
+        rust cargo gcc binutils openssl-devel tar xz \
     && dnf clean all
 
 # Embeds the dependency tree in the binary for cargo audit bin and SBOM scanners
 ARG CARGO_AUDITABLE_VERSION=0.7.5
-RUN cargo install cargo-auditable --locked --version "${CARGO_AUDITABLE_VERSION}" --root /usr/local
+RUN tar xJf /cachi2/output/deps/generic/cargo-auditable-${CARGO_AUDITABLE_VERSION}-$(uname -m).tar.xz \
+        -C /usr/local/bin --strip-components=1 --wildcards '*/cargo-auditable' \
+    && cargo auditable --version
 
 WORKDIR /src
 COPY . .

@@ -7,6 +7,9 @@
 # Replaces the upstream Dockerfile's Ubuntu base with UBI9 for
 # Red Hat / Konflux builds.
 #
+# Hermetic: every input is prefetched by Hermeto (cargo, rpm, generic) per
+# docker/konflux/server/. Local build: ./docker/konflux/build-local.sh server
+#
 # Built --no-default-features --features openssl for FIPS. That drops the gcs
 # feature along with rustls, so this image cannot pull models from GCS:
 # google-cloud-auth hardcodes rustls. HuggingFace and NGC are unaffected.
@@ -15,31 +18,21 @@ FROM registry.access.redhat.com/ubi9/ubi:9.8@sha256:bcbf1fe577df63bd975ea19ebae6
 
 RUN dnf install -y --nodocs --setopt=install_weak_deps=0 \
         rust cargo cmake gcc gcc-c++ binutils perl \
-        openssl-devel git-core unzip \
+        openssl-devel git-core unzip tar xz \
     && dnf clean all
 
 # prost-build has needed a system protoc since 0.11, and RHEL ships no protoc
-# RPM (only protobuf-c). Fetch the upstream release, checksum-pinned per arch.
-# Konflux hermetic builds will take these through the generic fetcher instead.
+# RPM (only protobuf-c). Hermeto verifies the checksums in generic-fetcher.yaml.
 ARG PROTOC_VERSION=35.1
-ARG PROTOC_SHA256_X86_64=6930ebf62bd4ea607b98fff052596c6ee564b9835b4ce172c75a3f53ae9d91b7
-ARG PROTOC_SHA256_AARCH_64=01bf9d08808c7f96678b63f4bd8efa559bb4f83d5a7a270d5edaf507f9d5d9cf
-RUN set -eux; \
-    case "$(uname -m)" in \
-        x86_64)  PROTOC_ARCH=x86_64;  PROTOC_SHA256="${PROTOC_SHA256_X86_64}"  ;; \
-        aarch64) PROTOC_ARCH=aarch_64; PROTOC_SHA256="${PROTOC_SHA256_AARCH_64}" ;; \
-        *) echo "unsupported arch $(uname -m)" >&2; exit 1 ;; \
-    esac; \
-    curl -fsSL -o /tmp/protoc.zip \
-        "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-${PROTOC_ARCH}.zip"; \
-    echo "${PROTOC_SHA256}  /tmp/protoc.zip" | sha256sum -c -; \
-    unzip -q /tmp/protoc.zip -d /usr/local bin/protoc 'include/*'; \
-    rm -f /tmp/protoc.zip; \
-    protoc --version
+RUN unzip -q /cachi2/output/deps/generic/protoc-${PROTOC_VERSION}-linux-$(uname -m).zip \
+        -d /usr/local bin/protoc 'include/*' \
+    && protoc --version
 
 # Embeds the dependency tree in the binary for cargo audit bin and SBOM scanners
 ARG CARGO_AUDITABLE_VERSION=0.7.5
-RUN cargo install cargo-auditable --locked --version "${CARGO_AUDITABLE_VERSION}" --root /usr/local
+RUN tar xJf /cachi2/output/deps/generic/cargo-auditable-${CARGO_AUDITABLE_VERSION}-$(uname -m).tar.xz \
+        -C /usr/local/bin --strip-components=1 --wildcards '*/cargo-auditable' \
+    && cargo auditable --version
 
 WORKDIR /src
 COPY . .

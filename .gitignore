@@ -71,3 +71,6 @@ docs/troubleshooting_*.md
 docs/trtllm_*.md
 docs/weight_correctness_*.md
 docs/CONTEXT.md
+
+# docker/konflux/build-local.sh
+hermeto-output/

@@ -1,0 +1,25 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Non-cargo, non-RPM inputs for docker/Dockerfile.ubi9, prefetched by Hermeto
+# into /cachi2/output/deps/generic/. Bumping a version here means bumping the
+# matching ARG in the Dockerfile.
+#
+# checksum: curl -fsSL <url> | sha256sum
+metadata:
+  version: "1.0"
+artifacts:
+  # RHEL ships no protoc RPM, and prost-build needs one
+  - download_url: https://github.com/protocolbuffers/protobuf/releases/download/v35.1/protoc-35.1-linux-x86_64.zip
+    checksum: "sha256:6930ebf62bd4ea607b98fff052596c6ee564b9835b4ce172c75a3f53ae9d91b7"
+    filename: protoc-35.1-linux-x86_64.zip
+  - download_url: https://github.com/protocolbuffers/protobuf/releases/download/v35.1/protoc-35.1-linux-aarch_64.zip
+    checksum: "sha256:01bf9d08808c7f96678b63f4bd8efa559bb4f83d5a7a270d5edaf507f9d5d9cf"
+    filename: protoc-35.1-linux-aarch64.zip
+
+  - download_url: https://github.com/rust-secure-code/cargo-auditable/releases/download/v0.7.5/cargo-auditable-x86_64-unknown-linux-gnu.tar.xz
+    checksum: "sha256:322eda09f24e5dba97371c6c2c6949569c411ddf893852e88135cc5b51d5a719"
+    filename: cargo-auditable-0.7.5-x86_64.tar.xz
+  - download_url: https://github.com/rust-secure-code/cargo-auditable/releases/download/v0.7.5/cargo-auditable-aarch64-unknown-linux-gnu.tar.xz
+    checksum: "sha256:6d364879b516fa914f98504e551faddedf35b71543b4331a6d26e4e217778cfa"
+    filename: cargo-auditable-0.7.5-aarch64.tar.xz

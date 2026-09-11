@@ -1,0 +1,33 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# RPMs for docker/Dockerfile.operator, build and runtime stages combined.
+#
+# Regenerate the lockfile after editing:
+#   ./docker/konflux/lock-rpms.sh operator
+contentOrigin:
+  repos:
+    - repoid: ubi-9-baseos-rpms
+      baseurl: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/$basearch/baseos/os/
+    - repoid: ubi-9-appstream-rpms
+      baseurl: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/$basearch/appstream/os/
+packages:
+  # build
+  - rust
+  - cargo
+  - gcc
+  - binutils
+  - openssl-devel
+  - tar
+  - xz
+  # runtime
+  - ca-certificates
+  - openssl-libs
+arches:
+  - x86_64
+  - aarch64
+# must match --setopt=install_weak_deps=0 in the Dockerfile
+installWeakDeps: false
+# pin the full closure: the build and runtime stages start from different bases
+context:
+  bare: true
