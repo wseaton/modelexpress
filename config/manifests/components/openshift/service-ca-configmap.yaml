@@ -7,6 +7,6 @@ metadata:
   annotations:
     service.beta.openshift.io/inject-cabundle: 'true'
   labels:
-    app.kubernetes.io/managed-by: xtask
+    app.kubernetes.io/managed-by: kustomize
     app.kubernetes.io/name: modelexpress-operator
   name: openshift-service-ca.crt

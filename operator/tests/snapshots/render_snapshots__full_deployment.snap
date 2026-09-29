@@ -99,6 +99,8 @@ spec:
           volumeMounts:
             - mountPath: /cache
               name: model-cache
+      imagePullSecrets:
+        - name: registry-creds
       nodeSelector:
         kubernetes.io/arch: arm64
       securityContext:

@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# RPMs for docker/Dockerfile.operator, build and runtime stages combined.
+# RPMs for docker/Dockerfile.konflux.operator, build and runtime stages combined.
 #
 # MintMaker refreshes rpms.lock.yaml on its own schedule. After editing this
 # file, regenerate it locally:

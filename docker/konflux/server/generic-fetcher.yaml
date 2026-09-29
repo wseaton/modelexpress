@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Non-cargo, non-RPM inputs for docker/Dockerfile.ubi9, prefetched by Hermeto
+# Non-cargo, non-RPM inputs for docker/Dockerfile.konflux, prefetched by Hermeto
 # into /cachi2/output/deps/generic/. Bumping a version here means bumping the
 # matching ARG in the Dockerfile.
 #

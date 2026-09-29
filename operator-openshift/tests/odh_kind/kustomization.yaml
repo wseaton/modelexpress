@@ -1,0 +1,14 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# config/manifests/overlays/odh installed the way a platform operator installs
+# it: into a namespace the platform owns, with every image set through the
+# params.env the platform resolves (base/params.env). test_tls_kind.sh
+# --overlay odh rewrites that file in a staged copy first.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: mx-platform
+resources:
+- namespace.yaml
+- ../../../config/manifests/overlays/odh
+- ../kind_crds

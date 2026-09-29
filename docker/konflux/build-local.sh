@@ -57,8 +57,8 @@ hermeto() {
 build_image() {
     local image="$1" dockerfile tag
     case "${image}" in
-        server)   dockerfile=docker/Dockerfile.ubi9 ;;
-        operator) dockerfile=docker/Dockerfile.operator ;;
+        server)   dockerfile=docker/Dockerfile.konflux ;;
+        operator) dockerfile=docker/Dockerfile.konflux.operator ;;
     esac
     tag="localhost/odh-modelexpress-${image}:hermetic"
     local konflux_dir="docker/konflux/${image}"

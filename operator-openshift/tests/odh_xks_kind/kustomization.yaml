@@ -1,0 +1,13 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# config/manifests/overlays/odh-xks installed the way a platform operator
+# installs it on a cluster that is not OpenShift. Unlike the other harnesses
+# this one installs no stand-in CRDs: kind already is the target, a cluster with
+# no config.openshift.io API and none of the RBAC for it.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: mx-platform
+resources:
+- namespace.yaml
+- ../../../config/manifests/overlays/odh-xks

@@ -49,7 +49,7 @@ if TYPE_CHECKING:
     MODEL_EXPRESS_LOG_LEVEL: str
     MODEL_NAME: Optional[str]
     # TLS (client)
-    MODEL_EXPRESS_TLS_CA_FILE: Optional[str]
+    MX_TLS_CA_FILE: Optional[str]
     # Auth (client)
     MX_AUTH_TOKEN_PATH: Optional[str]
     MX_AUTH_TOKEN_TTL_SECONDS: Optional[str]
@@ -254,7 +254,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MODEL_NAME": lambda: os.environ.get("MODEL_NAME"),
     # ── TLS (client) ───────────────────────────────────────────────────────
     # PEM CA bundle for an https:// server address; unset means system roots.
-    "MODEL_EXPRESS_TLS_CA_FILE": lambda: os.environ.get("MODEL_EXPRESS_TLS_CA_FILE"),
+    "MX_TLS_CA_FILE": lambda: os.environ.get("MX_TLS_CA_FILE"),
     # ── Auth (client) ──────────────────────────────────────────────────────
     "MX_AUTH_TOKEN_PATH": lambda: os.environ.get("MX_AUTH_TOKEN_PATH"),
     "MX_AUTH_TOKEN_TTL_SECONDS": lambda: os.environ.get("MX_AUTH_TOKEN_TTL_SECONDS"),

@@ -51,6 +51,16 @@ pub struct ModelExpressServerSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
 
+    /// Pull secrets for the server image, for a private or mirrored registry.
+    /// Set on the pod spec, so they apply whether the pods run as the
+    /// generated ServiceAccount or one named by `serviceAccountName`.
+    #[cel_validate(
+        rule = Rule::new("self.all(secret, secret.name != '')")
+            .message("image pull secret name must not be empty")
+    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_pull_secrets: Option<Vec<k8s_openapi::api::core::v1::LocalObjectReference>>,
+
     /// Replicas are stateless and share no locks; safe to scale as long as the
     /// cache volume is RWX or per-replica.
     #[serde(default = "default_replicas")]
@@ -78,7 +88,7 @@ pub struct ModelExpressServerSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub security: Option<SecurityConfig>,
 
-    /// TLS termination on the gRPC listener, MODEL_EXPRESS_TLS_*.
+    /// TLS termination on the gRPC listener, MX_TLS_*.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls: Option<TlsConfig>,
 
@@ -355,17 +365,17 @@ pub struct TlsConfig {
     #[cel_validate(rule = Rule::new("self != ''").message("secretName must not be empty"))]
     #[schemars(length(max = 253))]
     pub secret_name: String,
-    /// MODEL_EXPRESS_TLS_MIN_VERSION, `VersionTLS12` or `TLS1.2` style.
+    /// MX_TLS_MIN_VERSION, `VersionTLS12` or `TLS1.2` style.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(max = 16))]
     #[cel_validate(rule = Rule::new("self.matches('^(VersionTLS1[0-3]|TLS1[.][0-3])$')")
         .message("minVersion must be VersionTLS10..13 or TLS1.0..1.3"))]
     pub min_version: Option<String>,
-    /// MODEL_EXPRESS_TLS_CIPHER_SUITES, OpenSSL names (rendered comma-separated).
+    /// MX_TLS_CIPHER_SUITES, OpenSSL names (rendered comma-separated).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[schemars(length(max = 64))]
     pub cipher_suites: Vec<String>,
-    /// MODEL_EXPRESS_TLS_GROUPS, key exchange groups in preference order
+    /// MX_TLS_GROUPS, key exchange groups in preference order
     /// (rendered comma-separated).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[schemars(length(max = 16))]
@@ -582,6 +592,7 @@ mod tests {
             "self.startsWith('redis://')",
             "self >= 0",
             "self > 0 && self < 65536",
+            "self.all(secret, secret.name != '')",
             "self.cache.storage.pvc.spec.accessModes.exists(m, m == 'ReadWriteMany' || m == 'ReadOnlyMany')",
             "'storage' in self.spec.resources.requests",
             "must be a Kubernetes quantity",
@@ -589,6 +600,21 @@ mod tests {
             assert!(json.contains(rule), "missing CEL rule: {rule}");
         }
         assert!(json.contains("x-kubernetes-validations"));
+    }
+
+    #[test]
+    fn image_pull_secret_names_are_validated() {
+        let crd = serde_json::to_value(generate_crd()).expect("CRD serializes");
+        let image_pull_secrets = &crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]
+            ["spec"]["properties"]["imagePullSecrets"];
+        let validations = image_pull_secrets["x-kubernetes-validations"]
+            .as_array()
+            .expect("imagePullSecrets validations");
+
+        assert!(validations.iter().any(|validation| {
+            validation["rule"] == "self.all(secret, secret.name != '')"
+                && validation["message"] == "image pull secret name must not be empty"
+        }));
     }
 
     #[test]

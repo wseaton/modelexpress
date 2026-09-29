@@ -5,7 +5,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   labels:
-    app.kubernetes.io/managed-by: xtask
+    app.kubernetes.io/managed-by: kustomize
     app.kubernetes.io/name: modelexpress-operator
   name: modelexpress-operator
 spec:
@@ -22,7 +22,7 @@ spec:
         app.kubernetes.io/name: modelexpress-operator
     spec:
       containers:
-      - image: quay.io/opendatahub/odh-modelexpress-operator:latest
+      - image: quay.io/opendatahub/odh-modelexpress-operator:odh-stable
         livenessProbe:
           httpGet:
             path: /healthz

@@ -49,7 +49,7 @@ pub struct ClientArgs {
     pub timeout: Option<u64>,
 
     /// PEM CA bundle to trust for an https:// endpoint
-    #[arg(long, env = crate::envs::MODEL_EXPRESS_TLS_CA_FILE)]
+    #[arg(long, env = crate::envs::MX_TLS_CA_FILE)]
     pub tls_ca_file: Option<PathBuf>,
 
     /// Cache path override

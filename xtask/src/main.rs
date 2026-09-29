@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 mod objects;
+mod odh;
 mod openshift;
 
 use clap::{Parser, Subcommand};
@@ -52,7 +53,8 @@ enum Cmd {
         check: bool,
     },
     /// Generate the operator's deploy manifests into config/manifests/rbac/,
-    /// config/manifests/manager/, config/manifests/openshift/ and
+    /// config/manifests/manager/, config/manifests/components/,
+    /// config/manifests/openshift/, config/manifests/overlays/ and
     /// config/manifests/base/params.env
     Manifests {
         /// Fail if the on-disk manifests are stale instead of writing (for CI)
@@ -148,10 +150,19 @@ fn all_crds() -> Result<Vec<(PathBuf, String)>> {
     Ok(out)
 }
 
+fn yaml_files(
+    dir: &Path,
+    files: Vec<(&'static str, serde_json::Value)>,
+) -> Result<Vec<(PathBuf, String)>> {
+    files
+        .into_iter()
+        .map(|(file, value)| Ok((dir.join(file), to_yaml(&value)?)))
+        .collect()
+}
+
 fn manifests(image: &str) -> Result<Vec<(PathBuf, String)>> {
     let config = manifests_root();
     let rbac = config.join("rbac");
-    let params = format!("MODELEXPRESS_OPERATOR_IMAGE={image}\n");
     Ok(vec![
         (
             rbac.join("serviceaccount.yaml"),
@@ -173,18 +184,22 @@ fn manifests(image: &str) -> Result<Vec<(PathBuf, String)>> {
             config.join("manager/service.yaml"),
             to_yaml(&objects::metrics_service())?,
         ),
-        (config.join("base/params.env"), params),
+        (config.join("base/params.env"), objects::params_env(image)),
     ]
     .into_iter()
-    .chain(
-        openshift::overlay()
-            .into_iter()
-            .map(|(file, value)| Ok((config.join("openshift").join(file), to_yaml(&value)?)))
-            .collect::<Result<Vec<_>>>()?,
-    )
-    .chain([(
-        config.join("openshift/params.env"),
-        openshift::PARAMS_ENV.to_string(),
-    )])
+    .chain(yaml_files(
+        &config.join(openshift::COMPONENT_DIR),
+        openshift::component(),
+    )?)
+    .chain(yaml_files(&config.join("openshift"), openshift::overlay())?)
+    .chain(yaml_files(
+        &config.join(openshift::RELATED_IMAGE_COMPONENT_DIR),
+        openshift::related_image_component(),
+    )?)
+    .chain(yaml_files(&config.join(odh::OVERLAY_DIR), odh::overlay())?)
+    .chain(yaml_files(
+        &config.join(odh::XKS_OVERLAY_DIR),
+        odh::xks_overlay(),
+    )?)
     .collect())
 }

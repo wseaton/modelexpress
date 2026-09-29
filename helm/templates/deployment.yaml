@@ -134,20 +134,20 @@ spec:
             {{- if not .Values.tls.secretName }}
             {{- fail "tls.enabled requires tls.secretName" }}
             {{- end }}
-            - name: MODEL_EXPRESS_TLS_CERT_FILE
+            - name: MX_TLS_CERT_FILE
               value: /etc/modelexpress/tls/tls.crt
-            - name: MODEL_EXPRESS_TLS_KEY_FILE
+            - name: MX_TLS_KEY_FILE
               value: /etc/modelexpress/tls/tls.key
             {{- with .Values.tls.minVersion }}
-            - name: MODEL_EXPRESS_TLS_MIN_VERSION
+            - name: MX_TLS_MIN_VERSION
               value: {{ . | quote }}
             {{- end }}
             {{- with .Values.tls.cipherSuites }}
-            - name: MODEL_EXPRESS_TLS_CIPHER_SUITES
+            - name: MX_TLS_CIPHER_SUITES
               value: {{ join "," . | quote }}
             {{- end }}
             {{- with .Values.tls.groups }}
-            - name: MODEL_EXPRESS_TLS_GROUPS
+            - name: MX_TLS_GROUPS
               value: {{ join "," . | quote }}
             {{- end }}
             {{- end }}

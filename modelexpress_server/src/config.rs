@@ -219,26 +219,26 @@ impl TlsConfig {
 #[derive(clap::Args, Debug, Default)]
 pub struct TlsArgs {
     /// PEM certificate chain for the gRPC listener. Enables TLS.
-    #[arg(long = "tls-cert-file", env = modelexpress_common::envs::MODEL_EXPRESS_TLS_CERT_FILE)]
+    #[arg(long = "tls-cert-file", env = modelexpress_common::envs::MX_TLS_CERT_FILE)]
     pub cert_file: Option<PathBuf>,
 
     /// PEM private key for --tls-cert-file.
-    #[arg(long = "tls-key-file", env = modelexpress_common::envs::MODEL_EXPRESS_TLS_KEY_FILE)]
+    #[arg(long = "tls-key-file", env = modelexpress_common::envs::MX_TLS_KEY_FILE)]
     pub key_file: Option<PathBuf>,
 
     /// Minimum TLS version (TLS1.2, TLS1.3, or the OpenShift VersionTLS12 spelling).
-    #[arg(long = "tls-min-version", env = modelexpress_common::envs::MODEL_EXPRESS_TLS_MIN_VERSION)]
+    #[arg(long = "tls-min-version", env = modelexpress_common::envs::MX_TLS_MIN_VERSION)]
     pub min_version: Option<TlsVersion>,
 
     /// Comma-separated OpenSSL cipher names, TLS 1.2 and 1.3 names mixed.
     #[arg(
         long = "tls-cipher-suites",
-        env = modelexpress_common::envs::MODEL_EXPRESS_TLS_CIPHER_SUITES
+        env = modelexpress_common::envs::MX_TLS_CIPHER_SUITES
     )]
     pub cipher_suites: Option<CommaList<String>>,
 
     /// Comma-separated key exchange groups in preference order (OpenSSL names).
-    #[arg(long = "tls-groups", env = modelexpress_common::envs::MODEL_EXPRESS_TLS_GROUPS)]
+    #[arg(long = "tls-groups", env = modelexpress_common::envs::MX_TLS_GROUPS)]
     pub groups: Option<CommaList<String>>,
 }
 

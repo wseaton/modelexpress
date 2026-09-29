@@ -244,6 +244,7 @@ mod tests {
     fn spec(backend: MetadataBackend, sa: Option<&str>) -> ModelExpressServerSpec {
         ModelExpressServerSpec {
             image: Some("img".into()),
+            image_pull_secrets: None,
             replicas: 1,
             metadata_backend: backend,
             port: 8001,

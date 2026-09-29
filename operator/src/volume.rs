@@ -157,6 +157,7 @@ mod tests {
             affinity: None,
             network_policy: None,
             service_account_name: None,
+            image_pull_secrets: None,
         }
     }
 

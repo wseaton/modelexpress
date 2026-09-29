@@ -4,9 +4,9 @@
 //! The cluster TLS profile, end to end on a real API server.
 //!
 //! kind stands in for OpenShift: the `apiservers.config.openshift.io` CRD is
-//! installed (tests/tls_kind), so the `cluster` object can be edited freely
+//! installed (tests/kind_crds), so the `cluster` object can be edited freely
 //! without rolling a real kube-apiserver. Against it the test drives the
-//! OpenShift operator as shipped (OpenSSL, the OpenShift overlay) and two operands, one
+//! OpenShift operator as shipped (OpenSSL) and two operands, one
 //! per server TLS backend, and checks every policy with real handshakes
 //! through pod port-forwards:
 //!
@@ -18,6 +18,17 @@
 //!   Legacy         Custom    Intermediate        Intermediate, no restart
 //!   (metrics certificate rotated)                new cert served, no restart
 //! ```
+//!
+//! The operator comes from one of two installs, picked by `test_tls_kind.sh
+//! --overlay`: config/manifests/openshift in its own namespace (tests/tls_kind),
+//! or config/manifests/overlays/odh the way a platform operator applies it, in
+//! a namespace the overlay does not name and with both images set through
+//! base/params.env (tests/odh_kind). The scenario is the same for both.
+//!
+//! A third install, config/manifests/overlays/odh-xks (tests/odh_xks_kind), is
+//! the platform install on a cluster that is not OpenShift. It gets its own
+//! scenario, `platform_install_without_openshift`: with no APIServer to edit,
+//! what matters is that operands still come up on the Intermediate profile.
 //!
 //! The prometheus-operator API is installed too, as a schemaless CRD for the
 //! same group and kind, so the ServiceMonitor the operator applies for its own
@@ -72,10 +83,12 @@ const OPT_IN_ENV: &str = "MX_TLS_KIND_E2E";
 const CONTEXT_ENV: &str = "MX_TLS_KIND_CONTEXT";
 const DEFAULT_CONTEXT: &str = "kind-mx-tls-e2e";
 
-const OPERATOR_NS: &str = "modelexpress-operator-system";
+/// Set by test_tls_kind.sh to the namespace its overlay installs into.
+const OPERATOR_NS_ENV: &str = "MX_TLS_KIND_OPERATOR_NS";
+const DEFAULT_OPERATOR_NS: &str = "modelexpress-operator-system";
 const OPERATOR_SELECTOR: &str = "app.kubernetes.io/name=modelexpress-operator";
 const METRICS_SECRET: &str = "modelexpress-operator-metrics-tls";
-const METRICS_HOST: &str = "modelexpress-operator-metrics.modelexpress-operator-system.svc";
+const METRICS_SERVICE: &str = "modelexpress-operator-metrics";
 const METRICS_PORT: u16 = 8443;
 
 const SERVER: &str = "mx";
@@ -392,9 +405,9 @@ where
 /// An HTTP/1.1 request on an open TLS connection. Reads the whole response,
 /// so the connection is ready for the next request, and returns its status
 /// line.
-async fn http_status(stream: &mut Stream, path: &str) -> Result<String> {
+async fn http_status(stream: &mut Stream, host: &str, path: &str) -> Result<String> {
     stream
-        .write_all(format!("GET {path} HTTP/1.1\r\nhost: {METRICS_HOST}\r\n\r\n").as_bytes())
+        .write_all(format!("GET {path} HTTP/1.1\r\nhost: {host}\r\n\r\n").as_bytes())
         .await?;
     let mut head = Vec::new();
     let mut byte = [0_u8; 1];
@@ -587,17 +600,27 @@ fn restart_count(pod: &Pod) -> i32 {
         .unwrap_or_default()
 }
 
+fn operator_namespace() -> String {
+    std::env::var(OPERATOR_NS_ENV).unwrap_or_else(|_| DEFAULT_OPERATOR_NS.to_string())
+}
+
+fn metrics_host(namespace: &str) -> String {
+    format!("{METRICS_SERVICE}.{namespace}.svc")
+}
+
 /// The operator pod, pinned by UID so any restart or replacement fails the test.
 struct OperatorPod {
+    namespace: String,
     name: String,
     uid: String,
     restarts: i32,
 }
 
 impl OperatorPod {
-    async fn current(client: &Client) -> Result<Self> {
-        let pod = ready_pod(client, OPERATOR_NS, OPERATOR_SELECTOR).await?;
+    async fn current(client: &Client, namespace: &str) -> Result<Self> {
+        let pod = ready_pod(client, namespace, OPERATOR_SELECTOR).await?;
         Ok(Self {
+            namespace: namespace.to_string(),
             name: pod.name_any(),
             uid: pod.uid().context("operator pod uid")?,
             restarts: restart_count(&pod),
@@ -605,7 +628,7 @@ impl OperatorPod {
     }
 
     async fn assert_not_restarted(&self, client: &Client, during: &str) -> Result<()> {
-        let now = Self::current(client).await?;
+        let now = Self::current(client, &self.namespace).await?;
         if now.uid != self.uid || now.restarts != self.restarts {
             bail!(
                 "operator restarted during {during}: {} (restarts {}) became {} (restarts {})",
@@ -620,10 +643,10 @@ impl OperatorPod {
 
     fn metrics(&self) -> Target {
         Target {
-            namespace: OPERATOR_NS.to_string(),
+            namespace: self.namespace.clone(),
             pod: self.name.clone(),
             port: METRICS_PORT,
-            host: METRICS_HOST.to_string(),
+            host: metrics_host(&self.namespace),
         }
     }
 }
@@ -657,9 +680,9 @@ async fn operand_converged(
     eventually(&what, CONVERGE, || async move {
         let env = operand_env(client, backend).await?;
         for (name, want) in [
-            ("MODEL_EXPRESS_TLS_MIN_VERSION", min_version),
-            ("MODEL_EXPRESS_TLS_CIPHER_SUITES", ciphers),
-            ("MODEL_EXPRESS_TLS_GROUPS", groups),
+            ("MX_TLS_MIN_VERSION", min_version),
+            ("MX_TLS_CIPHER_SUITES", ciphers),
+            ("MX_TLS_GROUPS", groups),
         ] {
             let got = env.get(name).map(String::as_str);
             if got != Some(want) {
@@ -935,6 +958,9 @@ async fn cluster_tls_profile_end_to_end() -> Result<()> {
         .try_init();
     let client = kube_client().await?;
     let pki = Pki::new()?;
+    let operator_ns = operator_namespace();
+    let metrics_host = metrics_host(&operator_ns);
+    println!("operator namespace: {operator_ns}");
 
     println!("setup: apiservers/cluster with a Modern profile and no tlsAdherence");
     reset_apiserver(&client, json!({"tlsSecurityProfile": modern_profile()})).await?;
@@ -942,28 +968,30 @@ async fn cluster_tls_profile_end_to_end() -> Result<()> {
     println!("setup: operator metrics certificate, fresh operator pod");
     apply_tls_secret(
         &client,
-        OPERATOR_NS,
+        &operator_ns,
         METRICS_SECRET,
-        pki.leaf(&[METRICS_HOST, "127.0.0.1"])?,
+        pki.leaf(&[metrics_host.as_str(), "127.0.0.1"])?,
     )
     .await?;
-    let pods: Api<Pod> = Api::namespaced(client.clone(), OPERATOR_NS);
+    let pods: Api<Pod> = Api::namespaced(client.clone(), &operator_ns);
     pods.delete_collection(
         &DeleteParams::default(),
         &ListParams::default().labels(OPERATOR_SELECTOR),
     )
     .await?;
     eventually("a fresh operator pod", CONVERGE, || async {
-        OperatorPod::current(&client).await.map(|_| ())
+        OperatorPod::current(&client, &operator_ns)
+            .await
+            .map(|_| ())
     })
     .await?;
-    let operator = OperatorPod::current(&client).await?;
+    let operator = OperatorPod::current(&client, &operator_ns).await?;
     let metrics = operator.metrics();
 
     println!("setup: the operator applies its own ServiceMonitor");
     let monitors = Api::<DynamicObject>::namespaced_with(
         client.clone(),
-        OPERATOR_NS,
+        &operator_ns,
         &ApiResource::from_gvk(&GroupVersionKind::gvk(
             "monitoring.coreos.com",
             "v1",
@@ -976,9 +1004,8 @@ async fn cluster_tls_profile_end_to_end() -> Result<()> {
             .await?
             .context("not applied yet")?;
         let server_name = monitor.data["spec"]["endpoints"][0]["tlsConfig"]["serverName"].as_str();
-        let want = format!("modelexpress-operator-metrics.{OPERATOR_NS}.svc");
-        if server_name != Some(want.as_str()) {
-            bail!("serverName is {server_name:?}, want {want}");
+        if server_name != Some(metrics_host.as_str()) {
+            bail!("serverName is {server_name:?}, want {metrics_host}");
         }
         Ok(())
     })
@@ -1006,7 +1033,7 @@ async fn cluster_tls_profile_end_to_end() -> Result<()> {
     })
     .await?;
     let mut open = connect(&client, &pki, &metrics, &Offer::tls12().http1()).await?;
-    let status = http_status(&mut open, "/metrics").await?;
+    let status = http_status(&mut open, &metrics.host, "/metrics").await?;
     if !status.starts_with("HTTP/1.1 401") {
         bail!("unauthenticated scrape must get 401, got {status}");
     }
@@ -1031,7 +1058,7 @@ async fn cluster_tls_profile_end_to_end() -> Result<()> {
     operator
         .assert_not_restarted(&client, "the Modern swap")
         .await?;
-    let status = http_status(&mut open, "/metrics")
+    let status = http_status(&mut open, &metrics.host, "/metrics")
         .await
         .context("a TLS1.2 connection opened before the swap keeps serving")?;
     if !status.starts_with("HTTP/1.1 401") {
@@ -1083,9 +1110,9 @@ async fn cluster_tls_profile_end_to_end() -> Result<()> {
     let before = served_certificate(&client, &pki, &metrics).await?;
     apply_tls_secret(
         &client,
-        OPERATOR_NS,
+        &operator_ns,
         METRICS_SECRET,
-        pki.leaf(&[METRICS_HOST, "127.0.0.1"])?,
+        pki.leaf(&[metrics_host.as_str(), "127.0.0.1"])?,
     )
     .await?;
     eventually(
@@ -1102,6 +1129,69 @@ async fn cluster_tls_profile_end_to_end() -> Result<()> {
     .await?;
     operator
         .assert_not_restarted(&client, "certificate rotation")
+        .await?;
+
+    println!("cleanup");
+    for backend in Backend::ALL {
+        let api: Api<Namespace> = Api::all(client.clone());
+        api.delete(backend.namespace(), &DeleteParams::default())
+            .await?;
+    }
+    Ok(())
+}
+
+/// The operator reads the cluster TLS profile with no RBAC for it here, and
+/// the API group does not exist. The apiserver authorizes before it looks the
+/// resource up, so that read is a 403, not a 404, and it must not stop a
+/// ModelExpressServer from reconciling.
+#[tokio::test]
+#[ignore = "needs the kind cluster from test_tls_kind.sh --overlay odh-xks"]
+async fn platform_install_without_openshift() -> Result<()> {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("tls_kind=debug")
+        .with_test_writer()
+        .try_init();
+    let client = kube_client().await?;
+    let pki = Pki::new()?;
+    let operator_ns = operator_namespace();
+    println!("operator namespace: {operator_ns}");
+
+    let apiserver = GroupVersionKind::gvk("config.openshift.io", "v1", "APIServer");
+    if kube::discovery::oneshot::pinned_kind(&client, &apiserver)
+        .await
+        .is_ok()
+    {
+        bail!("config.openshift.io is served; this scenario needs a cluster without it");
+    }
+
+    println!("setup: the operator is up with plaintext metrics");
+    eventually("the operator pod", CONVERGE, || async {
+        OperatorPod::current(&client, &operator_ns)
+            .await
+            .map(|_| ())
+    })
+    .await?;
+    let operator = OperatorPod::current(&client, &operator_ns).await?;
+
+    println!("setup: one ModelExpressServer per server TLS backend, TLS settings unpinned");
+    for backend in Backend::ALL {
+        create_operand(&client, &pki, backend).await?;
+    }
+
+    println!("operands come up on the Intermediate profile");
+    for target in operands_converge_to(
+        &client,
+        &pki,
+        "VersionTLS12",
+        INTERMEDIATE_CIPHERS,
+        PROFILE_GROUPS,
+    )
+    .await?
+    {
+        assert_intermediate(&client, &pki, &target).await?;
+    }
+    operator
+        .assert_not_restarted(&client, "reconciling without an APIServer")
         .await?;
 
     println!("cleanup");

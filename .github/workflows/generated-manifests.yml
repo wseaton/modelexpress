@@ -52,3 +52,6 @@ jobs:
 
       - name: Check deploy manifests
         run: cargo run --package xtask -- manifests --check
+
+      - name: Check overlays build
+        run: ./ci/check-manifest-overlays.sh

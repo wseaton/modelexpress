@@ -37,15 +37,15 @@ spec:
               value: "8001"
             - name: MODEL_EXPRESS_CACHE_DIRECTORY
               value: /var/cache/modelexpress
-            - name: MODEL_EXPRESS_TLS_CERT_FILE
+            - name: MX_TLS_CERT_FILE
               value: /etc/modelexpress/tls/tls.crt
-            - name: MODEL_EXPRESS_TLS_KEY_FILE
+            - name: MX_TLS_KEY_FILE
               value: /etc/modelexpress/tls/tls.key
-            - name: MODEL_EXPRESS_TLS_MIN_VERSION
+            - name: MX_TLS_MIN_VERSION
               value: VersionTLS13
-            - name: MODEL_EXPRESS_TLS_CIPHER_SUITES
+            - name: MX_TLS_CIPHER_SUITES
               value: "TLS_AES_128_GCM_SHA256,TLS_AES_256_GCM_SHA384,TLS_CHACHA20_POLY1305_SHA256"
-            - name: MODEL_EXPRESS_TLS_GROUPS
+            - name: MX_TLS_GROUPS
               value: "X25519MLKEM768,X25519,secp256r1,secp384r1"
           image: "nvcr.io/nvidia/ai-dynamo/modelexpress-server:0.5.0"
           livenessProbe:

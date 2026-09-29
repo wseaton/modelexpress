@@ -225,7 +225,7 @@ See [`CLI.md`](CLI.md) for full CLI usage documentation.
 
 ### Generator refit checkpoint cache
 
-`refit_checkpoint_max_size_gb` defaults to 500 GB per model. At initialization,
+`refit_checkpoint_max_size_gb` defaults to 2000 GB per model. At initialization,
 the generator caps this quota at existing cache bytes plus free disk space and
 logs any reduction. Free space is checked again before known writes and copies,
 including when `null` disables the configured quota. See the
@@ -334,11 +334,11 @@ FIPS.
 
 | Env Var | Flag | Description |
 |---------|------|-------------|
-| `MODEL_EXPRESS_TLS_CERT_FILE` | `--tls-cert-file` | PEM certificate chain. Setting it enables TLS. |
-| `MODEL_EXPRESS_TLS_KEY_FILE` | `--tls-key-file` | PEM private key for the certificate. |
-| `MODEL_EXPRESS_TLS_MIN_VERSION` | `--tls-min-version` | Lowest protocol version accepted: `TLS1.2`, `TLS1.3`, or the OpenShift `VersionTLS12` spelling. OpenSSL's default when unset. |
-| `MODEL_EXPRESS_TLS_CIPHER_SUITES` | `--tls-cipher-suites` | Comma-separated OpenSSL cipher names. TLS 1.2 names (`ECDHE-RSA-AES128-GCM-SHA256`) and TLS 1.3 names (`TLS_AES_128_GCM_SHA256`) can be mixed, as they are in an OpenShift `tlsSecurityProfile`. OpenSSL's default when unset. |
-| `MODEL_EXPRESS_TLS_GROUPS` | `--tls-groups` | Comma-separated key exchange groups in preference order, OpenSSL names (`X25519MLKEM768`, `X25519`, `secp256r1`). Names the linked OpenSSL does not know are dropped with a warning, so a profile listing post-quantum groups still works on OpenSSL older than 3.5. OpenSSL's default when unset. |
+| `MX_TLS_CERT_FILE` | `--tls-cert-file` | PEM certificate chain. Setting it enables TLS. |
+| `MX_TLS_KEY_FILE` | `--tls-key-file` | PEM private key for the certificate. |
+| `MX_TLS_MIN_VERSION` | `--tls-min-version` | Lowest protocol version accepted: `TLS1.2`, `TLS1.3`, or the OpenShift `VersionTLS12` spelling. OpenSSL's default when unset. |
+| `MX_TLS_CIPHER_SUITES` | `--tls-cipher-suites` | Comma-separated OpenSSL cipher names. TLS 1.2 names (`ECDHE-RSA-AES128-GCM-SHA256`) and TLS 1.3 names (`TLS_AES_128_GCM_SHA256`) can be mixed, as they are in an OpenShift `tlsSecurityProfile`. OpenSSL's default when unset. |
+| `MX_TLS_GROUPS` | `--tls-groups` | Comma-separated key exchange groups in preference order, OpenSSL names (`X25519MLKEM768`, `X25519`, `secp256r1`). Names the linked OpenSSL does not know are dropped with a warning, so a profile listing post-quantum groups still works on OpenSSL older than 3.5. OpenSSL's default when unset. |
 
 Certificate and key must be set together. Version and cipher settings without a
 certificate fail config validation. A cipher list in which the backend knows none of the
@@ -384,7 +384,7 @@ endpoint from `MODEL_EXPRESS_ENDPOINT` or `--endpoint`; the Python client reads
 
 | Env Var | Default | Description |
 |---------|---------|-------------|
-| `MODEL_EXPRESS_TLS_CA_FILE` | (system roots) | PEM CA bundle that issued the server certificate. Setting it also turns TLS on for a bare `host:port` address in the Python client. |
+| `MX_TLS_CA_FILE` | (system roots) | PEM CA bundle that issued the server certificate. Setting it also turns TLS on for a bare `host:port` address in the Python client. |
 
 On OpenShift a service-ca signed certificate verifies against the bundle injected into any
 ConfigMap annotated `service.beta.openshift.io/inject-cabundle: "true"`; mount it into the
@@ -399,6 +399,39 @@ The multi-stage Dockerfile builds all binaries (server, CLI, test tools):
 ```bash
 docker build -f docker/Dockerfile -t model-express .
 docker run -p 8001:8001 model-express
+```
+
+### Konflux Images
+
+`docker/Dockerfile.konflux` builds the server, and
+`docker/Dockerfile.konflux.operator` builds the OpenShift operator. Both use
+UBI9 and OpenSSL. Hermeto prefetches Cargo dependencies from the workspace
+`Cargo.lock`, plus RPMs and tools listed in `docker/konflux/server/` or
+`docker/konflux/operator/`, before the image build.
+The `.tekton` PipelineRuns pass `hermetic` and `prefetch-input` to the shared
+Konflux pipeline.
+
+To reproduce these builds locally, install Podman and Git. Run from a Git
+checkout without an existing `.cargo/` directory; the helper creates and
+removes `.cargo/config.toml`. Network access is needed to pull images and
+prefetch dependencies. The image build itself runs with `--network none`.
+
+```bash
+./docker/konflux/build-local.sh server
+./docker/konflux/build-local.sh operator
+# Or build both:
+./docker/konflux/build-local.sh all
+```
+
+The resulting images are `localhost/odh-modelexpress-server:hermetic` and
+`localhost/odh-modelexpress-operator:hermetic`. The helper defaults to the
+host architecture. Set `PLATFORM=linux/arm64` or `PLATFORM=linux/amd64` only
+when Podman can run containers for that architecture.
+
+After changing an image's `rpms.in.yaml`, regenerate its RPM lockfile:
+
+```bash
+./docker/konflux/lock-rpms.sh server  # operator or all are also supported
 ```
 
 ### Docker Compose
@@ -562,6 +595,25 @@ kubectl create secret generic gcs-service-account-key \
 ```
 
 Mount the secret into the server or client pod and set `GOOGLE_APPLICATION_CREDENTIALS` to the mounted file path. When using Workload Identity, no key secret is needed. For cache layout, manifest behavior, and failure modes, see [`GCS_PROVIDER.md`](GCS_PROVIDER.md).
+
+### Private Image Registries
+
+When the server image lives in a private or mirrored registry, set `spec.imagePullSecrets` on the `ModelExpressServer`. The operator applies them to the pod spec, so they hold whether the pods run as the generated `<cr-name>-server` ServiceAccount or one supplied through `spec.serviceAccountName`.
+
+```yaml
+apiVersion: modelexpress.opendatahub.io/v1alpha1
+kind: ModelExpressServer
+metadata:
+  name: mx
+spec:
+  metadataBackend:
+    kubernetes: {}
+  image: registry.example.com/modelexpress-server:0.7.0
+  imagePullSecrets:
+    - name: registry-creds
+```
+
+Each entry names a `kubernetes.io/dockerconfigjson` Secret in the same namespace as the CR. This is required on clusters with no node-level pull secret, where nothing else supplies registry credentials to the pods the operator creates.
 
 ### Helm Chart
 

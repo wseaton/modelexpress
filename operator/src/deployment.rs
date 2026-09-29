@@ -130,6 +130,7 @@ pub fn render(
                     security_context: Some(pod_security_context()),
                     volumes: Some(volumes),
                     service_account_name: Some(crate::rbac::service_account_name(cr_name, spec)),
+                    image_pull_secrets: spec.image_pull_secrets.clone(),
                     node_selector: spec.node_selector.clone(),
                     tolerations: spec.tolerations.clone(),
                     affinity: spec.affinity.clone(),
@@ -312,8 +313,8 @@ mod tests {
     use super::*;
     use crate::crd::{CacheConfig, CacheStorage, ManagedPvcStorage, MetadataBackend, RedisBackend};
     use k8s_openapi::api::core::v1::{
-        Affinity, NodeAffinity, NodeSelector, NodeSelectorRequirement, NodeSelectorTerm,
-        PersistentVolumeClaimSpec, Toleration, VolumeResourceRequirements,
+        Affinity, LocalObjectReference, NodeAffinity, NodeSelector, NodeSelectorRequirement,
+        NodeSelectorTerm, PersistentVolumeClaimSpec, Toleration, VolumeResourceRequirements,
     };
     use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 
@@ -340,6 +341,7 @@ mod tests {
             affinity: None,
             network_policy: None,
             service_account_name: None,
+            image_pull_secrets: None,
         }
     }
 
@@ -481,6 +483,69 @@ mod tests {
         assert!(pod.node_selector.is_none());
         assert!(pod.tolerations.is_none());
         assert!(pod.affinity.is_none());
+    }
+
+    #[test]
+    fn image_pull_secrets_reach_the_pod_spec() {
+        let mut spec = base_spec();
+        spec.image_pull_secrets = Some(vec![LocalObjectReference {
+            name: "registry-creds".into(),
+        }]);
+
+        let state = render("mx", &spec, "img", &TlsSettings::default());
+        let pod = pod_spec(&state);
+        let secrets = pod.image_pull_secrets.as_ref().expect("image pull secrets");
+        assert_eq!(secrets.len(), 1);
+        assert_eq!(secrets[0].name, "registry-creds");
+    }
+
+    #[test]
+    fn image_pull_secrets_preserve_multiple_entries() {
+        let mut spec = base_spec();
+        spec.image_pull_secrets = Some(vec![
+            LocalObjectReference {
+                name: "primary-registry-creds".into(),
+            },
+            LocalObjectReference {
+                name: "mirror-registry-creds".into(),
+            },
+        ]);
+
+        let state = render("mx", &spec, "img", &TlsSettings::default());
+        let pod = pod_spec(&state);
+        let secrets = pod.image_pull_secrets.as_ref().expect("image pull secrets");
+        assert_eq!(
+            secrets
+                .iter()
+                .map(|secret| secret.name.as_str())
+                .collect::<Vec<_>>(),
+            ["primary-registry-creds", "mirror-registry-creds"]
+        );
+    }
+
+    // A caller supplying their own ServiceAccount still gets the pod-level
+    // secrets: the two are independent, so neither route alone is a trap.
+    #[test]
+    fn image_pull_secrets_survive_a_custom_service_account() {
+        let mut spec = base_spec();
+        spec.service_account_name = Some("byo-sa".into());
+        spec.image_pull_secrets = Some(vec![LocalObjectReference {
+            name: "registry-creds".into(),
+        }]);
+
+        let state = render("mx", &spec, "img", &TlsSettings::default());
+        let pod = pod_spec(&state);
+        assert_eq!(pod.service_account_name.as_deref(), Some("byo-sa"));
+        assert_eq!(
+            pod.image_pull_secrets.as_ref().expect("image pull secrets")[0].name,
+            "registry-creds"
+        );
+    }
+
+    #[test]
+    fn image_pull_secrets_are_unset_by_default() {
+        let pod_owned = render("mx", &base_spec(), "img", &TlsSettings::default());
+        assert!(pod_spec(&pod_owned).image_pull_secrets.is_none());
     }
 
     #[test]

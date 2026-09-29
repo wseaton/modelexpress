@@ -8,8 +8,7 @@ apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:
 - ../../../config/manifests/openshift
-- apiservers.config.openshift.io.crd.json
-- servicemonitors.monitoring.coreos.com.crd.json
+- ../kind_crds
 images:
 - name: quay.io/opendatahub/odh-modelexpress-operator
   newName: mx-e2e/operator

@@ -4,6 +4,10 @@
 # The cluster TLS profile e2e (operator-openshift/tests/tls_kind.rs) on kind:
 # tlsAdherence and tlsSecurityProfile changes reaching both server TLS backends
 # and the operator's metrics listener, without restarts.
+#
+# Runs once per install: config/manifests/openshift as a standalone user applies
+# it, and config/manifests/overlays/odh as a platform operator does, in a
+# namespace the overlay does not name and with images set through params.env.
 
 name: TLS kind e2e
 
@@ -25,9 +29,22 @@ on:
 
 jobs:
   tls-kind-e2e:
-    name: Cluster TLS profile on kind
+    name: Cluster TLS profile on kind (${{ matrix.overlay }})
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - overlay: openshift
+            cluster: mx-tls-e2e
+            namespace: modelexpress-operator-system
+          - overlay: odh
+            cluster: mx-tls-e2e-odh
+            namespace: mx-platform
+          - overlay: odh-xks
+            cluster: mx-tls-e2e-xks
+            namespace: mx-platform
     env:
       KIND_VERSION: v0.31.0
       KIND_SHA256: eb244cbafcc157dff60cf68693c14c9a75c4e6e6fedaf9cd71c58117cb93e3fa
@@ -78,16 +95,17 @@ jobs:
           done
 
       - name: Run the e2e
-        run: ./test_tls_kind.sh --skip-build
+        run: ./test_tls_kind.sh --overlay "${{ matrix.overlay }}" --skip-build
 
       - name: Diagnostics
         if: failure()
         run: |
-          kind get kubeconfig --name mx-tls-e2e > /tmp/kubeconfig 2>/dev/null || exit 0
+          kind get kubeconfig --name "${{ matrix.cluster }}" > /tmp/kubeconfig 2>/dev/null || exit 0
           export KUBECONFIG=/tmp/kubeconfig
           kubectl get apiservers.config.openshift.io cluster -o yaml || true
           kubectl get pods -A -o wide || true
-          kubectl -n modelexpress-operator-system logs -l app.kubernetes.io/name=modelexpress-operator --tail=200 || true
+          kubectl -n "${{ matrix.namespace }}" get deploy,pods,configmap -o wide || true
+          kubectl -n "${{ matrix.namespace }}" logs -l app.kubernetes.io/name=modelexpress-operator --tail=200 || true
           for ns in mx-tls-kind-openssl mx-tls-kind-rustls; do
             kubectl -n "$ns" get deploy,pods -o wide || true
             kubectl -n "$ns" logs -l app.kubernetes.io/instance=mx --tail=100 || true

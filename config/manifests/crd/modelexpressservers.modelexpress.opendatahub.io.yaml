@@ -775,6 +775,22 @@ spec:
                 x-kubernetes-validations:
                 - message: image must not be empty
                   rule: self != ''
+              imagePullSecrets:
+                description: Pull secrets for the server image, for a private or mirrored registry. Set on the pod spec, so they apply whether the pods run as the generated ServiceAccount or one named by `serviceAccountName`.
+                items:
+                  description: LocalObjectReference contains enough information to let you locate the referenced object inside the same namespace.
+                  properties:
+                    name:
+                      description: 'Name of the referent. This field is effectively required, but due to backwards compatibility is allowed to be empty. Instances of this type with an empty value here are almost certainly wrong. More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names'
+                      type: string
+                  required:
+                  - name
+                  type: object
+                nullable: true
+                type: array
+                x-kubernetes-validations:
+                - message: image pull secret name must not be empty
+                  rule: self.all(secret, secret.name != '')
               log:
                 description: Logging, MODEL_EXPRESS_LOG_LEVEL / MODEL_EXPRESS_LOG_FORMAT.
                 nullable: true
@@ -1123,23 +1139,23 @@ spec:
                     type: object
                 type: object
               tls:
-                description: TLS termination on the gRPC listener, MODEL_EXPRESS_TLS_*.
+                description: TLS termination on the gRPC listener, MX_TLS_*.
                 nullable: true
                 properties:
                   cipherSuites:
-                    description: MODEL_EXPRESS_TLS_CIPHER_SUITES, OpenSSL names (rendered comma-separated).
+                    description: MX_TLS_CIPHER_SUITES, OpenSSL names (rendered comma-separated).
                     items:
                       type: string
                     maxItems: 64
                     type: array
                   groups:
-                    description: MODEL_EXPRESS_TLS_GROUPS, key exchange groups in preference order (rendered comma-separated).
+                    description: MX_TLS_GROUPS, key exchange groups in preference order (rendered comma-separated).
                     items:
                       type: string
                     maxItems: 16
                     type: array
                   minVersion:
-                    description: MODEL_EXPRESS_TLS_MIN_VERSION, `VersionTLS12` or `TLS1.2` style.
+                    description: MX_TLS_MIN_VERSION, `VersionTLS12` or `TLS1.2` style.
                     maxLength: 16
                     nullable: true
                     type: string

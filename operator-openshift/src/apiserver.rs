@@ -217,11 +217,23 @@ fn api_resource() -> ApiResource {
     resource
 }
 
-/// Fetch the settings to follow. A missing object or API group, which is any
-/// non-OpenShift cluster, is Intermediate. A 403 is returned as-is: the
-/// operator is missing RBAC it ships, and that must not silently degrade to a
-/// default profile.
+/// Fetch the settings to follow. A cluster that does not serve the API, which
+/// is any non-OpenShift cluster, is Intermediate, and so is a missing object.
+///
+/// Discovery answers the first question, not the read: the apiserver
+/// authorizes a request before it looks the resource up, so without RBAC for
+/// a group that does not exist the read is a 403, not a 404. Where the API is
+/// served a 403 is returned as-is: the operator is missing RBAC it ships, and
+/// that must not silently degrade to a default profile.
 pub async fn fetch(client: &Client) -> Result<TlsSettings, FetchError> {
+    if matches!(served(client).await, Served::No) {
+        return Ok(intermediate());
+    }
+    read(client).await
+}
+
+/// Read the object from an API already known to be served.
+async fn read(client: &Client) -> Result<TlsSettings, FetchError> {
     let api = Api::<DynamicObject>::all_with(client.clone(), &api_resource());
     match api.get_opt(CLUSTER_OBJECT).await? {
         Some(object) => Ok(from_apiserver_spec(&object.data["spec"])?),
@@ -328,7 +340,7 @@ impl TlsDefaults for ApiServerTlsDefaults {
                         }
                     }
                     read_now = false;
-                    match fetch(&client).await {
+                    match read(&client).await {
                         Ok(settings) if last.as_ref() == Some(&settings) => {}
                         Ok(settings) => {
                             last = Some(settings.clone());

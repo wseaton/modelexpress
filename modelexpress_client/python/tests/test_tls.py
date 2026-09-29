@@ -63,7 +63,7 @@ def _call(channel):
 
 
 def test_tls_requested_from_https_scheme(monkeypatch):
-    monkeypatch.delenv("MODEL_EXPRESS_TLS_CA_FILE", raising=False)
+    monkeypatch.delenv("MX_TLS_CA_FILE", raising=False)
     monkeypatch.delenv("MODEL_EXPRESS_URL", raising=False)
     monkeypatch.delenv("MX_SERVER_ADDRESS", raising=False)
     assert _tls_requested("https://mx:8001") is True
@@ -73,7 +73,7 @@ def test_tls_requested_from_https_scheme(monkeypatch):
 
 
 def test_tls_requested_from_env_address(monkeypatch):
-    monkeypatch.delenv("MODEL_EXPRESS_TLS_CA_FILE", raising=False)
+    monkeypatch.delenv("MX_TLS_CA_FILE", raising=False)
     monkeypatch.delenv("MODEL_EXPRESS_URL", raising=False)
     monkeypatch.setenv("MX_SERVER_ADDRESS", "https://mx:8001")
     assert _tls_requested(None) is True
@@ -82,12 +82,12 @@ def test_tls_requested_from_env_address(monkeypatch):
 
 
 def test_ca_file_env_turns_tls_on_for_bare_addresses(monkeypatch, tmp_path):
-    monkeypatch.setenv("MODEL_EXPRESS_TLS_CA_FILE", str(tmp_path / "ca.crt"))
+    monkeypatch.setenv("MX_TLS_CA_FILE", str(tmp_path / "ca.crt"))
     assert _tls_requested("mx:8001") is True
 
 
 def test_clients_record_tls_and_strip_the_scheme(monkeypatch):
-    monkeypatch.delenv("MODEL_EXPRESS_TLS_CA_FILE", raising=False)
+    monkeypatch.delenv("MX_TLS_CA_FILE", raising=False)
     mx = MxClient(server_url="https://mx:8001")
     assert mx.server_url == "mx:8001"
     assert mx._tls is True
@@ -97,7 +97,7 @@ def test_clients_record_tls_and_strip_the_scheme(monkeypatch):
 
 
 def test_open_channel_insecure_when_tls_off(monkeypatch):
-    monkeypatch.delenv("MODEL_EXPRESS_TLS_CA_FILE", raising=False)
+    monkeypatch.delenv("MX_TLS_CA_FILE", raising=False)
     handler = _Handler()
     server, port = _serve(handler)
     try:
@@ -110,7 +110,7 @@ def test_open_channel_insecure_when_tls_off(monkeypatch):
 
 def test_secure_channel_handshakes_with_configured_ca(monkeypatch, tmp_path):
     cert, key = _self_signed(tmp_path)
-    monkeypatch.setenv("MODEL_EXPRESS_TLS_CA_FILE", str(cert))
+    monkeypatch.setenv("MX_TLS_CA_FILE", str(cert))
     credentials = grpc.ssl_server_credentials([(key.read_bytes(), cert.read_bytes())])
     handler = _Handler()
     server, port = _serve(handler, credentials)
@@ -127,7 +127,7 @@ def test_secure_channel_rejects_untrusted_server(monkeypatch, tmp_path):
     other_dir = tmp_path / "other"
     other_dir.mkdir()
     other_cert, _ = _self_signed(other_dir)
-    monkeypatch.setenv("MODEL_EXPRESS_TLS_CA_FILE", str(other_cert))
+    monkeypatch.setenv("MX_TLS_CA_FILE", str(other_cert))
     credentials = grpc.ssl_server_credentials([(key.read_bytes(), cert.read_bytes())])
     handler = _Handler()
     server, port = _serve(handler, credentials)
@@ -157,6 +157,6 @@ def test_plaintext_channel_cannot_reach_tls_server(monkeypatch, tmp_path):
 
 
 def test_missing_ca_file_raises_clearly(monkeypatch, tmp_path):
-    monkeypatch.setenv("MODEL_EXPRESS_TLS_CA_FILE", str(tmp_path / "absent.crt"))
+    monkeypatch.setenv("MX_TLS_CA_FILE", str(tmp_path / "absent.crt"))
     with pytest.raises(FileNotFoundError):
         client_mod._channel_credentials()

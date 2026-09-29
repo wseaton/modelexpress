@@ -22,11 +22,11 @@ pub const MODEL_EXPRESS_SECURITY_CACHE_TTL_SECS: &str = "MODEL_EXPRESS_SECURITY_
 pub const MODEL_EXPRESS_SECURITY_MODE: &str = "MODEL_EXPRESS_SECURITY_MODE";
 pub const MODEL_EXPRESS_SECURITY_TOKEN_AUDIENCES: &str = "MODEL_EXPRESS_SECURITY_TOKEN_AUDIENCES";
 pub const MODEL_EXPRESS_SERVER_PORT: &str = "MODEL_EXPRESS_SERVER_PORT";
-pub const MODEL_EXPRESS_TLS_CERT_FILE: &str = "MODEL_EXPRESS_TLS_CERT_FILE";
-pub const MODEL_EXPRESS_TLS_CIPHER_SUITES: &str = "MODEL_EXPRESS_TLS_CIPHER_SUITES";
-pub const MODEL_EXPRESS_TLS_GROUPS: &str = "MODEL_EXPRESS_TLS_GROUPS";
-pub const MODEL_EXPRESS_TLS_KEY_FILE: &str = "MODEL_EXPRESS_TLS_KEY_FILE";
-pub const MODEL_EXPRESS_TLS_MIN_VERSION: &str = "MODEL_EXPRESS_TLS_MIN_VERSION";
+pub const MX_TLS_CERT_FILE: &str = "MX_TLS_CERT_FILE";
+pub const MX_TLS_CIPHER_SUITES: &str = "MX_TLS_CIPHER_SUITES";
+pub const MX_TLS_GROUPS: &str = "MX_TLS_GROUPS";
+pub const MX_TLS_KEY_FILE: &str = "MX_TLS_KEY_FILE";
+pub const MX_TLS_MIN_VERSION: &str = "MX_TLS_MIN_VERSION";
 pub const MX_GC_TIMEOUT_SECS: &str = "MX_GC_TIMEOUT_SECS";
 pub const MX_HEARTBEAT_TIMEOUT_SECS: &str = "MX_HEARTBEAT_TIMEOUT_SECS";
 pub const MX_METADATA_BACKEND: &str = "MX_METADATA_BACKEND";
@@ -148,26 +148,17 @@ pub fn render_env(spec: &ModelExpressServerSpec, tls: Option<&ResolvedTls>) -> V
     }
 
     if let Some(tls) = tls {
-        env.push(literal(
-            MODEL_EXPRESS_TLS_CERT_FILE,
-            format!("{MOUNT_PATH}/tls.crt"),
-        ));
-        env.push(literal(
-            MODEL_EXPRESS_TLS_KEY_FILE,
-            format!("{MOUNT_PATH}/tls.key"),
-        ));
+        env.push(literal(MX_TLS_CERT_FILE, format!("{MOUNT_PATH}/tls.crt")));
+        env.push(literal(MX_TLS_KEY_FILE, format!("{MOUNT_PATH}/tls.key")));
         let settings = &tls.settings;
         if let Some(min_version) = &settings.min_version {
-            env.push(literal(MODEL_EXPRESS_TLS_MIN_VERSION, min_version.clone()));
+            env.push(literal(MX_TLS_MIN_VERSION, min_version.clone()));
         }
         if !settings.ciphers.is_empty() {
-            env.push(literal(
-                MODEL_EXPRESS_TLS_CIPHER_SUITES,
-                settings.ciphers.join(","),
-            ));
+            env.push(literal(MX_TLS_CIPHER_SUITES, settings.ciphers.join(",")));
         }
         if !settings.groups.is_empty() {
-            env.push(literal(MODEL_EXPRESS_TLS_GROUPS, settings.groups.join(",")));
+            env.push(literal(MX_TLS_GROUPS, settings.groups.join(",")));
         }
     }
 
@@ -239,23 +230,11 @@ mod tests {
                 server::MODEL_EXPRESS_SECURITY_TOKEN_AUDIENCES,
             ),
             (MODEL_EXPRESS_SERVER_PORT, server::MODEL_EXPRESS_SERVER_PORT),
-            (
-                MODEL_EXPRESS_TLS_CERT_FILE,
-                server::MODEL_EXPRESS_TLS_CERT_FILE,
-            ),
-            (
-                MODEL_EXPRESS_TLS_CIPHER_SUITES,
-                server::MODEL_EXPRESS_TLS_CIPHER_SUITES,
-            ),
-            (MODEL_EXPRESS_TLS_GROUPS, server::MODEL_EXPRESS_TLS_GROUPS),
-            (
-                MODEL_EXPRESS_TLS_KEY_FILE,
-                server::MODEL_EXPRESS_TLS_KEY_FILE,
-            ),
-            (
-                MODEL_EXPRESS_TLS_MIN_VERSION,
-                server::MODEL_EXPRESS_TLS_MIN_VERSION,
-            ),
+            (MX_TLS_CERT_FILE, server::MX_TLS_CERT_FILE),
+            (MX_TLS_CIPHER_SUITES, server::MX_TLS_CIPHER_SUITES),
+            (MX_TLS_GROUPS, server::MX_TLS_GROUPS),
+            (MX_TLS_KEY_FILE, server::MX_TLS_KEY_FILE),
+            (MX_TLS_MIN_VERSION, server::MX_TLS_MIN_VERSION),
             (MX_GC_TIMEOUT_SECS, server::MX_GC_TIMEOUT_SECS),
             (MX_HEARTBEAT_TIMEOUT_SECS, server::MX_HEARTBEAT_TIMEOUT_SECS),
             (MX_METADATA_BACKEND, server::MX_METADATA_BACKEND),
@@ -295,6 +274,7 @@ mod tests {
             affinity: None,
             network_policy: None,
             service_account_name: None,
+            image_pull_secrets: None,
         }
     }
 
