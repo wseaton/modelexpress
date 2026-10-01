@@ -401,6 +401,39 @@ docker build -f docker/Dockerfile -t model-express .
 docker run -p 8001:8001 model-express
 ```
 
+### Konflux Images
+
+`docker/Dockerfile.konflux` builds the server, and
+`docker/Dockerfile.konflux.operator` builds the OpenShift operator. Both use
+UBI9 and OpenSSL. Hermeto prefetches Cargo dependencies from the workspace
+`Cargo.lock`, plus RPMs and tools listed in `docker/konflux/server/` or
+`docker/konflux/operator/`, before the image build.
+The `.tekton` PipelineRuns pass `hermetic` and `prefetch-input` to the shared
+Konflux pipeline.
+
+To reproduce these builds locally, install Podman and Git. Run from a Git
+checkout without an existing `.cargo/` directory; the helper creates and
+removes `.cargo/config.toml`. Network access is needed to pull images and
+prefetch dependencies. The image build itself runs with `--network none`.
+
+```bash
+./docker/konflux/build-local.sh server
+./docker/konflux/build-local.sh operator
+# Or build both:
+./docker/konflux/build-local.sh all
+```
+
+The resulting images are `localhost/odh-modelexpress-server:hermetic` and
+`localhost/odh-modelexpress-operator:hermetic`. The helper defaults to the
+host architecture. Set `PLATFORM=linux/arm64` or `PLATFORM=linux/amd64` only
+when Podman can run containers for that architecture.
+
+After changing an image's `rpms.in.yaml`, regenerate its RPM lockfile:
+
+```bash
+./docker/konflux/lock-rpms.sh server  # operator or all are also supported
+```
+
 ### Docker Compose
 
 Local development setup. Brings up the server plus a Redis metadata backend:
