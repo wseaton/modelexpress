@@ -169,3 +169,42 @@ def test_dir_lists_registered_names():
     assert "MX_NIXL_BACKEND" in names
     assert "VLLM_ATTENTION_BACKEND" in names
     assert names == sorted(names)
+
+
+def test_pod_identity_from_pod_info_dir(monkeypatch, tmp_path):
+    """MX_POD_INFO_DIR wins over the environment, which describes the pod the
+    process started in, and drops the environment's worker host."""
+    monkeypatch.setenv("POD_NAME", "donor")
+    monkeypatch.setenv("POD_NAMESPACE", "old-ns")
+    monkeypatch.setenv("POD_UID", "donor-uid")
+    monkeypatch.setenv("MX_WORKER_HOST", "10.0.0.1")
+    monkeypatch.delenv("MX_POD_INFO_DIR", raising=False)
+    assert (envs.POD_NAME, envs.POD_NAMESPACE, envs.POD_UID) == ("donor", "old-ns", "donor-uid")
+    assert envs.MX_WORKER_HOST == "10.0.0.1"
+
+    (tmp_path / "name").write_text("restored\n")
+    (tmp_path / "namespace").write_text("serving")
+    (tmp_path / "uid").write_text("restored-uid")
+    monkeypatch.setenv("MX_POD_INFO_DIR", str(tmp_path))
+    assert envs.MX_POD_INFO_DIR == str(tmp_path)
+    assert (envs.POD_NAME, envs.POD_NAMESPACE, envs.POD_UID) == (
+        "restored",
+        "serving",
+        "restored-uid",
+    )
+    assert envs.MX_WORKER_HOST == ""
+
+    (tmp_path / "name").write_text("renamed")
+    assert envs.POD_NAME == "renamed"
+
+
+def test_pod_identity_falls_back_per_missing_file(monkeypatch, tmp_path):
+    """A field missing or empty in MX_POD_INFO_DIR falls back to its variable."""
+    monkeypatch.setenv("POD_NAME", "env-name")
+    monkeypatch.setenv("POD_UID", "env-uid")
+    (tmp_path / "uid").write_text("  ")
+    monkeypatch.setenv("MX_POD_INFO_DIR", str(tmp_path))
+    assert envs.POD_NAME == "env-name"
+    assert envs.POD_UID == "env-uid"
+    monkeypatch.setenv("MX_POD_INFO_DIR", str(tmp_path / "missing"))
+    assert envs.POD_NAME == "env-name"

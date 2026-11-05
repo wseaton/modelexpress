@@ -58,6 +58,7 @@ if TYPE_CHECKING:
     MX_METADATA_PORT: int
     MX_WORKER_GRPC_PORT: int
     MX_WORKER_HOST: str
+    MX_POD_INFO_DIR: str
     MX_HEARTBEAT_INTERVAL_SECS: int
     MX_PUBLISH_TIMEOUT_SECS: int
     MX_MODEL_REVISION: str
@@ -158,6 +159,23 @@ if TYPE_CHECKING:
     POD_UID: str
 
 _TRUTHY = {"1", "true", "yes", "on"}
+
+
+def _pod_field(env_name: str, file_name: str) -> str:
+    """Read a pod identity field from the MX_POD_INFO_DIR downward API volume,
+    falling back to its environment variable. The volume tracks the pod the
+    process runs in now, which differs from the environment after a process
+    checkpoint is restored into another pod."""
+    directory = os.environ.get("MX_POD_INFO_DIR", "")
+    if directory:
+        try:
+            with open(os.path.join(directory, file_name)) as f:
+                value = f.read().strip()
+        except OSError:
+            value = ""
+        if value:
+            return value
+    return os.environ.get(env_name, "")
 
 
 def _env_int(name: str, default: int) -> int:
@@ -264,7 +282,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "MX_METADATA_PORT": lambda: _env_int("MX_METADATA_PORT", 5555),
     "MX_WORKER_GRPC_PORT": lambda: _env_int("MX_WORKER_GRPC_PORT", 6555),
-    "MX_WORKER_HOST": lambda: os.environ.get("MX_WORKER_HOST", ""),
+    # A downward API pod IP is fixed in the environment at process start, so
+    # with MX_POD_INFO_DIR the host is resolved from the network instead.
+    "MX_WORKER_HOST": lambda: (
+        "" if os.environ.get("MX_POD_INFO_DIR") else os.environ.get("MX_WORKER_HOST", "")
+    ),
+    "MX_POD_INFO_DIR": lambda: os.environ.get("MX_POD_INFO_DIR", ""),
     "MX_HEARTBEAT_INTERVAL_SECS": lambda: _env_int("MX_HEARTBEAT_INTERVAL_SECS", 30),
     "MX_PUBLISH_TIMEOUT_SECS": lambda: _env_int("MX_PUBLISH_TIMEOUT_SECS", 30 * 60),
     "MX_MODEL_REVISION": lambda: os.environ.get("MX_MODEL_REVISION", ""),
@@ -416,9 +439,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ATTENTION_BACKEND": lambda: os.environ.get("VLLM_ATTENTION_BACKEND", "auto"),
     "HOSTNAME": lambda: os.environ.get("HOSTNAME", ""),
     "LWS_LEADER_ADDRESS": lambda: os.environ.get("LWS_LEADER_ADDRESS", ""),
-    "POD_NAMESPACE": lambda: os.environ.get("POD_NAMESPACE", ""),
-    "POD_NAME": lambda: os.environ.get("POD_NAME", ""),
-    "POD_UID": lambda: os.environ.get("POD_UID", ""),
+    "POD_NAMESPACE": lambda: _pod_field("POD_NAMESPACE", "namespace"),
+    "POD_NAME": lambda: _pod_field("POD_NAME", "name"),
+    "POD_UID": lambda: _pod_field("POD_UID", "uid"),
 }
 
 
